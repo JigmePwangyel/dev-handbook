@@ -4,5 +4,11 @@
     "title": "DevOps & Deployment",
     "icon": "⚙️",
     "blurb": "How software is built, shipped and kept alive: servers, CI/CD, containers, Kubernetes, cloud, IaC and observability."
+  },
+  {
+    "id": "go",
+    "title": "Go Programming",
+    "icon": "🐹",
+    "blurb": "Learn Go from zero: syntax, types, interfaces, error handling, concurrency, testing and building real services."
   }
 ]

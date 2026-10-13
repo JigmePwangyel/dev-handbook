@@ -1,0 +1,73 @@
+<h1>Generics</h1>
+<p class="lead">Since Go 1.18 you can write functions and types that work with many types while staying type-safe. Use them to remove duplication, not to build elaborate abstractions.</p>
+
+<h2>Generic functions</h2>
+<pre><code>func Map[T, U any](xs []T, f func(T) U) []U {
+    out := make([]U, 0, len(xs))
+    for _, x := range xs {
+        out = append(out, f(x))
+    }
+    return out
+}
+
+lengths := Map([]string{"a", "bb", "ccc"}, func(s string) int { return len(s) })
+// [1 2 3]. Type arguments are inferred.</code></pre>
+<p><code>[T, U any]</code> declares type parameters. <code>any</code> is the constraint, meaning "any type".</p>
+
+<h2>Constraints</h2>
+<pre><code>import "cmp"
+
+func Max[T cmp.Ordered](a, b T) T {
+    if a &gt; b { return a }
+    return b
+}
+Max(3, 7)          // 7
+Max("a", "b")      // "b"
+
+// custom constraint: a union of types
+type Number interface {
+    ~int | ~int64 | ~float64
+}
+func Sum[T Number](xs []T) T {
+    var total T
+    for _, x := range xs { total += x }
+    return total
+}</code></pre>
+<p>The <code>~int</code> means "int or any type whose underlying type is int" (such as <code>type Age int</code>). <code>comparable</code> is a built-in constraint for types usable with <code>==</code> and as map keys.</p>
+
+<h2>Generic types</h2>
+<pre><code>type Stack[T any] struct {
+    items []T
+}
+
+func (s *Stack[T]) Push(v T) { s.items = append(s.items, v) }
+
+func (s *Stack[T]) Pop() (T, bool) {
+    var zero T
+    if len(s.items) == 0 { return zero, false }
+    v := s.items[len(s.items)-1]
+    s.items = s.items[:len(s.items)-1]
+    return v, true
+}
+
+var s Stack[string]
+s.Push("a")
+v, _ := s.Pop()</code></pre>
+
+<h2>A generic set</h2>
+<pre><code>type Set[T comparable] map[T]struct{}
+
+func (s Set[T]) Add(v T)           { s[v] = struct{}{} }
+func (s Set[T]) Has(v T) bool      { _, ok := s[v]; return ok }</code></pre>
+
+<h2>When to use generics</h2>
+<table>
+<tr><th>Good fit</th><th>Poor fit</th></tr>
+<tr><td>Containers: stacks, queues, sets, caches</td><td>When an interface with methods already works</td></tr>
+<tr><td>Slice/map helpers (<code>Map</code>, <code>Filter</code>, <code>Keys</code>)</td><td>Only one concrete type is ever used</td></tr>
+<tr><td>Same algorithm over numeric types</td><td>Clever "type-level" programming</td></tr>
+</table>
+<div class="callout tip"><strong>Look before you write</strong><p>The standard library already provides generic helpers: packages <code>slices</code>, <code>maps</code> and <code>cmp</code>.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Write <code>Filter[T any](xs []T, keep func(T) bool) []T</code> and <code>Reduce</code>.</li><li>Implement a generic <code>Cache[K comparable, V any]</code> with <code>Get</code>/<code>Set</code>, guarded by a mutex.</li></ol></div>

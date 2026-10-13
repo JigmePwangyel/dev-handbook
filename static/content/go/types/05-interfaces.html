@@ -1,0 +1,71 @@
+<h1>Interfaces</h1>
+<p class="lead">Interfaces are Go's mechanism for abstraction and polymorphism. They are satisfied <strong>implicitly</strong>: a type implements an interface simply by having the right methods. No <code>implements</code> keyword.</p>
+
+<h2>Defining and using</h2>
+<pre><code>type Shape interface {
+    Area() float64
+    Perimeter() float64
+}
+
+type Rect struct{ W, H float64 }
+type Circle struct{ R float64 }
+
+func (r Rect) Area() float64        { return r.W * r.H }
+func (r Rect) Perimeter() float64   { return 2 * (r.W + r.H) }
+func (c Circle) Area() float64      { return math.Pi * c.R * c.R }
+func (c Circle) Perimeter() float64 { return 2 * math.Pi * c.R }
+
+func describe(s Shape) {
+    fmt.Printf("area=%.2f perimeter=%.2f\n", s.Area(), s.Perimeter())
+}
+
+describe(Rect{3, 4})
+describe(Circle{5})   // both satisfy Shape without declaring it</code></pre>
+
+<h2>Small interfaces are best</h2>
+<p>The standard library's most powerful interfaces have one method:</p>
+<pre><code>type Reader interface { Read(p []byte) (n int, err error) }
+type Writer interface { Write(p []byte) (n int, err error) }
+type Stringer interface { String() string }
+type error interface { Error() string }</code></pre>
+<p>Because <code>io.Reader</code> is so small, files, network connections, HTTP bodies, gzip streams and in-memory buffers are all interchangeable.</p>
+<pre><code>func countBytes(r io.Reader) (int64, error) {
+    return io.Copy(io.Discard, r)
+}
+countBytes(strings.NewReader("hello"))
+countBytes(os.Stdin)</code></pre>
+
+<div class="callout key"><strong>"Accept interfaces, return structs"</strong><p>Define small interfaces <em>where they are consumed</em>, not where the type is defined. Functions accept the narrowest interface they need and return concrete types.</p></div>
+
+<h2>The empty interface and any</h2>
+<pre><code>var x any = 42       // any == interface{}: holds a value of any type
+x = "hello"</code></pre>
+
+<h2>Type assertions and type switches</h2>
+<pre><code>var v any = "hi"
+s, ok := v.(string)      // safe: ok is false on mismatch
+n := v.(int)             // panics if v is not an int!
+
+switch t := v.(type) {
+case string: fmt.Println("string of length", len(t))
+case int:    fmt.Println("int", t)
+case nil:    fmt.Println("nil")
+default:     fmt.Printf("other: %T\n", t)
+}</code></pre>
+
+<h2>Composing interfaces</h2>
+<pre><code>type ReadWriter interface {
+    Reader
+    Writer
+}</code></pre>
+
+<h2>The nil interface gotcha</h2>
+<pre><code>func find() error {
+    var e *MyError = nil
+    return e            // non-nil interface holding a nil pointer!
+}
+fmt.Println(find() == nil)  // false</code></pre>
+<p>An interface value is a (type, value) pair. It is <code>nil</code> only if both are nil. Return a literal <code>nil</code> for "no error".</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Write a <code>Logger</code> interface with <code>Log(string)</code> and two implementations: console and in-memory slice. Write a function that accepts a <code>Logger</code>.</li><li>Implement <code>io.Writer</code> on a type that uppercases everything written, and use it with <code>fmt.Fprintln</code>.</li></ol></div>

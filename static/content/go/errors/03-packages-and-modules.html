@@ -1,0 +1,77 @@
+<h1>Packages and Modules</h1>
+<p class="lead">A <strong>package</strong> is a directory of <code>.go</code> files that share a namespace. A <strong>module</strong> is a collection of packages versioned together, defined by a <code>go.mod</code> file. Together they form Go's code organization and dependency system.</p>
+
+<h2>Packages</h2>
+<pre><code>// mathutil/mathutil.go
+package mathutil
+
+// Exported (capital letter): visible to other packages
+func Double(n int) int { return n * 2 }
+
+// unexported: private to this package
+func helper() {}</code></pre>
+<pre><code>// main.go
+package main
+
+import (
+    "fmt"
+    "example.com/hello/mathutil"
+)
+
+func main() { fmt.Println(mathutil.Double(21)) }</code></pre>
+<ul>
+<li>All files in a directory must declare the same <code>package</code> name.</li>
+<li>Package <code>main</code> with <code>func main()</code> builds an executable; any other name is a library.</li>
+<li>Import cycles are forbidden by the compiler.</li>
+</ul>
+
+<h2>Modules and go.mod</h2>
+<pre><code>go mod init github.com/you/myapp</code></pre>
+<pre><code>module github.com/you/myapp
+
+go 1.24
+
+require (
+    github.com/google/uuid v1.6.0
+    github.com/spf13/cobra v1.8.1
+)</code></pre>
+
+<h2>Dependencies</h2>
+<pre><code>go get github.com/google/uuid@latest   # add or upgrade
+go get github.com/google/uuid@v1.6.0   # pin a version
+go mod tidy                            # sync go.mod/go.sum with your imports
+go list -m all                         # list all dependencies
+go mod vendor                          # optional: copy deps into ./vendor</code></pre>
+<p><code>go.sum</code> holds cryptographic checksums of dependencies for reproducible, tamper-evident builds. Commit both <code>go.mod</code> and <code>go.sum</code>.</p>
+
+<h2>Recommended layout</h2>
+<pre class="diagram">
+myapp/
+├── go.mod
+├── go.sum
+├── cmd/
+│   └── myapp/
+│       └── main.go          # thin entry point(s)
+├── internal/                # private: cannot be imported by other modules
+│   ├── server/
+│   └── store/
+├── pkg/                     # optional: public reusable libraries
+└── README.md
+</pre>
+<div class="callout key"><strong>internal/ is enforced</strong><p>Code under <code>internal/</code> can only be imported by code rooted at the parent of <code>internal</code>. It lets you keep implementation details private without worrying about outside users.</p></div>
+
+<h2>Import tricks</h2>
+<pre><code>import (
+    str "strings"        // alias
+    _ "embed"            // import only for side effects
+    . "fmt"              // dot import (avoid)
+)</code></pre>
+
+<h2>Naming conventions</h2>
+<ul>
+<li>Package names are short, lowercase, single words: <code>http</code>, <code>store</code>. Avoid <code>util</code> and <code>common</code>.</li>
+<li>Avoid stutter: <code>http.Server</code>, not <code>http.HTTPServer</code>.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Create a module with an <code>internal/greeter</code> package and call it from <code>cmd/app/main.go</code>.</li><li>Add <code>github.com/google/uuid</code>, print a UUID, then run <code>go mod tidy</code> and inspect the <code>go.mod</code> diff.</li></ol></div>

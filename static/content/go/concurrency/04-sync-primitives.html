@@ -1,0 +1,72 @@
+<h1>The sync Package</h1>
+<p class="lead">Channels are great for passing ownership of data, but sometimes you simply need to protect shared state. The <code>sync</code> and <code>sync/atomic</code> packages give you the classic tools.</p>
+
+<h2>Mutex</h2>
+<pre><code>type SafeCounter struct {
+    mu sync.Mutex
+    n  map[string]int
+}
+
+func (c *SafeCounter) Inc(key string) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.n[key]++
+}
+
+func (c *SafeCounter) Get(key string) int {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    return c.n[key]
+}</code></pre>
+<ul>
+<li>Keep critical sections short, and always <code>defer Unlock()</code>.</li>
+<li>Never copy a struct containing a mutex (use pointer receivers). <code>go vet</code> warns about it.</li>
+</ul>
+
+<h2>RWMutex</h2>
+<p>Allows many concurrent readers or one writer:</p>
+<pre><code>var mu sync.RWMutex
+mu.RLock();  v := cache[k];  mu.RUnlock()   // readers
+mu.Lock();   cache[k] = v;   mu.Unlock()    // writer</code></pre>
+
+<h2>Once</h2>
+<pre><code>var (
+    once sync.Once
+    cfg  *Config
+)
+func GetConfig() *Config {
+    once.Do(func() { cfg = loadConfig() })   // runs exactly once, even if concurrent
+    return cfg
+}</code></pre>
+<p>Newer alternatives: <code>sync.OnceValue</code> and <code>sync.OnceFunc</code>.</p>
+
+<h2>atomic</h2>
+<pre><code>var hits atomic.Int64
+hits.Add(1)
+fmt.Println(hits.Load())</code></pre>
+<p>Lock-free operations on single values. Great for counters and flags.</p>
+
+<h2>sync.Pool and sync.Map</h2>
+<ul>
+<li><strong><code>sync.Pool</code></strong>: reuse temporary objects (e.g. buffers) to reduce GC pressure.</li>
+<li><strong><code>sync.Map</code></strong>: a concurrent map optimized for keys written once and read many times, or disjoint key sets. For most cases a plain map plus a mutex is simpler and faster.</li>
+</ul>
+
+<h2>errgroup</h2>
+<p>From <code>golang.org/x/sync/errgroup</code>. It runs goroutines, waits, and returns the first error:</p>
+<pre><code>g, ctx := errgroup.WithContext(ctx)
+for _, url := range urls {
+    g.Go(func() error { return fetch(ctx, url) })
+}
+if err := g.Wait(); err != nil { return err }</code></pre>
+
+<h2>Mutex or channel?</h2>
+<table>
+<tr><th>Use a channel to…</th><th>Use a mutex to…</th></tr>
+<tr><td>Transfer ownership of data</td><td>Protect a shared cache or counter</td></tr>
+<tr><td>Distribute work, pipelines</td><td>Guard internal struct state</td></tr>
+<tr><td>Signal events and completion</td><td>Keep a critical section tiny and obvious</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Fix the racy counter from the goroutines lesson with a mutex, then with <code>atomic.Int64</code>. Benchmark both.</li><li>Build a concurrency-safe in-memory cache with <code>RWMutex</code> and a <code>TTL</code> per key.</li></ol></div>

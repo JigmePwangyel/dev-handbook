@@ -1,0 +1,54 @@
+<h1>Goroutines</h1>
+<p class="lead">A goroutine is a lightweight thread managed by the Go runtime. You start one with the <code>go</code> keyword. They cost a few KB of stack each, so programs routinely run hundreds of thousands of them.</p>
+
+<h2>Concurrency is not parallelism</h2>
+<ul>
+<li><strong>Concurrency</strong>: structuring a program as independently executing tasks.</li>
+<li><strong>Parallelism</strong>: running tasks at the same instant on multiple cores.</li>
+</ul>
+<p>Go's scheduler multiplexes many goroutines onto a few OS threads (by default one per CPU core, controlled by <code>GOMAXPROCS</code>), giving you both.</p>
+
+<h2>Starting a goroutine</h2>
+<pre><code>func say(msg string) {
+    for i := 0; i &lt; 3; i++ {
+        fmt.Println(msg, i)
+        time.Sleep(100 * time.Millisecond)
+    }
+}
+
+func main() {
+    go say("goroutine")   // runs concurrently
+    say("main")
+}</code></pre>
+<div class="callout warn"><strong>main exiting kills everything</strong><p>When <code>main</code> returns, the program ends, even if goroutines are still running. You need a way to wait.</p></div>
+
+<h2>Waiting with sync.WaitGroup</h2>
+<pre><code>var wg sync.WaitGroup
+for i := 1; i &lt;= 5; i++ {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        fmt.Println("worker", i)
+    }()
+}
+wg.Wait()   // blocks until the counter hits zero</code></pre>
+<p>Call <code>wg.Add</code> <em>before</em> starting the goroutine. Since Go 1.25 you can also write <code>wg.Go(func() { ... })</code>.</p>
+
+<h2>Data races</h2>
+<pre><code>counter := 0
+var wg sync.WaitGroup
+for i := 0; i &lt; 1000; i++ {
+    wg.Add(1)
+    go func() { defer wg.Done(); counter++ }()   // RACE
+}
+wg.Wait()
+fmt.Println(counter)   // not reliably 1000</code></pre>
+<p><code>counter++</code> is read-modify-write, not atomic. Detect such bugs with <code>go run -race .</code> or <code>go test -race</code>. Fix with a mutex, an atomic, or by communicating over channels (next lessons).</p>
+
+<h2>Goroutine leaks</h2>
+<p>A goroutine blocked forever on a channel nobody will use is never freed. Always make sure every goroutine has a way to finish: closing a channel, cancelling a context, or reaching the end of its work.</p>
+
+<div class="callout key"><strong>Go proverb</strong><p>"Don't communicate by sharing memory; share memory by communicating."</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Fetch five URLs concurrently with goroutines and a <code>WaitGroup</code>, printing each status code.</li><li>Run the racy counter with <code>-race</code> and read the report.</li></ol></div>

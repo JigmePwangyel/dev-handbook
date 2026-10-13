@@ -1,0 +1,84 @@
+<h1>Channels</h1>
+<p class="lead">A channel is a typed conduit through which goroutines send and receive values. It both transfers data and synchronizes the two sides.</p>
+
+<h2>Basics</h2>
+<pre><code>ch := make(chan int)      // unbuffered channel of ints
+
+go func() {
+    ch &lt;- 42               // send (blocks until someone receives)
+}()
+
+v := &lt;-ch                  // receive (blocks until someone sends)
+fmt.Println(v)</code></pre>
+
+<h2>Unbuffered vs buffered</h2>
+<pre><code>unbuf := make(chan int)       // send and receive rendezvous
+buf   := make(chan int, 3)    // holds up to 3 values
+
+buf &lt;- 1; buf &lt;- 2; buf &lt;- 3   // fine, no receiver needed
+// buf &lt;- 4                   // would block: buffer full
+fmt.Println(len(buf), cap(buf))   // 3 3</code></pre>
+<table>
+<tr><th></th><th>Unbuffered</th><th>Buffered</th></tr>
+<tr><td>Send blocks when…</td><td>no receiver is ready</td><td>buffer is full</td></tr>
+<tr><td>Receive blocks when…</td><td>no sender is ready</td><td>buffer is empty</td></tr>
+<tr><td>Good for</td><td>Handoff and synchronization</td><td>Smoothing bursts, bounded queues</td></tr>
+</table>
+
+<h2>Closing and ranging</h2>
+<pre><code>func produce(n int) &lt;-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)            // sender closes, signalling "no more"
+        for i := 0; i &lt; n; i++ { out &lt;- i }
+    }()
+    return out
+}
+
+for v := range produce(5) {         // loops until closed
+    fmt.Println(v)
+}
+
+v, ok := &lt;-ch                       // ok == false when closed and drained</code></pre>
+<ul>
+<li>Only the <strong>sender</strong> should close a channel, and only once.</li>
+<li>Sending on a closed channel panics. Receiving from one returns the zero value immediately.</li>
+<li>You do <em>not</em> have to close channels for garbage collection. Close only to signal completion.</li>
+</ul>
+
+<h2>Directional channels</h2>
+<pre><code>func producer(out chan&lt;- int) { out &lt;- 1 }   // send-only
+func consumer(in &lt;-chan int)  { &lt;-in }        // receive-only</code></pre>
+<p>Directions make APIs self-documenting and let the compiler catch misuse.</p>
+
+<h2>Worker pool</h2>
+<pre><code>func worker(id int, jobs &lt;-chan int, results chan&lt;- int) {
+    for j := range jobs {
+        results &lt;- j * j
+    }
+}
+
+func main() {
+    jobs := make(chan int, 100)
+    results := make(chan int, 100)
+
+    var wg sync.WaitGroup
+    for w := 1; w &lt;= 4; w++ {
+        wg.Add(1)
+        go func() { defer wg.Done(); worker(w, jobs, results) }()
+    }
+
+    for i := 1; i &lt;= 20; i++ { jobs &lt;- i }
+    close(jobs)
+
+    go func() { wg.Wait(); close(results) }()
+    for r := range results { fmt.Println(r) }
+}</code></pre>
+
+<h2>Deadlocks</h2>
+<pre><code>ch := make(chan int)
+ch &lt;- 1        // fatal error: all goroutines are asleep - deadlock!</code></pre>
+<p>If every goroutine is blocked, the runtime detects it and crashes. A nil channel blocks forever on both send and receive. That is occasionally useful inside <code>select</code>.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Build a pipeline: generator → square → print, each stage a goroutine connected by channels.</li><li>Change the worker pool to 1 worker and 10 workers and time it with simulated <code>time.Sleep</code> work.</li></ol></div>

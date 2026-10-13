@@ -1,0 +1,85 @@
+<h1>Structs and Methods</h1>
+<p class="lead">Go has no classes. Instead you define <strong>structs</strong> (data) and attach <strong>methods</strong> (behavior) to any named type. Composition replaces inheritance.</p>
+
+<h2>Structs</h2>
+<pre><code>type User struct {
+    Name  string
+    Email string
+    Age   int
+}
+
+u := User{Name: "Ada", Email: "ada@example.com", Age: 36}
+var z User              // zero value: all fields zero
+fmt.Println(u.Name)
+u.Age++
+p := &amp;u                 // pointer to struct
+p.Name = "Ada L."       // auto-dereferenced</code></pre>
+
+<h2>Methods</h2>
+<p>A method is a function with a <strong>receiver</strong>:</p>
+<pre><code>func (u User) Greeting() string {      // value receiver: works on a copy
+    return "Hi, I'm " + u.Name
+}
+
+func (u *User) Birthday() {            // pointer receiver: can modify
+    u.Age++
+}
+
+u.Birthday()
+fmt.Println(u.Greeting())</code></pre>
+
+<h3>Value or pointer receiver?</h3>
+<table>
+<tr><th>Use a pointer receiver when…</th><th>Use a value receiver when…</th></tr>
+<tr><td>The method modifies the receiver</td><td>The type is small and immutable (e.g. a point, a time)</td></tr>
+<tr><td>The struct is large (avoid copying)</td><td>It is a basic type or map/slice/func wrapper</td></tr>
+<tr><td>The struct contains a mutex or similar</td><td></td></tr>
+</table>
+<p>Rule of thumb: if any method needs a pointer receiver, use pointers for <em>all</em> methods of that type.</p>
+
+<h2>Constructors</h2>
+<p>Go has no constructors, only a convention: a <code>NewX</code> function.</p>
+<pre><code>func NewUser(name, email string) (*User, error) {
+    if !strings.Contains(email, "@") {
+        return nil, fmt.Errorf("invalid email %q", email)
+    }
+    return &amp;User{Name: name, Email: email}, nil
+}</code></pre>
+
+<h2>Embedding: composition over inheritance</h2>
+<pre><code>type Animal struct{ Name string }
+func (a Animal) Speak() string { return a.Name + " makes a sound" }
+
+type Dog struct {
+    Animal          // embedded: Dog gets Animal's fields and methods
+    Breed string
+}
+
+d := Dog{Animal: Animal{Name: "Rex"}, Breed: "Lab"}
+fmt.Println(d.Name, d.Speak())   // promoted from Animal
+
+// override by defining the method on Dog
+func (d Dog) Speak() string { return d.Name + " barks" }</code></pre>
+
+<h2>Struct tags</h2>
+<pre><code>type Product struct {
+    ID    int     `json:"id"`
+    Name  string  `json:"name"`
+    Price float64 `json:"price,omitempty"`
+}</code></pre>
+<p>Tags are metadata read via reflection. The <code>encoding/json</code> package uses them (see the JSON lesson).</p>
+
+<h2>Exported vs unexported</h2>
+<p>Capitalized names (<code>User</code>, <code>Name</code>) are visible outside the package. Lowercase names are private to the package. That is Go's only access control.</p>
+
+<h2>Custom types and methods on any type</h2>
+<pre><code>type Celsius float64
+func (c Celsius) Fahrenheit() float64 { return float64(c)*9/5 + 32 }
+
+type Color int
+const (Red Color = iota; Green; Blue)
+func (c Color) String() string { return [...]string{"Red", "Green", "Blue"}[c] }
+fmt.Println(Green)   // prints "Green" because it satisfies fmt.Stringer</code></pre>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Model a <code>BankAccount</code> with <code>Deposit</code> and <code>Withdraw</code> (returning an error when funds are insufficient).</li><li>Embed a <code>Logger</code> struct in a <code>Server</code> struct and call its methods through the server.</li></ol></div>

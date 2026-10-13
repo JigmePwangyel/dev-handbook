@@ -1,0 +1,116 @@
+<h1>Building an HTTP API</h1>
+<p class="lead">Go's standard library is production-grade for web services. Since Go 1.22 the built-in router supports methods and path parameters, so you can build a clean REST API with zero dependencies.</p>
+
+<h2>Hello, server</h2>
+<pre><code>package main
+
+import (
+    "fmt"
+    "log"
+    "net/http"
+)
+
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprintln(w, "ok")
+    })
+    log.Fatal(http.ListenAndServe(":8080", mux))
+}</code></pre>
+
+<h2>A small todo API</h2>
+<pre><code>type Todo struct {
+    ID    int    `json:"id"`
+    Title string `json:"title"`
+    Done  bool   `json:"done"`
+}
+
+type Server struct {
+    mu     sync.Mutex
+    todos  map[int]Todo
+    nextID int
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(status)
+    json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) list(w http.ResponseWriter, r *http.Request) {
+    s.mu.Lock(); defer s.mu.Unlock()
+    out := make([]Todo, 0, len(s.todos))
+    for _, t := range s.todos { out = append(out, t) }
+    writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) create(w http.ResponseWriter, r *http.Request) {
+    var in struct{ Title string `json:"title"` }
+    if err := json.NewDecoder(r.Body).Decode(&amp;in); err != nil || in.Title == "" {
+        writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title required"})
+        return
+    }
+    s.mu.Lock(); defer s.mu.Unlock()
+    s.nextID++
+    t := Todo{ID: s.nextID, Title: in.Title}
+    s.todos[t.ID] = t
+    writeJSON(w, http.StatusCreated, t)
+}
+
+func (s *Server) get(w http.ResponseWriter, r *http.Request) {
+    id, err := strconv.Atoi(r.PathValue("id"))   // path parameter
+    if err != nil {
+        writeJSON(w, 400, map[string]string{"error": "bad id"}); return
+    }
+    s.mu.Lock(); defer s.mu.Unlock()
+    t, ok := s.todos[id]
+    if !ok {
+        writeJSON(w, 404, map[string]string{"error": "not found"}); return
+    }
+    writeJSON(w, 200, t)
+}
+
+func main() {
+    s := &amp;Server{todos: map[int]Todo{}}
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /todos", s.list)
+    mux.HandleFunc("POST /todos", s.create)
+    mux.HandleFunc("GET /todos/{id}", s.get)
+    log.Fatal(http.ListenAndServe(":8080", mux))
+}</code></pre>
+<pre><code>curl -X POST localhost:8080/todos -d '{"title":"learn go"}'
+curl localhost:8080/todos
+curl localhost:8080/todos/1</code></pre>
+
+<h2>Middleware</h2>
+<p>Middleware is just a function that wraps an <code>http.Handler</code>:</p>
+<pre><code>func logging(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+        next.ServeHTTP(w, r)
+        log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+    })
+}
+
+http.ListenAndServe(":8080", logging(mux))</code></pre>
+
+<h2>Production-ready server settings</h2>
+<pre><code>srv := &amp;http.Server{
+    Addr:              ":8080",
+    Handler:           logging(mux),
+    ReadHeaderTimeout: 5 * time.Second,
+    ReadTimeout:       10 * time.Second,
+    WriteTimeout:      15 * time.Second,
+    IdleTimeout:       60 * time.Second,
+}</code></pre>
+<div class="callout warn"><strong>Never use bare ListenAndServe in production</strong><p>The defaults have no timeouts, so slow or malicious clients can hold connections open forever. Use an explicit <code>http.Server</code> with timeouts, and pair it with graceful shutdown (see the context lesson).</p></div>
+
+<h2>Databases and frameworks</h2>
+<ul>
+<li><strong>Database</strong>: <code>database/sql</code> with a driver like <code>pgx</code>, or <code>sqlc</code> to generate type-safe code from SQL.</li>
+<li><strong>Routers/frameworks</strong> (optional): chi, Gin, Echo, Fiber. The stdlib mux is often enough now.</li>
+<li><strong>Structured logging</strong>: the standard <code>log/slog</code> package.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Add <code>PUT /todos/{id}</code> and <code>DELETE /todos/{id}</code>.</li><li>Write handler tests with <code>httptest</code>.</li><li>Persist todos to a JSON file or SQLite instead of memory.</li></ol></div>

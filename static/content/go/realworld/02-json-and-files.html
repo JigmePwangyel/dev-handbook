@@ -1,0 +1,87 @@
+<h1>JSON, Files and I/O</h1>
+<p class="lead">Most real programs read configuration, write files and speak JSON. The standard library handles all of it with <code>encoding/json</code>, <code>os</code>, <code>io</code> and <code>bufio</code>.</p>
+
+<h2>Encoding JSON</h2>
+<pre><code>type Product struct {
+    ID       int      `json:"id"`
+    Name     string   `json:"name"`
+    Price    float64  `json:"price"`
+    Tags     []string `json:"tags,omitempty"`   // omitted when empty
+    internal string                              // unexported: ignored
+}
+
+p := Product{ID: 1, Name: "Mug", Price: 9.5}
+data, err := json.Marshal(p)
+fmt.Println(string(data))        // {"id":1,"name":"Mug","price":9.5}
+
+pretty, _ := json.MarshalIndent(p, "", "  ")</code></pre>
+
+<h2>Decoding JSON</h2>
+<pre><code>var p Product
+err := json.Unmarshal([]byte(`{"id":2,"name":"Pen","price":1.2}`), &amp;p)
+
+// unknown shape? decode into a map
+var m map[string]any
+json.Unmarshal(data, &amp;m)
+fmt.Println(m["name"])           // numbers decode as float64!</code></pre>
+<p>Fields must be <strong>exported</strong> (capitalized) to be encoded or decoded.</p>
+
+<h2>Streaming with Encoder/Decoder</h2>
+<pre><code>json.NewEncoder(os.Stdout).Encode(p)
+
+dec := json.NewDecoder(r.Body)
+dec.DisallowUnknownFields()      // strict: reject unexpected keys
+if err := dec.Decode(&amp;p); err != nil { /* 400 Bad Request */ }</code></pre>
+
+<h2>Custom marshaling</h2>
+<pre><code>type Status int
+const (Active Status = iota; Disabled)
+
+func (s Status) MarshalJSON() ([]byte, error) {
+    return json.Marshal([...]string{"active", "disabled"}[s])
+}</code></pre>
+
+<h2>Files</h2>
+<pre><code>// small files: read or write in one call
+data, err := os.ReadFile("config.json")
+err = os.WriteFile("out.txt", []byte("hello\n"), 0o644)
+
+// line by line (large files)
+f, err := os.Open("big.log")
+if err != nil { return err }
+defer f.Close()
+
+sc := bufio.NewScanner(f)
+for sc.Scan() {
+    line := sc.Text()
+    fmt.Println(line)
+}
+if err := sc.Err(); err != nil { return err }
+
+// create or append
+out, err := os.OpenFile("app.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)</code></pre>
+
+<h2>Paths and directories</h2>
+<pre><code>path := filepath.Join("data", "users", "ada.json")   // OS-correct separators
+os.MkdirAll("data/users", 0o755)
+entries, _ := os.ReadDir(".")
+filepath.WalkDir(".", func(p string, d fs.DirEntry, err error) error { return err })</code></pre>
+
+<h2>Environment, arguments and flags</h2>
+<pre><code>port := os.Getenv("PORT")
+if port == "" { port = "8080" }
+
+name := flag.String("name", "world", "who to greet")
+verbose := flag.Bool("v", false, "verbose output")
+flag.Parse()
+fmt.Println("hello", *name)</code></pre>
+
+<h2>Embedding files in the binary</h2>
+<pre><code>import "embed"
+
+//go:embed templates/*.html
+var templates embed.FS</code></pre>
+<p>Ship static assets inside your single binary, which is handy for Docker and for CLIs.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Read a <code>todos.json</code> file into <code>[]Todo</code>, add an item, and write it back with indentation.</li><li>Write a CLI using <code>flag</code> that counts lines/words in a file (a tiny <code>wc</code>).</li></ol></div>

@@ -1,0 +1,75 @@
+<h1>Control Flow</h1>
+<p class="lead">Go keeps control flow minimal: one loop keyword (<code>for</code>), <code>if</code>, <code>switch</code>, and <code>defer</code>. No parentheses around conditions, braces always required.</p>
+
+<h2>if</h2>
+<pre><code>if x &gt; 10 {
+    fmt.Println("big")
+} else if x &gt; 5 {
+    fmt.Println("medium")
+} else {
+    fmt.Println("small")
+}
+
+// init statement: variable scoped to the if/else chain
+if n, err := strconv.Atoi(input); err != nil {
+    fmt.Println("bad number:", err)
+} else {
+    fmt.Println("parsed", n)
+}</code></pre>
+
+<h2>for: the only loop</h2>
+<pre><code>for i := 0; i &lt; 5; i++ { }      // classic
+
+for x &lt; 100 { x *= 2 }          // like while
+
+for { /* forever */ break }      // infinite, exit with break
+
+nums := []int{10, 20, 30}
+for i, v := range nums { fmt.Println(i, v) }
+for i := range 3 { fmt.Println(i) }          // 0 1 2 (Go 1.22+)
+for k, v := range map[string]int{"a": 1} { fmt.Println(k, v) }</code></pre>
+<p><code>break</code> and <code>continue</code> work as expected; labels let you break out of nested loops:</p>
+<pre><code>outer:
+for i := 0; i &lt; 3; i++ {
+    for j := 0; j &lt; 3; j++ {
+        if j == 2 { continue outer }
+        if i == 2 { break outer }
+    }
+}</code></pre>
+
+<h2>switch</h2>
+<p>No fallthrough by default, so no <code>break</code> needed:</p>
+<pre><code>switch day {
+case "sat", "sun":
+    fmt.Println("weekend")
+case "fri":
+    fmt.Println("almost")
+default:
+    fmt.Println("weekday")
+}
+
+// expressionless switch replaces if/else chains
+switch {
+case score &gt;= 90: grade = "A"
+case score &gt;= 80: grade = "B"
+default:           grade = "C"
+}
+
+// type switch (more in the interfaces lesson)
+switch v := val.(type) {
+case int:    fmt.Println("int", v)
+case string: fmt.Println("string", v)
+}</code></pre>
+<p>Use the <code>fallthrough</code> keyword only when you truly want the next case to run.</p>
+
+<h2>defer</h2>
+<p><code>defer</code> schedules a call to run when the surrounding function returns, in last-in-first-out order. It is the idiom for cleanup:</p>
+<pre><code>f, err := os.Open("data.txt")
+if err != nil { return err }
+defer f.Close()      // runs no matter how we leave the function
+// ... use f ...</code></pre>
+
+<div class="callout info"><strong>Arguments are evaluated immediately</strong><p><code>defer fmt.Println(i)</code> captures the value of <code>i</code> at the time of the defer statement, not when it runs.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Write FizzBuzz for 1..100 using an expressionless <code>switch</code>.</li><li>Print a 3x3 multiplication table, stopping early with a labeled <code>break</code> when the product exceeds 6.</li></ol></div>

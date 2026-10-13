@@ -1,0 +1,59 @@
+<h1>Why Go, and Setting Up</h1>
+<p class="lead">Go (often "Golang") is a compiled, statically typed language created at Google in 2009 by Robert Griesemer, Rob Pike and Ken Thompson. It was designed to make building fast, reliable network software boring in the best way: small language, fast compiles, one obvious way to do most things.</p>
+
+<h2>What Go is good at</h2>
+<ul>
+<li><strong>Backend services and APIs</strong>: a great standard library for HTTP, JSON, crypto and more.</li>
+<li><strong>Cloud and DevOps tooling</strong>: Docker, Kubernetes, Terraform, Prometheus and Caddy are all written in Go.</li>
+<li><strong>CLIs</strong>: compiles to a single static binary you can copy anywhere, with no runtime to install.</li>
+<li><strong>Concurrent programs</strong>: goroutines and channels are built into the language.</li>
+</ul>
+
+<h2>What makes it different</h2>
+<table>
+<tr><th>Trait</th><th>What it means for you</th></tr>
+<tr><td>Compiled to native code</td><td>Fast startup, low memory, no VM or interpreter on the server</td></tr>
+<tr><td>Static typing with inference</td><td>Errors caught at compile time, but you rarely write types twice</td></tr>
+<tr><td>Garbage collected</td><td>No manual <code>free</code>; short GC pauses suit servers</td></tr>
+<tr><td>Small spec</td><td>You can learn the whole language in a few weeks</td></tr>
+<tr><td>Fast compilation</td><td>Edit, build, run feels almost like a scripting language</td></tr>
+<tr><td>Cross compilation</td><td><code>GOOS=linux GOARCH=arm64 go build</code> from your laptop</td></tr>
+</table>
+
+<h2>Install</h2>
+<p>Download the installer from <code>go.dev/dl</code>, or use a package manager:</p>
+<pre><code>brew install go          # macOS
+sudo apt install golang  # Debian/Ubuntu (may be an older version)
+go version               # verify, e.g. go version go1.24 darwin/arm64</code></pre>
+
+<h2>Your first module</h2>
+<pre><code>mkdir hello &amp;&amp; cd hello
+go mod init example.com/hello   # creates go.mod
+</code></pre>
+<p>Create <code>main.go</code>:</p>
+<pre><code>package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello, Go!")
+}</code></pre>
+<pre><code>go run .      # compile and run in one step
+go build      # produce a binary named after the module
+./hello</code></pre>
+
+<h2>The toolchain you get for free</h2>
+<table>
+<tr><th>Command</th><th>Purpose</th></tr>
+<tr><td><code>go run</code></td><td>Compile and run</td></tr>
+<tr><td><code>go build</code></td><td>Produce a binary</td></tr>
+<tr><td><code>go test ./...</code></td><td>Run all tests</td></tr>
+<tr><td><code>go fmt ./...</code></td><td>Format code. There is one official style, so no formatting debates</td></tr>
+<tr><td><code>go vet ./...</code></td><td>Static checks for suspicious code</td></tr>
+<tr><td><code>go mod tidy</code></td><td>Add missing and remove unused dependencies</td></tr>
+</table>
+
+<div class="callout tip"><strong>Editor setup</strong><p>Use VS Code with the official Go extension (or GoLand). It installs <code>gopls</code>, the language server, and runs <code>gofmt</code> on save.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Install Go and run the hello program.</li><li>Change the message, then break it on purpose (delete a quote) and read the compiler error.</li><li>Run <code>go build</code> and check the binary size with <code>ls -lh</code>. Note that it is self-contained.</li></ol></div>

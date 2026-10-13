@@ -1,0 +1,78 @@
+<h1>Context</h1>
+<p class="lead"><code>context.Context</code> carries cancellation signals, deadlines and request-scoped values across API boundaries and goroutines. It is how Go programs stop work that is no longer needed.</p>
+
+<h2>Creating contexts</h2>
+<pre><code>ctx := context.Background()                          // root, never cancelled
+
+ctx, cancel := context.WithCancel(ctx)               // cancel manually
+defer cancel()
+
+ctx, cancel = context.WithTimeout(ctx, 3*time.Second) // auto-cancel after 3s
+defer cancel()
+
+ctx, cancel = context.WithDeadline(ctx, time.Now().Add(time.Minute))
+defer cancel()</code></pre>
+<p>Always call <code>cancel</code> (usually with <code>defer</code>) to release resources.</p>
+
+<h2>Respecting cancellation</h2>
+<pre><code>func work(ctx context.Context) error {
+    for i := 0; i &lt; 10; i++ {
+        select {
+        case &lt;-ctx.Done():
+            return ctx.Err()        // context.Canceled or context.DeadlineExceeded
+        case &lt;-time.After(500 * time.Millisecond):
+            fmt.Println("step", i)
+        }
+    }
+    return nil
+}
+
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+err := work(ctx)
+fmt.Println(err)   // context deadline exceeded</code></pre>
+
+<h2>Conventions</h2>
+<ul>
+<li><strong>Pass <code>ctx</code> as the first parameter</strong>, named <code>ctx</code>: <code>func Fetch(ctx context.Context, url string)</code>.</li>
+<li>Don't store contexts in structs. Pass them through calls.</li>
+<li>Derived contexts are cancelled when their parent is, forming a tree.</li>
+<li>Pass <code>context.TODO()</code> when you haven't decided yet.</li>
+</ul>
+
+<h2>Contexts in the standard library</h2>
+<pre><code>// HTTP client request with timeout
+req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+resp, err := http.DefaultClient.Do(req)
+
+// database
+rows, err := db.QueryContext(ctx, "SELECT ...")
+
+// HTTP server: each request has its own context, cancelled if the client disconnects
+func handler(w http.ResponseWriter, r *http.Request) {
+    ctx := r.Context()
+    // pass ctx to everything you call
+}</code></pre>
+
+<h2>Values</h2>
+<pre><code>type ctxKey string
+const requestIDKey ctxKey = "requestID"
+
+ctx = context.WithValue(ctx, requestIDKey, "abc-123")
+id, _ := ctx.Value(requestIDKey).(string)</code></pre>
+<div class="callout warn"><strong>Use values sparingly</strong><p>Only for request-scoped metadata like trace IDs and auth identity. Never for optional function parameters. Use a private key type to avoid collisions.</p></div>
+
+<h2>Graceful shutdown</h2>
+<pre><code>ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+go func() { srv.ListenAndServe() }()
+
+&lt;-ctx.Done()   // wait for Ctrl+C or SIGTERM
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+srv.Shutdown(shutdownCtx)   // finish in-flight requests, then exit</code></pre>
+<p>This is exactly what Kubernetes expects when it sends SIGTERM during a rolling deploy.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Make an HTTP GET with a 1-second timeout against a slow endpoint (e.g. <code>httpbin.org/delay/5</code>) and print the error.</li><li>Run 5 workers that all stop when you press Ctrl+C, using <code>signal.NotifyContext</code>.</li></ol></div>

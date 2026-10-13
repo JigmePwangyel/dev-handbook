@@ -1,0 +1,99 @@
+<h1>Testing</h1>
+<p class="lead">Testing is built into the language and toolchain: no framework required. Test files end in <code>_test.go</code>, test functions start with <code>Test</code>, and <code>go test</code> runs them.</p>
+
+<h2>Your first test</h2>
+<pre><code>// calc.go
+package calc
+func Add(a, b int) int { return a + b }</code></pre>
+<pre><code>// calc_test.go
+package calc
+
+import "testing"
+
+func TestAdd(t *testing.T) {
+    got := Add(2, 3)
+    want := 5
+    if got != want {
+        t.Errorf("Add(2,3) = %d; want %d", got, want)
+    }
+}</code></pre>
+<pre><code>go test ./...            # all packages
+go test -v               # verbose
+go test -run TestAdd     # filter by regex
+go test -cover           # coverage summary
+go test -race ./...      # data race detector (use it in CI!)</code></pre>
+<p><code>t.Errorf</code> marks failure and continues; <code>t.Fatalf</code> stops the test immediately.</p>
+
+<h2>Table-driven tests (the Go idiom)</h2>
+<pre><code>func TestDivide(t *testing.T) {
+    tests := []struct {
+        name    string
+        a, b    float64
+        want    float64
+        wantErr bool
+    }{
+        {"normal", 10, 2, 5, false},
+        {"negative", -9, 3, -3, false},
+        {"by zero", 1, 0, 0, true},
+    }
+    for _, tc := range tests {
+        t.Run(tc.name, func(t *testing.T) {
+            got, err := Divide(tc.a, tc.b)
+            if (err != nil) != tc.wantErr {
+                t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+            }
+            if got != tc.want {
+                t.Errorf("got %v, want %v", got, tc.want)
+            }
+        })
+    }
+}</code></pre>
+<p>Each row becomes a named subtest, so failures point to the exact case, and adding a case is one line.</p>
+
+<h2>Helpers and setup</h2>
+<pre><code>func newTestServer(t *testing.T) *Server {
+    t.Helper()                      // report failures at the caller's line
+    dir := t.TempDir()              // auto-cleaned temp directory
+    t.Cleanup(func() { /* teardown */ })
+    return NewServer(dir)
+}</code></pre>
+
+<h2>Testing HTTP handlers</h2>
+<pre><code>func TestHealth(t *testing.T) {
+    req := httptest.NewRequest("GET", "/health", nil)
+    rec := httptest.NewRecorder()
+    healthHandler(rec, req)
+
+    if rec.Code != http.StatusOK {
+        t.Fatalf("status = %d", rec.Code)
+    }
+}</code></pre>
+
+<h2>Benchmarks and fuzzing</h2>
+<pre><code>func BenchmarkAdd(b *testing.B) {
+    for i := 0; i &lt; b.N; i++ { Add(1, 2) }
+}
+// go test -bench=. -benchmem
+
+func FuzzParse(f *testing.F) {
+    f.Add("42")
+    f.Fuzz(func(t *testing.T, s string) { Parse(s) })  // must not panic
+}
+// go test -fuzz=FuzzParse</code></pre>
+
+<h2>Testing with interfaces (fakes)</h2>
+<pre><code>type Store interface { Get(id int) (*User, error) }
+
+type fakeStore struct{ users map[int]*User }
+func (f fakeStore) Get(id int) (*User, error) {
+    if u, ok := f.users[id]; ok { return u, nil }
+    return nil, ErrNotFound
+}
+
+// the service depends on the interface, so tests inject the fake
+svc := NewService(fakeStore{users: map[int]*User{1: {Name: "Ada"}}})</code></pre>
+
+<div class="callout tip"><strong>Keep it simple</strong><p>The standard <code>testing</code> package is enough for most projects. Optional helpers like <code>testify</code> or <code>go-cmp</code> are popular but never required.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Write a table-driven test for a function <code>IsPalindrome(string) bool</code>, including empty strings and mixed case.</li><li>Run with <code>-cover</code> and open the HTML report: <code>go test -coverprofile=c.out &amp;&amp; go tool cover -html=c.out</code>.</li></ol></div>

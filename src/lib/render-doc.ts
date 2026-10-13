@@ -1,7 +1,7 @@
 import type { TocItem } from './models';
 
 const KEYWORDS =
-  'FROM|RUN|CMD|COPY|ENTRYPOINT|EXPOSE|ENV|WORKDIR|ARG|apiVersion|kind|resource|provider|sudo|apt|docker|kubectl|git|npm|if|then|fi|for|do|done|function|const|let|return|import|export|async|await|def|class';
+  'FROM|RUN|CMD|COPY|ENTRYPOINT|EXPOSE|ENV|WORKDIR|ARG|apiVersion|kind|resource|provider|sudo|apt|docker|kubectl|git|npm|if|then|fi|for|do|done|function|const|let|return|import|export|async|await|def|class|package|func|type|struct|interface|defer|chan|select|range|var|switch|case|default|map|go';
 const TOKEN = new RegExp(
   `^([ \\t]*(?:#|//|--).*)$|("[^"\\n]*"|'[^'\\n]*')|\\b(${KEYWORDS})\\b`,
   'gm',

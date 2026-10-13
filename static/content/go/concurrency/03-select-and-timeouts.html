@@ -1,0 +1,68 @@
+<h1>select and Timeouts</h1>
+<p class="lead"><code>select</code> is like <code>switch</code> for channels: it waits on multiple channel operations and runs whichever is ready first.</p>
+
+<h2>Basic select</h2>
+<pre><code>select {
+case msg := &lt;-ch1:
+    fmt.Println("from ch1:", msg)
+case ch2 &lt;- 10:
+    fmt.Println("sent to ch2")
+case &lt;-time.After(1 * time.Second):
+    fmt.Println("timeout")
+}</code></pre>
+<p>If several cases are ready, one is chosen at random. If none is ready, <code>select</code> blocks.</p>
+
+<h2>Non-blocking operations</h2>
+<pre><code>select {
+case v := &lt;-ch:
+    fmt.Println("got", v)
+default:
+    fmt.Println("nothing ready")   // runs immediately if no case is ready
+}</code></pre>
+
+<h2>Timeouts</h2>
+<pre><code>func fetchWithTimeout(url string) (string, error) {
+    result := make(chan string, 1)   // buffered so the goroutine can't leak
+    go func() { result &lt;- slowFetch(url) }()
+
+    select {
+    case r := &lt;-result:
+        return r, nil
+    case &lt;-time.After(2 * time.Second):
+        return "", errors.New("timeout")
+    }
+}</code></pre>
+
+<h2>Tickers</h2>
+<pre><code>ticker := time.NewTicker(500 * time.Millisecond)
+defer ticker.Stop()
+done := time.After(2 * time.Second)
+
+for {
+    select {
+    case t := &lt;-ticker.C:
+        fmt.Println("tick at", t.Format("15:04:05"))
+    case &lt;-done:
+        return
+    }
+}</code></pre>
+
+<h2>The done-channel pattern</h2>
+<pre><code>func worker(done &lt;-chan struct{}, out chan&lt;- int) {
+    for i := 0; ; i++ {
+        select {
+        case out &lt;- i:
+        case &lt;-done:
+            return        // stop cleanly when asked
+        }
+    }
+}
+
+done := make(chan struct{})
+go worker(done, out)
+// ... later
+close(done)               // broadcasts to every listener</code></pre>
+<p>Closing a channel wakes <em>all</em> receivers, so it works as a broadcast signal. This pattern is formalized by <code>context</code> (next lesson).</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Merge two channels into one with a <code>select</code> loop (fan-in).</li><li>Write a function that returns the first result from three simulated slow servers and ignores the rest.</li></ol></div>

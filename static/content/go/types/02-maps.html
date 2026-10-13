@@ -1,0 +1,60 @@
+<h1>Maps</h1>
+<p class="lead">A map is Go's built-in hash table: an unordered collection of key/value pairs with O(1) average lookup.</p>
+
+<h2>Creating and using maps</h2>
+<pre><code>ages := map[string]int{
+    "ada":   36,
+    "linus": 54,
+}
+ages["grace"] = 85          // insert/update
+fmt.Println(ages["ada"])    // 36
+delete(ages, "linus")
+fmt.Println(len(ages))
+
+m := make(map[string][]string)  // empty, ready to use</code></pre>
+
+<h2>The "comma ok" idiom</h2>
+<p>Reading a missing key returns the zero value, so you can't tell "missing" from "present with zero value" without the second return:</p>
+<pre><code>age, ok := ages["bob"]
+if !ok {
+    fmt.Println("bob not found")
+}
+
+if v, ok := ages["ada"]; ok {
+    fmt.Println("found", v)
+}</code></pre>
+
+<h2>Iterating</h2>
+<pre><code>for k, v := range ages {
+    fmt.Println(k, v)
+}
+// order is intentionally randomized!
+
+keys := slices.Sorted(maps.Keys(ages))  // sorted keys (Go 1.23+)
+for _, k := range keys { fmt.Println(k, ages[k]) }</code></pre>
+
+<h2>Rules and gotchas</h2>
+<ul>
+<li><strong>Keys must be comparable</strong>: strings, numbers, bools, pointers, arrays, structs of comparable fields. Not slices, maps or functions.</li>
+<li><strong>A nil map can be read but not written</strong>. Writing panics. Always initialize with a literal or <code>make</code>.</li>
+<li><strong>Maps are not safe for concurrent writes.</strong> Protect with a <code>sync.Mutex</code> or use <code>sync.Map</code>.</li>
+<li>Maps are reference-like: assigning one to another variable shares the same data.</li>
+</ul>
+
+<h2>Common patterns</h2>
+<pre><code>// counting
+counts := map[string]int{}
+for _, w := range words { counts[w]++ }
+
+// grouping
+groups := map[string][]string{}
+for _, p := range people { groups[p.City] = append(groups[p.City], p.Name) }
+
+// set
+seen := map[string]struct{}{}
+seen["a"] = struct{}{}
+if _, ok := seen["a"]; ok { /* present */ }</code></pre>
+<p><code>struct{}</code> takes zero bytes, so <code>map[T]struct{}</code> is the idiomatic set.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Count word frequencies in a paragraph and print the top 3.</li><li>Write <code>func invert(m map[string]int) map[int][]string</code>.</li></ol></div>

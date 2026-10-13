@@ -1,0 +1,82 @@
+<h1>Shipping Go: Build and Docker</h1>
+<p class="lead">Go compiles to one static binary, which makes deployment unusually simple. This lesson ties Go back to the DevOps topic: cross-compiling, tiny container images and CI.</p>
+
+<h2>Building a release binary</h2>
+<pre><code>CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/server ./cmd/server</code></pre>
+<table>
+<tr><th>Flag</th><th>Effect</th></tr>
+<tr><td><code>CGO_ENABLED=0</code></td><td>Pure Go, fully static binary with no libc dependency</td></tr>
+<tr><td><code>-trimpath</code></td><td>Remove local file paths (reproducible builds)</td></tr>
+<tr><td><code>-ldflags="-s -w"</code></td><td>Strip debug info: smaller binary</td></tr>
+</table>
+
+<h2>Cross-compilation</h2>
+<pre><code>GOOS=linux  GOARCH=amd64 go build -o server-linux-amd64 .
+GOOS=linux  GOARCH=arm64 go build -o server-linux-arm64 .
+GOOS=darwin GOARCH=arm64 go build -o server-mac .
+GOOS=windows GOARCH=amd64 go build -o server.exe .</code></pre>
+<p>Build for your Linux servers straight from a Mac, with no extra toolchain.</p>
+
+<h2>Multi-stage Dockerfile</h2>
+<pre><code># ---- build stage ----
+FROM golang:1.24 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download            # cached layer unless dependencies change
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+
+# ---- runtime stage ----
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/server /server
+EXPOSE 8080
+USER nonroot
+ENTRYPOINT ["/server"]</code></pre>
+<p>The final image contains only your binary: typically 10-25 MB instead of 800 MB+, with a minimal attack surface (no shell, no package manager). For even smaller images use <code>FROM scratch</code>, but you'll need to copy in CA certificates yourself if you make HTTPS calls.</p>
+
+<h2>Configuration the 12-factor way</h2>
+<pre><code>cfg := struct {
+    Addr string
+    DSN  string
+}{
+    Addr: getenv("ADDR", ":8080"),
+    DSN:  os.Getenv("DATABASE_URL"),
+}
+
+func getenv(k, def string) string {
+    if v := os.Getenv(k); v != "" { return v }
+    return def
+}</code></pre>
+
+<h2>Health checks and shutdown</h2>
+<ul>
+<li>Expose <code>GET /healthz</code> for liveness and <code>/readyz</code> for readiness (Kubernetes probes).</li>
+<li>Handle <code>SIGTERM</code> with graceful shutdown so rolling deploys drop no requests.</li>
+<li>Log to stdout as JSON with <code>slog.New(slog.NewJSONHandler(os.Stdout, nil))</code>.</li>
+</ul>
+
+<h2>CI with GitHub Actions</h2>
+<pre><code>name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go vet ./...
+      - run: go test -race -cover ./...
+      - run: go build ./...</code></pre>
+<p>Add <code>golangci-lint</code> for deeper static analysis. See the <em>Git &amp; CI/CD</em> section of the DevOps topic for pipelines in depth.</p>
+
+<h2>Where to go next</h2>
+<ul>
+<li>Read <em>Effective Go</em> and the <em>Go Code Review Comments</em> on go.dev.</li>
+<li>Work through the <em>Tour of Go</em> (<code>go.dev/tour</code>) and <em>Go by Example</em>.</li>
+<li>Build something real: a URL shortener, a CLI tool, a chat server with WebSockets, or a Kubernetes operator.</li>
+<li>Read the standard library source. It is some of the best Go code around.</li>
+</ul>
+
+<div class="exercise"><h3>Capstone</h3>
+<ol><li>Take the todo API, persist data to SQLite or Postgres, and add structured logging and graceful shutdown.</li><li>Write a multi-stage Dockerfile and confirm the image is under 25 MB.</li><li>Add a GitHub Actions workflow that runs tests with <code>-race</code> and builds the image.</li><li>Deploy it to a VPS or a Kubernetes cluster using what you learned in the DevOps topic.</li></ol></div>

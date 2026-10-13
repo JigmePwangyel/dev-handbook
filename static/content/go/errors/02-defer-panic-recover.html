@@ -1,0 +1,74 @@
+<h1>defer, panic and recover</h1>
+<p class="lead"><code>defer</code> guarantees cleanup. <code>panic</code> is for unrecoverable bugs, not ordinary errors. <code>recover</code> lets you stop a panic at a boundary, such as an HTTP handler.</p>
+
+<h2>defer in depth</h2>
+<pre><code>func process(path string) error {
+    f, err := os.Open(path)
+    if err != nil { return err }
+    defer f.Close()                 // runs when process returns
+
+    mu.Lock()
+    defer mu.Unlock()               // pair lock/unlock together
+
+    // ...
+    return nil
+}</code></pre>
+<p>Multiple defers run in <strong>LIFO</strong> order:</p>
+<pre><code>for i := 0; i &lt; 3; i++ {
+    defer fmt.Println(i)
+}
+// prints 2, 1, 0</code></pre>
+<div class="callout warn"><strong>Defer in loops</strong><p>Defers run at <em>function</em> exit, not loop-iteration exit. Opening thousands of files in a loop with <code>defer f.Close()</code> leaks until the function returns. Extract the loop body into its own function.</p></div>
+
+<h3>Modifying named results</h3>
+<pre><code>func readAll(path string) (data []byte, err error) {
+    f, err := os.Open(path)
+    if err != nil { return nil, err }
+    defer func() {
+        if cerr := f.Close(); err == nil { err = cerr }  // surface close error
+    }()
+    return io.ReadAll(f)
+}</code></pre>
+
+<h2>panic</h2>
+<p>A panic stops normal execution, runs deferred functions while unwinding the stack, then crashes the program with a stack trace.</p>
+<pre><code>var m map[string]int
+m["a"] = 1                 // panic: assignment to entry in nil map
+
+s := []int{1, 2, 3}
+_ = s[5]                   // panic: index out of range
+
+panic("this should never happen")</code></pre>
+<p><strong>Use <code>panic</code> only for programmer errors</strong> (impossible states, failed invariants) or during startup (e.g. <code>regexp.MustCompile</code> of a bad constant pattern). Expected failures should be <code>error</code>s.</p>
+
+<h2>recover</h2>
+<p><code>recover</code> works only inside a deferred function and returns the panic value:</p>
+<pre><code>func safe(fn func()) (err error) {
+    defer func() {
+        if r := recover(); r != nil {
+            err = fmt.Errorf("recovered: %v", r)
+        }
+    }()
+    fn()
+    return nil
+}
+
+err := safe(func() { var m map[string]int; m["x"] = 1 })
+fmt.Println(err)   // recovered: assignment to entry in nil map</code></pre>
+
+<h3>Real-world use: middleware</h3>
+<pre><code>func recoverMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        defer func() {
+            if rec := recover(); rec != nil {
+                log.Printf("panic: %v\n%s", rec, debug.Stack())
+                http.Error(w, "internal error", 500)
+            }
+        }()
+        next.ServeHTTP(w, r)
+    })
+}</code></pre>
+<p>(The <code>net/http</code> server already recovers per-request panics, but custom middleware lets you log and respond your way.)</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Write a function that opens three files with <code>defer</code> and prints when each closes. Confirm the LIFO order.</li><li>Write <code>safeDivide(a, b int) (int, error)</code> that converts a divide-by-zero panic into an error using <code>recover</code>.</li></ol></div>

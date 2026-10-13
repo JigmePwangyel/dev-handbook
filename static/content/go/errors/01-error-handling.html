@@ -1,0 +1,68 @@
+<h1>Error Handling</h1>
+<p class="lead">Go has no exceptions. Errors are ordinary values returned from functions. It is verbose by design: every failure path is visible in the code, which makes programs easier to reason about.</p>
+
+<h2>The basic pattern</h2>
+<pre><code>f, err := os.Open("config.json")
+if err != nil {
+    return fmt.Errorf("open config: %w", err)
+}
+defer f.Close()</code></pre>
+<p>The built-in <code>error</code> interface has a single method: <code>Error() string</code>. A <code>nil</code> error means success.</p>
+
+<h2>Creating errors</h2>
+<pre><code>errors.New("something broke")
+fmt.Errorf("user %d not found", id)
+
+// sentinel error: a package-level value callers can compare against
+var ErrNotFound = errors.New("not found")</code></pre>
+
+<h2>Wrapping with %w</h2>
+<p>Add context as the error travels up the stack, while preserving the original:</p>
+<pre><code>func loadUser(id int) (*User, error) {
+    u, err := db.Find(id)
+    if err != nil {
+        return nil, fmt.Errorf("loadUser(%d): %w", id, err)
+    }
+    return u, nil
+}
+// message: "loadUser(7): sql: no rows in result set"</code></pre>
+
+<h2>Inspecting errors: errors.Is and errors.As</h2>
+<pre><code>if errors.Is(err, ErrNotFound) {      // matches anywhere in the wrap chain
+    http.Error(w, "not found", 404)
+}
+
+var pe *fs.PathError
+if errors.As(err, &amp;pe) {              // extract a specific error type
+    fmt.Println("failed path:", pe.Path)
+}</code></pre>
+
+<h2>Custom error types</h2>
+<pre><code>type ValidationError struct {
+    Field, Reason string
+}
+func (e *ValidationError) Error() string {
+    return fmt.Sprintf("invalid %s: %s", e.Field, e.Reason)
+}
+
+func validate(u User) error {
+    if u.Email == "" {
+        return &amp;ValidationError{"email", "required"}
+    }
+    return nil
+}</code></pre>
+
+<h2>Joining errors</h2>
+<pre><code>err := errors.Join(err1, err2)   // Go 1.20+: reports all failures</code></pre>
+
+<h2>Guidelines</h2>
+<ul>
+<li><strong>Handle an error once.</strong> Either log it or return it, not both.</li>
+<li><strong>Add context</strong> where you have it ("what was I doing?"), with lowercase messages and no trailing punctuation.</li>
+<li><strong>Don't ignore errors.</strong> If you truly must, write <code>_ = f.Close()</code> to make it explicit.</li>
+<li>Use sentinel errors or custom types for conditions the caller needs to branch on. Otherwise plain wrapped errors are fine.</li>
+</ul>
+<div class="callout warn"><strong>Early return, avoid else</strong><p>Handle the error and return, keeping the happy path un-indented. This "line of sight" style is idiomatic.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Write <code>readConfig(path)</code> that wraps errors at each step. In <code>main</code>, use <code>errors.Is(err, os.ErrNotExist)</code> to print a friendly message.</li><li>Create a <code>ValidationError</code> and extract it with <code>errors.As</code> from a wrapped error.</li></ol></div>

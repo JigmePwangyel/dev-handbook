@@ -1,0 +1,52 @@
+<h1>Pointers</h1>
+<p class="lead">A pointer holds the memory address of a value. Go has pointers but no pointer arithmetic, so you get the performance benefits without most of C's danger.</p>
+
+<h2>Basics</h2>
+<pre><code>x := 42
+p := &amp;x          // p is *int, the address of x
+fmt.Println(*p)  // 42: dereference
+*p = 100         // modify x through the pointer
+fmt.Println(x)   // 100
+
+var np *int      // nil pointer
+// fmt.Println(*np)  // panic: nil pointer dereference</code></pre>
+
+<h2>Why pointers matter: pass by value</h2>
+<pre><code>func incrementBad(n int)   { n++ }    // changes a copy
+func increment(n *int)     { *n++ }   // changes the original
+
+v := 1
+incrementBad(v); fmt.Println(v) // 1
+increment(&amp;v);   fmt.Println(v) // 2</code></pre>
+
+<h2>new and composite literals</h2>
+<pre><code>p := new(int)            // *int pointing to 0
+u := &amp;User{Name: "Ada"} // pointer to a new struct (most common)</code></pre>
+
+<h2>Pointers to structs</h2>
+<p>Field access through a pointer needs no <code>*</code>: <code>u.Name</code> works the same for a value or pointer. Returning a pointer to a local variable is fine. Go's escape analysis moves it to the heap automatically:</p>
+<pre><code>func newCounter() *int {
+    n := 0
+    return &amp;n      // safe!
+}</code></pre>
+
+<h2>When to use pointers</h2>
+<ul>
+<li>You need a function or method to <strong>mutate</strong> its argument.</li>
+<li>The value is <strong>large</strong> and copying would be wasteful.</li>
+<li>You need to signal <strong>absence</strong> (<code>nil</code>) of an optional value.</li>
+<li>The type contains a lock or must not be copied.</li>
+</ul>
+<div class="callout tip"><strong>Don't over-use them</strong><p>For small values (ints, strings, small structs) copying is cheap and often faster than pointer chasing. Slices, maps and channels are already reference-like, so you rarely need a pointer to them.</p></div>
+
+<h2>The classic loop-variable trap</h2>
+<pre><code>var ptrs []*int
+for i := 0; i &lt; 3; i++ {
+    ptrs = append(ptrs, &amp;i)
+}
+// Go 1.22+: each iteration has its own i → prints 0 1 2
+// Go ≤1.21: all point to the same i → prints 3 3 3</code></pre>
+<p>Go 1.22 changed loop variables to be per-iteration, fixing this long-standing bug. Make sure your <code>go.mod</code> says <code>go 1.22</code> or later.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Write <code>swap(a, b *int)</code>.</li><li>Create a linked list node type with a <code>Next *Node</code> and write a function to append to it and print it.</li></ol></div>

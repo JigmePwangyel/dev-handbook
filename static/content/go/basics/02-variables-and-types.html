@@ -1,0 +1,71 @@
+<h1>Variables, Constants and Basic Types</h1>
+<p class="lead">Go is statically typed, but the compiler infers most types for you. This lesson covers how to declare values, the built-in types, and Go's "zero value" rule that removes a whole class of uninitialized-variable bugs.</p>
+
+<h2>Declaring variables</h2>
+<pre><code>var name string = "Ada"   // explicit
+var age = 36              // type inferred (int)
+var count int             // zero value: 0
+
+city := "Lisbon"          // short declaration, only inside functions
+x, y := 1, 2              // multiple at once</code></pre>
+<p><code>:=</code> declares and assigns; <code>=</code> only assigns to something that already exists. Unused local variables and unused imports are <strong>compile errors</strong>. That keeps code tidy.</p>
+
+<h2>Basic types</h2>
+<table>
+<tr><th>Kind</th><th>Types</th></tr>
+<tr><td>Booleans</td><td><code>bool</code></td></tr>
+<tr><td>Integers</td><td><code>int</code>, <code>int8/16/32/64</code>, <code>uint</code>, <code>uint8…64</code>, <code>uintptr</code></td></tr>
+<tr><td>Floats</td><td><code>float32</code>, <code>float64</code></td></tr>
+<tr><td>Complex</td><td><code>complex64</code>, <code>complex128</code></td></tr>
+<tr><td>Text</td><td><code>string</code> (immutable UTF-8 bytes), <code>byte</code> (= <code>uint8</code>), <code>rune</code> (= <code>int32</code>, a Unicode code point)</td></tr>
+</table>
+<p>Use <code>int</code> and <code>float64</code> unless you have a reason not to.</p>
+
+<h2>Zero values</h2>
+<p>Every variable is initialized. Without an explicit value it gets its type's zero value:</p>
+<pre><code>var i int      // 0
+var f float64  // 0
+var b bool     // false
+var s string   // "" (empty string)
+var p *int     // nil
+var sl []int   // nil slice</code></pre>
+<div class="callout key"><strong>Design for useful zero values</strong><p>Idiomatic Go types work without a constructor when possible. A zero <code>sync.Mutex</code> or <code>bytes.Buffer</code> is ready to use.</p></div>
+
+<h2>No implicit conversions</h2>
+<pre><code>var a int = 10
+var b float64 = float64(a) * 1.5   // explicit conversion required
+// var c float64 = a               // compile error</code></pre>
+
+<h2>Constants and iota</h2>
+<pre><code>const Pi = 3.14159
+const (
+    Small = iota   // 0
+    Medium         // 1
+    Large          // 2
+)
+
+type Weekday int
+const (
+    Sunday Weekday = iota
+    Monday
+    Tuesday
+)</code></pre>
+<p><code>iota</code> is a counter that resets in each <code>const</code> block. It is Go's idiom for enums.</p>
+
+<h2>Strings and runes</h2>
+<pre><code>s := "héllo"
+fmt.Println(len(s))          // 6 (bytes, not characters!)
+for i, r := range s {        // range iterates runes
+    fmt.Println(i, string(r))
+}
+multi := `raw string
+with "quotes" and \n kept literally`</code></pre>
+
+<h2>Printing</h2>
+<pre><code>fmt.Println("a", 1)             // a 1
+fmt.Printf("%s is %d\n", "Ada", 36)
+fmt.Printf("%v %+v %T\n", p, p, p) // value, with field names, type
+s := fmt.Sprintf("%.2f", 3.14159) // format into a string</code></pre>
+
+<div class="exercise"><h3>Try it</h3>
+<ol><li>Print the length of <code>"日本語"</code> with <code>len</code> and with <code>utf8.RuneCountInString</code>. Why do they differ?</li><li>Define a <code>Color</code> enum with <code>iota</code> and give it a <code>String()</code> method (we cover methods soon).</li></ol></div>

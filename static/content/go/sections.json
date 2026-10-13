@@ -1,0 +1,7 @@
+[
+{"id":"basics","title":"Getting Started","icon":"🚀","blurb":"Install Go, write your first program, and learn variables, control flow and functions."},
+{"id":"types","title":"Data & Types","icon":"🧩","blurb":"Slices, maps, structs, methods, pointers and interfaces: the heart of Go's type system."},
+{"id":"errors","title":"Errors, Packages & Testing","icon":"🧪","blurb":"Error handling the Go way, defer/panic/recover, modules, packages and built-in testing."},
+{"id":"concurrency","title":"Concurrency","icon":"⚡","blurb":"Goroutines, channels, select, sync primitives and context: Go's superpower."},
+{"id":"realworld","title":"Real-World Go","icon":"🏗️","blurb":"Generics, JSON, an HTTP API, a CLI tool, and shipping Go in a tiny Docker image."}
+]
