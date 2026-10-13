@@ -1,0 +1,162 @@
+<h1>Database Migrations in Deployments</h1>
+<p class="lead">Code is easy to roll back; data is not. The database schema is the one part of a deployment that carries state, and most "bad deploy" horror stories (locked tables, dropped columns, hours of downtime) are migration mistakes. Learn to change schemas safely while the app keeps running.</p>
+
+<h2>What a migration is, and why you need them</h2>
+<p>Your code expects a certain schema: tables, columns, indexes. When a feature needs a new column, the schema must change in lockstep with the code. If you apply changes by hand (<code>psql</code> on production, "I'll run this SQL after the deploy"), you get environments that disagree, forgotten steps, and no history.</p>
+<p>A <strong>migration</strong> is a small, ordered, versioned script that moves the schema from version N to N+1. The tool records which migrations have run (in a table such as <code>schema_migrations</code>) so each runs exactly once, in the same order, in every environment: your laptop, CI, staging, production. Schema becomes code, reviewed in pull requests and reproducible from scratch.</p>
+<table>
+<tr><th>Ecosystem</th><th>Tools</th></tr>
+<tr><td>Node</td><td>Prisma Migrate, Knex, Drizzle Kit, TypeORM, node-pg-migrate, Sequelize</td></tr>
+<tr><td>Python</td><td>Alembic (SQLAlchemy), Django migrations</td></tr>
+<tr><td>Ruby / PHP</td><td>ActiveRecord migrations, Laravel migrations</td></tr>
+<tr><td>JVM</td><td>Flyway, Liquibase</td></tr>
+<tr><td>Language-agnostic</td><td>Flyway, Liquibase, golang-migrate, Atlas, sqitch, dbmate</td></tr>
+</table>
+
+<h2>Anatomy of a migration</h2>
+<pre><code>-- migrations/20260314_001_add_users_phone.up.sql
+ALTER TABLE users ADD COLUMN phone text;
+
+-- migrations/20260314_001_add_users_phone.down.sql
+ALTER TABLE users DROP COLUMN phone;</code></pre>
+<pre><code>// Knex style
+exports.up   = (knex) =&gt; knex.schema.alterTable('users', t =&gt; t.string('phone'));
+exports.down = (knex) =&gt; knex.schema.alterTable('users', t =&gt; t.dropColumn('phone'));
+
+# Typical commands
+npx knex migrate:latest          # apply all pending
+npx prisma migrate deploy        # apply committed migrations (use in production; not "migrate dev")
+alembic upgrade head
+flyway migrate</code></pre>
+<p>Rules: <strong>never edit a migration that has already been applied</strong> anywhere shared (add a new one instead); commit migrations with the code that needs them; keep each small and focused; test them against a copy of production-sized data.</p>
+
+<h2>Where migrations fit in the deploy</h2>
+<pre class="diagram">
+ Old code (v1) running ──────────────────────────────────────────────┐
+                                                                      ▼
+ 1. Run migration  ──▶  schema S1 → S2     v1 code must STILL work on S2   ◀── the key constraint
+ 2. Deploy v2 code (rolling / blue-green)   v1 and v2 BOTH run during the rollout
+ 3. v2 verified; v1 gone
+</pre>
+<p>The critical insight: during a deploy, <strong>old and new code run simultaneously</strong> (rolling update, canary, or just the seconds between processes), and a rollback means old code runs against the <em>new</em> schema. So every migration must be compatible with both the previous and the next version of the application.</p>
+<div class="callout key"><strong>The golden rule</strong><p>Schema changes must be backwards-compatible with the code that is currently running. If a change breaks the old code, you cannot deploy without downtime, and you cannot roll back. Split the change into several safe steps across several deployments.</p></div>
+
+<h2>Safe versus dangerous changes</h2>
+<table>
+<tr><th>Change</th><th>Safe?</th><th>Why / how to do it safely</th></tr>
+<tr><td>Add a nullable column</td><td>Safe</td><td>Old code ignores it. (PostgreSQL 11+ also makes <code>ADD COLUMN ... DEFAULT const</code> instant.)</td></tr>
+<tr><td>Add a table</td><td>Safe</td><td>Nothing uses it yet.</td></tr>
+<tr><td>Add an index</td><td>Careful</td><td>Plain <code>CREATE INDEX</code> blocks writes. Use <code>CREATE INDEX CONCURRENTLY</code> in Postgres (outside a transaction).</td></tr>
+<tr><td>Add <code>NOT NULL</code></td><td>Dangerous</td><td>Old code inserting without it fails. Add nullable, backfill, then add constraint (<code>NOT VALID</code> then <code>VALIDATE</code>).</td></tr>
+<tr><td>Add a foreign key / check constraint</td><td>Careful</td><td>Full-table scan under lock. In Postgres: <code>ADD CONSTRAINT ... NOT VALID</code> then <code>VALIDATE CONSTRAINT</code> (lighter lock).</td></tr>
+<tr><td>Rename a column or table</td><td>Dangerous</td><td>Old code references the old name. Use expand/contract (below).</td></tr>
+<tr><td>Drop a column or table</td><td>Dangerous</td><td>Old code (or a rollback) will break. Only after no running code references it.</td></tr>
+<tr><td>Change a column type</td><td>Dangerous</td><td>May rewrite the whole table under an exclusive lock. Add a new column and migrate.</td></tr>
+<tr><td>Backfill millions of rows in one UPDATE</td><td>Dangerous</td><td>Long transaction, bloat, replication lag, lock contention. Batch it.</td></tr>
+</table>
+
+<h2>The expand / contract pattern</h2>
+<p>Also called "parallel change". To make a breaking change, do it in phases where each phase is individually safe and deployable:</p>
+<ol>
+<li><strong>Expand</strong>: add the new structure alongside the old (migration only; app unchanged).</li>
+<li><strong>Migrate code (dual write)</strong>: deploy code that writes to <em>both</em> old and new, still reading from old.</li>
+<li><strong>Backfill</strong>: copy existing data into the new structure, in batches.</li>
+<li><strong>Switch reads</strong>: deploy code that reads from new (still writes both, so rollback is safe).</li>
+<li><strong>Stop writing old</strong>: deploy code that only uses new.</li>
+<li><strong>Contract</strong>: later, drop the old column in a separate migration, after you are sure you will not roll back past step 5.</li>
+</ol>
+<h3>Worked example: rename <code>users.fullname</code> to <code>users.display_name</code></h3>
+<pre><code>-- Release 1 (expand): add new column
+ALTER TABLE users ADD COLUMN display_name text;
+
+-- Optional: keep both in sync even for old code, using a trigger
+CREATE OR REPLACE FUNCTION sync_display_name() RETURNS trigger AS $$
+BEGIN
+  IF NEW.display_name IS NULL THEN NEW.display_name := NEW.fullname; END IF;
+  IF NEW.fullname     IS NULL THEN NEW.fullname     := NEW.display_name; END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE TRIGGER users_sync BEFORE INSERT OR UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION sync_display_name();
+
+-- Backfill in batches (repeat until 0 rows updated; sleep between batches)
+UPDATE users SET display_name = fullname
+ WHERE id IN (SELECT id FROM users WHERE display_name IS NULL ORDER BY id LIMIT 5000);</code></pre>
+<pre><code>// Release 2: code reads display_name, writes both
+await db.query('UPDATE users SET display_name=$1, fullname=$1 WHERE id=$2', [name, id]);
+const { display_name } = row;
+
+// Release 3: code only uses display_name  (fullname untouched)
+
+-- Release 4 (contract), days or weeks later:
+DROP TRIGGER users_sync ON users;
+ALTER TABLE users DROP COLUMN fullname;</code></pre>
+<p>It takes four deploys instead of one. That is the price of doing it without downtime or rollback risk. For small apps with a maintenance window and a few users, a single "rename" migration at 2 a.m. may be perfectly acceptable. Choose deliberately.</p>
+
+<h2>Locks: how migrations cause outages</h2>
+<p>In PostgreSQL, <code>ALTER TABLE</code> commonly takes an <code>ACCESS EXCLUSIVE</code> lock, blocking even reads. Worse: if a long-running query holds a conflicting lock, your <code>ALTER</code> <em>waits</em> in the queue, and every query that arrives after it queues behind your <code>ALTER</code>. The whole table freezes. Defend with timeouts so the migration fails quickly instead of stalling the app:</p>
+<pre><code>SET lock_timeout = '3s';          -- give up if we cannot get the lock quickly
+SET statement_timeout = '60s';    -- cap runtime of the statement
+ALTER TABLE orders ADD COLUMN note text;
+-- If it fails with "canceling statement due to lock timeout", retry later; nothing broke.
+
+-- Index without blocking writes (cannot run inside a transaction block)
+CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders (user_id);
+
+-- Constraint with minimal locking
+ALTER TABLE orders ADD CONSTRAINT orders_user_fk FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_user_fk;
+
+-- NOT NULL safely (Postgres 12+ uses a validated CHECK to avoid a full scan under lock)
+ALTER TABLE orders ADD CONSTRAINT orders_note_nn CHECK (note IS NOT NULL) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT orders_note_nn;
+ALTER TABLE orders ALTER COLUMN note SET NOT NULL;      -- fast, uses the validated check
+ALTER TABLE orders DROP CONSTRAINT orders_note_nn;</code></pre>
+<p>MySQL has its own online DDL rules (<code>ALGORITHM=INPLACE, LOCK=NONE</code>, tools like gh-ost and pt-online-schema-change for huge tables). Linters such as <code>squawk</code> (Postgres), <code>strong_migrations</code> (Rails) and Atlas lint can flag unsafe migrations in CI.</p>
+
+<h2>Running migrations during deployment</h2>
+<table>
+<tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr>
+<tr><td>Separate deploy step (recommended)</td><td>Pipeline runs <code>migrate</code> once, before rolling out new code</td><td>Single runner, no races; schema is ahead of code (hence backward compatibility)</td></tr>
+<tr><td>App runs migrations at startup</td><td>Every instance runs <code>migrate</code> when booting</td><td>Simple, but N instances race (use advisory locks - most tools do); slow migrations delay readiness; the app DB user needs DDL rights</td></tr>
+<tr><td>Init container / pre-deploy hook</td><td>Kubernetes Job or Helm pre-upgrade hook; Heroku release phase</td><td>Good: runs once per release</td></tr>
+<tr><td>Manual</td><td>DBA runs it</td><td>For risky migrations, with a human watching</td></tr>
+</table>
+<pre><code># Example pipeline order
+1. CI: run tests including a migration test on a fresh DB AND on a copy of the previous schema
+2. Backup / snapshot (or confirm point-in-time recovery is on)
+3. Run migrations (with lock_timeout) using a dedicated migration DB role
+4. Deploy new code (rolling)
+5. Smoke test; keep the old version ready for rollback</code></pre>
+<p>Use a separate database role for migrations (can ALTER) and for the app (only SELECT/INSERT/UPDATE/DELETE) when feasible, limiting what an SQL injection can do.</p>
+
+<h2>Rollbacks and down migrations</h2>
+<p>"Down" migrations look reassuring but are often a trap: a down that drops a column destroys the data written since. In practice, many mature teams do not rely on down migrations in production: they roll back the <em>code</em> (which still works against the expanded schema) and roll <em>forward</em> with a fix migration. Hence: make every release compatible with the previous schema, keep destructive contract steps separate, and treat dropped data as unrecoverable except from a backup. Test your restore.</p>
+
+<h2>Other practices</h2>
+<ul>
+<li><strong>Seed/reference data</strong> as migrations (idempotent), separate from test fixtures.</li>
+<li><strong>Test migrations on production-like data volume</strong>: a migration instant on 100 rows can lock for minutes on 100 million.</li>
+<li><strong>Idempotency and transactions</strong>: Postgres supports transactional DDL (a failed migration rolls back cleanly), MySQL does not (DDL auto-commits, leaving half-applied migrations). Use <code>IF NOT EXISTS</code> where helpful.</li>
+<li><strong>Branching</strong>: two branches adding migrations produce ordering conflicts; use timestamp prefixes and resolve in review.</li>
+<li><strong>Schema drift</strong>: nobody should hand-edit production. Tools like Atlas and Prisma <code>migrate diff</code> can detect drift.</li>
+<li><strong>Document the plan</strong> in the pull request for anything risky: expected duration, lock levels, rollback.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Deploying code that needs the new column before the migration has run, or running a destructive migration before all old instances are gone.</li>
+<li>ORM auto-sync (<code>synchronize: true</code> in TypeORM, <code>db push</code>, Django <code>--run-syncdb</code>) in production, which can drop data silently.</li>
+<li>Long migrations inside the request path or app startup, blowing health-check timeouts and causing crash loops.</li>
+<li>Backfilling in one giant transaction.</li>
+<li>No backup before a risky migration.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Start Postgres locally (<code>docker run -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:17</code>). Create <code>users(id, fullname)</code> and insert 1 million rows with <code>generate_series</code>.</li>
+<li>In one <code>psql</code> session, open a transaction that reads from <code>users</code> and does not commit. In another run <code>ALTER TABLE users ADD COLUMN x int;</code> and watch it hang; in a third session try a plain <code>SELECT</code> and see it queue behind the ALTER. Then retry with <code>SET lock_timeout='2s'</code>.</li>
+<li>Time <code>CREATE INDEX</code> versus <code>CREATE INDEX CONCURRENTLY</code> while a loop inserts rows from another session.</li>
+<li>Walk through the rename example using a migration tool of your choice: write the four releases as separate migrations and a tiny app version for each. Confirm that app v1 still works after release 1 and release 2's schema.</li>
+<li>Add a migration linter (squawk or Atlas lint) to a CI job and see what it flags on a <code>DROP COLUMN</code>.</li>
+</ol></div>

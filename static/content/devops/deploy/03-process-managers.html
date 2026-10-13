@@ -1,0 +1,180 @@
+<h1>Process Managers: systemd, PM2, supervisor</h1>
+<p class="lead">Running <code>node server.js</code> in an SSH session works until you close the terminal, the process crashes, or the server reboots. A process manager keeps your app alive, restarts it when it fails, captures its logs and starts it at boot.</p>
+
+<h2>The problem</h2>
+<p>Run <code>node server.js &amp;</code> and log out: depending on the shell, the process gets SIGHUP and dies. Use <code>nohup</code> or <code>screen</code> and it survives logout, but when it crashes at 3 a.m. nobody restarts it, logs go to a random file, and after a reboot it is gone. A <strong>process manager</strong> (also called a supervisor or init system) is a small, trusted program whose job is to run your programs and keep them running:</p>
+<ul>
+<li>Start on boot, in the right order (after network, after database).</li>
+<li>Restart on crash, with back-off so a crash loop does not melt the CPU.</li>
+<li>Run as a specific unprivileged user with resource limits.</li>
+<li>Collect stdout/stderr and manage logs.</li>
+<li>Offer start/stop/restart/status commands and send signals correctly for graceful shutdown.</li>
+</ul>
+
+<h2>Option 1: systemd (the default on modern Linux)</h2>
+<p>systemd is PID 1 on Ubuntu, Debian, RHEL, Fedora. It is already installed, supervises everything on the machine, and needs no extra runtime. For a single server, it is usually the right answer. A unit file:</p>
+<pre><code># /etc/systemd/system/myapp.service
+[Unit]
+Description=My Node API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myapp
+Group=myapp
+WorkingDirectory=/srv/myapp/current
+EnvironmentFile=/etc/myapp/myapp.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure          # restart if exit code != 0, killed by signal, or timeout
+RestartSec=3
+StartLimitIntervalSec=60    # give up (mark failed) if it restarts too often...
+StartLimitBurst=5           # ...more than 5 times in 60 s
+TimeoutStopSec=30           # how long to wait after SIGTERM before SIGKILL
+LimitNOFILE=65536
+MemoryMax=1G                # cgroup limit: OOM-kill this service, not the whole box
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+<pre><code>sudo systemctl daemon-reload            # after editing any unit file
+sudo systemctl enable --now myapp       # start now AND at boot
+sudo systemctl restart myapp
+sudo systemctl status myapp
+sudo systemctl reload myapp             # if you defined ExecReload (e.g. send SIGHUP)
+journalctl -u myapp -f                  # follow logs
+journalctl -u myapp --since "1 hour ago" -p err
+systemctl list-units --failed
+systemd-analyze security myapp          # hardening score card</code></pre>
+<p>Logs: stdout and stderr go to the journal automatically. Just <code>console.log</code>; no log files to rotate. Make sure the journal is persistent (<code>/var/log/journal</code> exists) and size-limited (<code>SystemMaxUse=</code> in <code>/etc/systemd/journald.conf</code>).</p>
+
+<h3>Restart policies</h3>
+<table>
+<tr><th><code>Restart=</code></th><th>Restarts when</th><th>Use for</th></tr>
+<tr><td><code>no</code></td><td>Never</td><td>One-shot jobs</td></tr>
+<tr><td><code>on-failure</code></td><td>Non-zero exit, signal, timeout</td><td>Most services (a clean <code>systemctl stop</code> stays stopped)</td></tr>
+<tr><td><code>always</code></td><td>Any exit</td><td>Daemons that should never exit</td></tr>
+</table>
+
+<h3>Running several instances: template units</h3>
+<pre><code># /etc/systemd/system/myapp@.service   (the "@" makes it a template; %i is the instance name)
+[Service]
+Environment=PORT=%i
+ExecStart=/usr/bin/node server.js
+# ...rest as above
+
+sudo systemctl enable --now myapp@3000 myapp@3001 myapp@3002
+# then load-balance across 3000-3002 with nginx upstream</code></pre>
+<p>Other useful systemd features: <code>.timer</code> units (a better cron), socket activation, <code>ExecStartPre</code> (run migrations or checks), <code>DynamicUser=yes</code>, <code>WatchdogSec</code> with <code>sd_notify</code> for liveness.</p>
+
+<h2>Option 2: PM2 (Node-specific)</h2>
+<p>PM2 is a Node process manager with batteries: clustering, zero-downtime reload, built-in log management and a monitor UI. It is popular because it is easy for Node developers and does not require systemd knowledge.</p>
+<pre><code>sudo npm install -g pm2
+
+pm2 start server.js --name myapp -i max      # cluster mode: one worker per CPU core
+pm2 list
+pm2 logs myapp
+pm2 monit
+pm2 reload myapp                             # graceful zero-downtime reload (cluster mode)
+pm2 restart myapp
+pm2 stop myapp
+
+# Survive reboots: PM2 registers itself with systemd
+pm2 startup systemd -u myapp --hp /srv/myapp   # prints a command to run with sudo
+pm2 save                                       # remember the current process list</code></pre>
+<p>Better to declare it in a file:</p>
+<pre><code>// ecosystem.config.js
+module.exports = {
+  apps: [{
+    name: 'myapp',
+    script: 'server.js',
+    instances: 'max',            // or a number
+    exec_mode: 'cluster',
+    max_memory_restart: '500M',  // restart a leaking worker
+    kill_timeout: 10000,         // ms before SIGKILL after SIGINT/SIGTERM
+    wait_ready: true,            // wait for process.send('ready') before routing traffic
+    listen_timeout: 10000,
+    env_production: { NODE_ENV: 'production', PORT: 3000 }
+  }]
+};
+// pm2 start ecosystem.config.js --env production</code></pre>
+<p>Pros: cluster mode with rolling reload; simple for Node; cross-platform (works on a laptop and macOS). Cons: another daemon (which itself needs supervising, hence <code>pm2 startup</code> using systemd); logs live in <code>~/.pm2/logs</code> unless configured (add <code>pm2-logrotate</code>); a Node-centric tool, so mixed-language servers need a second manager; the free tier pushes toward the paid PM2 Plus.</p>
+
+<h2>Option 3: supervisor</h2>
+<p>Supervisor (<code>supervisord</code>) is a Python-based, language-agnostic process control system, historically popular for Python/PHP/Ruby apps before systemd was universal, and still common inside containers that must run several processes.</p>
+<pre><code># /etc/supervisor/conf.d/myapp.conf
+[program:myapp]
+command=/usr/bin/node /srv/myapp/current/server.js
+directory=/srv/myapp/current
+user=myapp
+autostart=true
+autorestart=true
+startretries=5
+stopsignal=TERM
+stopwaitsecs=30
+numprocs=1
+environment=NODE_ENV="production",PORT="3000"
+stdout_logfile=/var/log/myapp/out.log
+stderr_logfile=/var/log/myapp/err.log
+stdout_logfile_maxbytes=50MB
+stdout_logfile_backups=5</code></pre>
+<pre><code>sudo apt install -y supervisor
+sudo supervisorctl reread &amp;&amp; sudo supervisorctl update
+sudo supervisorctl status
+sudo supervisorctl restart myapp</code></pre>
+<p>On a modern server it duplicates what systemd already does; choose it when you are inside a container or on a system without systemd.</p>
+
+<h2>Comparison</h2>
+<table>
+<tr><th></th><th>systemd</th><th>PM2</th><th>supervisor</th></tr>
+<tr><td>Installed by default</td><td>Yes</td><td>No (npm)</td><td>No (apt/pip)</td></tr>
+<tr><td>Language</td><td>Any</td><td>Node (others possible)</td><td>Any</td></tr>
+<tr><td>Starts at boot</td><td>Native</td><td>Via systemd hook</td><td>Via init/systemd</td></tr>
+<tr><td>Clustering over cores</td><td>Template units + LB</td><td>Built in (<code>-i max</code>)</td><td><code>numprocs</code> + LB</td></tr>
+<tr><td>Zero-downtime reload</td><td>Not built in (use proxy/LB drain)</td><td><code>pm2 reload</code></td><td>No</td></tr>
+<tr><td>Logs</td><td>journald</td><td>Files in <code>~/.pm2</code></td><td>Files you configure</td></tr>
+<tr><td>Resource limits and sandboxing</td><td>Excellent (cgroups, namespaces)</td><td>Memory restart only</td><td>Minimal</td></tr>
+<tr><td>Dependencies between services</td><td>Yes (<code>After=</code>, <code>Requires=</code>)</td><td>No</td><td>Priority ordering only</td></tr>
+</table>
+
+<h2>Clustering: using every core</h2>
+<p>A Node process runs JavaScript on one thread, so a 4-core VPS wastes 3 cores with a single process. Options:</p>
+<ol>
+<li><strong>PM2 cluster mode</strong> or Node's <code>cluster</code> module: the master process listens on the port and distributes connections to workers. Easiest.</li>
+<li><strong>Multiple processes behind nginx</strong>: systemd template units on ports 3000, 3001, ... listed in an nginx <code>upstream</code>. More explicit, plays well with drain-and-restart one at a time.</li>
+<li><strong>Containers</strong>: one container per core or many replicas behind a load balancer (the Kubernetes way).</li>
+</ol>
+<p>Constraints: workers share nothing. In-memory sessions, caches, rate-limit counters and WebSocket rooms are per process. Move shared state to Redis/Postgres. This is the same stateless-app requirement as for load balancers. For other stacks the equivalents are gunicorn/uvicorn workers (<code>-w 4</code>), Puma workers, PHP-FPM pools. JVM apps typically use threads in one process instead.</p>
+
+<h2>Signals and graceful stop</h2>
+<p>All managers stop a process the same way: send SIGTERM, wait a timeout, then SIGKILL. Your app should handle SIGTERM by finishing in-flight work (details in the zero-downtime lesson). Two traps: running via <code>npm start</code> or a shell wrapper puts an intermediate process between the manager and Node that may not forward signals. Execute <code>node</code> directly in <code>ExecStart</code>. And in Docker, the same applies to PID 1.</p>
+
+<h2>Which should you choose?</h2>
+<ul>
+<li><strong>A Linux server, any language</strong>: systemd. Fewer moving parts, best isolation, native logging.</li>
+<li><strong>Node, want clustering and graceful reloads with minimal fuss</strong>: PM2 (ideally started by systemd), or systemd with several instances behind nginx.</li>
+<li><strong>Inside a container</strong>: usually none. One process per container; the orchestrator (Docker restart policy, Kubernetes) is the manager.</li>
+<li><strong>Multiple processes in one container or no systemd</strong>: supervisor (or s6-overlay).</li>
+</ul>
+
+<div class="callout tip"><strong>Don't forget what supervises the supervisor</strong><p>Whatever you choose, check it survives a reboot and that its own crash is handled. A process manager that is not enabled at boot is just a more elaborate way to forget to start your app.</p></div>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Crash loops hiding a real bug: a restart policy with no limit and no alert. Alert on restart count.</li>
+<li>Memory leaks "fixed" by <code>max_memory_restart</code> forever. It is a safety net, not a cure.</li>
+<li>Relative paths and missing environment: services run with a minimal environment, not your shell's. Specify <code>WorkingDirectory</code>, absolute paths and <code>EnvironmentFile</code>.</li>
+<li>Forgetting <code>daemon-reload</code> after editing a unit; changes silently do not apply.</li>
+<li>Running as root. Always set <code>User=</code>.</li>
+<li>PM2 started as your login user, so it does not run after reboot unless <code>pm2 startup</code> and <code>pm2 save</code> were done.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write a tiny Node HTTP server, create a systemd unit for it with <code>Restart=on-failure</code>, start it and <code>curl</code> it.</li>
+<li>Kill it with <code>kill -9</code> and confirm it comes back (<code>journalctl -u</code>). Add <code>process.exit(1)</code> on a route to make it crash on demand; check <code>StartLimitBurst</code> behaviour by triggering it repeatedly.</li>
+<li>Set <code>MemoryMax=100M</code> and write a route that leaks memory. Watch systemd kill and restart the service.</li>
+<li>Install PM2, run the same app with <code>-i 2</code>, and hit the endpoint repeatedly while it returns <code>process.pid</code> to see requests spread across workers. Run <code>pm2 reload</code> under load with <code>curl</code> in a loop and count failures.</li>
+<li>Reboot the machine and verify which of the two setups came back on its own.</li>
+</ol></div>

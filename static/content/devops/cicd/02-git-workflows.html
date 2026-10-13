@@ -1,0 +1,163 @@
+<h1>Git Workflows: Branching, Reviews and Releases</h1>
+<p class="lead">CI/CD is only as good as the workflow that feeds it. How your team branches, reviews, merges and tags code determines how often you integrate, how risky releases are, and how easily you can trace what is running in production.</p>
+
+<h2>Why a workflow at all?</h2>
+<p>Git gives you cheap branches and no rules. Without an agreed workflow, teams drift into the worst of all worlds: long-lived personal branches, unreviewed pushes to main, "which branch is production?" confusion, and releases nobody can reproduce. A workflow is a small set of conventions that answers: where does new work happen, how does it get reviewed, how does it reach production, and how do we fix production quickly?</p>
+
+<h2>The three models you will meet</h2>
+<h3>1. Trunk-based development</h3>
+<p>Everybody integrates into a single branch (<code>main</code>, the "trunk") at least once a day. Branches, if used at all, live hours to a couple of days. Incomplete work is hidden behind <strong>feature flags</strong> so unfinished code can be merged and even deployed safely.</p>
+<pre class="diagram">
+ main  ──●──●──●──●──●──●──●──●──●──▶   (always releasable)
+          \/  \/    \/
+          short-lived branches (&lt; 1-2 days) / small PRs
+ releases: tag a commit on main (v1.8.0), or cut a release branch only when needed
+</pre>
+<p><strong>Pros:</strong> minimal integration pain, fastest feedback, simplest model, best DORA outcomes. <strong>Cons:</strong> needs strong automated tests, feature flags, and team discipline. It is the model CI was designed around, and the one the DORA research most strongly associates with high performance.</p>
+
+<h3>2. GitHub Flow</h3>
+<p>A lightweight variant: <code>main</code> is always deployable; every change is a short feature branch plus a pull request; merge after review and green checks; deploy from main (often immediately).</p>
+<pre class="diagram">
+ main     ──●────────────●────────────●──▶
+            \           /\           /
+ feature     ●──●──●───●  ●──●──●───●     (PR, review, CI, merge)
+</pre>
+<p>This is trunk-based development with a pull request gate. For most web teams it is the right default.</p>
+
+<h3>3. GitFlow</h3>
+<p>Introduced by Vincent Driessen in 2010. It uses several long-lived branches: <code>main</code> (production), <code>develop</code> (integration), plus <code>feature/*</code>, <code>release/*</code> and <code>hotfix/*</code>.</p>
+<pre class="diagram">
+ main     ──●───────────────────●────────●──▶  (tags v1.0, v1.1)
+             \                  / \      /
+ release      \        ●──●──●/   \    /
+               \      /           \  /
+ develop  ──●───●──●──●──●──●──●───●──●──▶
+              \  /  \  /
+ feature       ●●    ●●
+ hotfix                       ●──●  (from main, merged to main AND develop)
+</pre>
+<p><strong>Pros:</strong> explicit release stabilization; fits software that ships in numbered versions and supports several versions at once (desktop apps, firmware, libraries with LTS lines). <strong>Cons:</strong> long-lived branches recreate integration hell; double merges (to main and develop); slow flow; poor fit for continuous deployment. Even its author later added a note recommending simpler flows for web apps that deploy continuously.</p>
+
+<table>
+<tr><th></th><th>Trunk-based</th><th>GitHub Flow</th><th>GitFlow</th></tr>
+<tr><td>Long-lived branches</td><td>main only</td><td>main only</td><td>main + develop (+ release)</td></tr>
+<tr><td>Branch lifetime</td><td>Hours</td><td>Days</td><td>Weeks</td></tr>
+<tr><td>Release cadence</td><td>On demand, many/day</td><td>On demand</td><td>Scheduled versions</td></tr>
+<tr><td>Needs feature flags</td><td>Yes</td><td>Helpful</td><td>Rarely</td></tr>
+<tr><td>Best for</td><td>SaaS, high-performing teams</td><td>Most web teams</td><td>Versioned/multi-release products</td></tr>
+<tr><td>CI/CD fit</td><td>Excellent</td><td>Excellent</td><td>Awkward</td></tr>
+</table>
+<div class="callout key"><strong>Recommendation</strong><p>If you deploy a service you control, use GitHub Flow or trunk-based development. Reach for GitFlow-style release branches only when you truly must maintain several released versions in parallel.</p></div>
+
+<h2>Pull requests and code review</h2>
+<p>A pull request (GitHub, Bitbucket) or merge request (GitLab) is where CI and humans meet. It bundles the diff, the discussion and the automated checks in one place.</p>
+<h3>What a good PR looks like</h3>
+<ul>
+<li><strong>Small.</strong> Aim for under ~400 lines changed. Review quality collapses on big diffs ("10 lines = 10 comments; 500 lines = LGTM").</li>
+<li><strong>One purpose.</strong> A bug fix and a refactor are two PRs.</li>
+<li><strong>Described.</strong> Why the change, how it was tested, screenshots, links to the issue, rollout/rollback notes.</li>
+<li><strong>Green before review.</strong> Reviewers should not spend time on something a linter or test already rejects.</li>
+</ul>
+<h3>What reviewers should do</h3>
+<ul>
+<li>Check design, correctness, edge cases, security, and tests. Leave style to the formatter and linter.</li>
+<li>Review within hours, not days; slow review is a hidden lead-time killer. Many teams set a norm like "first response within one working day".</li>
+<li>Distinguish blocking comments from suggestions ("nit:").</li>
+</ul>
+<h3>Merge strategies</h3>
+<table>
+<tr><th>Strategy</th><th>Result</th><th>Use when</th></tr>
+<tr><td>Merge commit</td><td>Preserves branch history, adds a merge commit</td><td>You want full history</td></tr>
+<tr><td>Squash and merge</td><td>One commit per PR on main</td><td>Most teams: linear, readable, each commit = one reviewed change, easy revert</td></tr>
+<tr><td>Rebase and merge</td><td>Replays commits linearly</td><td>Clean, meaningful individual commits</td></tr>
+</table>
+
+<h2>Branch protection: enforcing the rules</h2>
+<p>A convention nobody enforces will be broken at 6 p.m. on a Friday. Branch protection (GitHub "rulesets" / protected branches, GitLab protected branches) makes the rules mechanical. For <code>main</code>, a sensible baseline:</p>
+<ul>
+<li>Require a pull request; no direct pushes, including for admins.</li>
+<li>Require at least 1 approving review (2 for sensitive repos); dismiss stale approvals when new commits land.</li>
+<li>Require status checks to pass (your CI jobs by name) and require the branch to be up to date before merging.</li>
+<li>Require signed commits or linear history if your policy demands it.</li>
+<li>Use a <code>CODEOWNERS</code> file so changes to certain paths auto-request the owning team.</li>
+<li>Block force-pushes and branch deletion.</li>
+</ul>
+<pre><code># .github/CODEOWNERS
+*                    @acme/backend
+/infra/              @acme/platform
+/.github/workflows/  @acme/platform   # pipeline changes need platform review
+/docs/               @acme/docs
+</code></pre>
+<div class="callout warn"><strong>Pipeline changes are code changes</strong><p>Anyone who can change the workflow file can change what runs with your secrets. Put workflow files under CODEOWNERS and require review for them.</p></div>
+
+<h2>Commits: conventional commits</h2>
+<p>The Conventional Commits specification gives commit messages a machine-readable shape:</p>
+<pre><code>&lt;type&gt;(&lt;optional scope&gt;): &lt;description&gt;
+
+[optional body]
+
+[optional footer(s)]</code></pre>
+<table>
+<tr><th>Type</th><th>Meaning</th><th>Version bump</th></tr>
+<tr><td><code>feat</code></td><td>New feature</td><td>MINOR</td></tr>
+<tr><td><code>fix</code></td><td>Bug fix</td><td>PATCH</td></tr>
+<tr><td><code>feat!</code> or footer <code>BREAKING CHANGE:</code></td><td>Incompatible API change</td><td>MAJOR</td></tr>
+<tr><td><code>docs</code>, <code>chore</code>, <code>refactor</code>, <code>test</code>, <code>ci</code>, <code>perf</code>, <code>build</code></td><td>Non-user-facing</td><td>none (usually)</td></tr>
+</table>
+<pre><code>feat(cart): allow applying multiple discount codes
+fix(auth): refresh token before expiry to avoid 401 loop
+feat(api)!: remove deprecated /v1/orders endpoint
+
+BREAKING CHANGE: clients must migrate to /v2/orders.</code></pre>
+<p>Why bother? Tools such as <code>semantic-release</code>, <code>release-please</code> and <code>git-cliff</code> read these messages to compute the next version and generate a changelog automatically, so releasing becomes a merge instead of a ceremony. A commit-lint check in CI (<code>commitlint</code>) enforces the format. With squash merging, you only need to enforce the <em>PR title</em>.</p>
+
+<h2>Semantic versioning</h2>
+<p>SemVer (<code>MAJOR.MINOR.PATCH</code>, e.g. <code>2.14.3</code>) is a contract with consumers:</p>
+<ul>
+<li><strong>MAJOR</strong>: incompatible API changes.</li>
+<li><strong>MINOR</strong>: backward-compatible new functionality.</li>
+<li><strong>PATCH</strong>: backward-compatible bug fixes.</li>
+<li>Pre-release and build metadata: <code>2.0.0-rc.1</code>, <code>1.4.2+build.567</code>.</li>
+</ul>
+<p>SemVer is essential for libraries. For continuously deployed services, users do not care about version numbers, so many teams identify releases by <strong>commit SHA</strong> or date-based tags (<code>2026.10.05-3</code>, CalVer). Pick one scheme and apply it consistently to artifacts.</p>
+
+<h2>Tags and releases</h2>
+<p>A <strong>tag</strong> is a permanent name for a commit. Use annotated tags for releases; they store author, date and message.</p>
+<pre><code># create and push an annotated tag
+git tag -a v1.8.0 -m "Release 1.8.0"
+git push origin v1.8.0
+
+# list, inspect, check out a release
+git tag --list 'v1.*'
+git show v1.8.0
+git switch --detach v1.8.0
+
+# what changed between releases?
+git log --oneline v1.7.0..v1.8.0</code></pre>
+<p>A <strong>release</strong> on GitHub/GitLab is a tag plus release notes and attached assets (binaries, checksums). The common automation pattern: pushing a tag <code>v*</code> triggers a pipeline that builds, tests, publishes the artifacts (npm package, Docker image tagged <code>1.8.0</code>) and creates the release page.</p>
+<div class="callout tip"><strong>Release from a tag, deploy from a SHA</strong><p>Tag the image with both the commit SHA (immutable, always unique) and the semantic version. Never deploy <code>latest</code>; you cannot tell what it contains or roll back to it.</p></div>
+
+<h2>Hotfixes and rollbacks</h2>
+<ul>
+<li><strong>Trunk/GitHub Flow:</strong> a hotfix is just a normal small PR through the fast pipeline. Often, <code>git revert &lt;sha&gt;</code> of the bad PR is the fastest fix and goes through the same pipeline.</li>
+<li><strong>Release branches:</strong> branch from the release tag, fix, tag <code>v1.8.1</code>, then merge or cherry-pick the fix back to main so it is not lost.</li>
+<li>Prefer <code>git revert</code> over rewriting history on shared branches. Never force-push main.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Long-lived feature branches.</strong> The number one cause of integration hell. Use feature flags and merge daily.</li>
+<li><strong>Giant PRs.</strong> Split them; stack PRs if needed.</li>
+<li><strong>Rubber-stamp reviews.</strong> Approvals without reading give a false sense of safety.</li>
+<li><strong>Admins bypassing protection.</strong> Rules apply to everyone, or to no one.</li>
+<li><strong>Secrets committed to Git.</strong> Rotating is mandatory; rewriting history is not enough. Enable secret scanning/push protection.</li>
+<li><strong>Merging when CI is red "just this once".</strong> That is how red builds become normal.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a throwaway GitHub repo. In Settings, add a ruleset for <code>main</code> requiring a PR and one approval. Try to push directly and observe the rejection.</li>
+<li>Make a branch, commit with <code>feat: add greeting</code>, open a PR, and squash merge it.</li>
+<li>Tag <code>v0.1.0</code> with <code>git tag -a</code>, push it, and create a GitHub release from it.</li>
+<li>Install <code>commitlint</code> or try <code>npx release-please</code> to see how commit types drive versions.</li>
+</ol></div>

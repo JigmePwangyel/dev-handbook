@@ -1,0 +1,220 @@
+<h1>Cheat Sheets</h1>
+<p class="lead">Dense, scannable reference tables for the commands you will use daily. Bookmark this page; the goal is recall speed, not explanation. Each section links back to a lesson for the why.</p>
+
+<h2>Linux: files, text and navigation</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>List with details, hidden, sorted by time</td><td><code>ls -lAht</code></td></tr>
+<tr><td>Find files by name / size / age</td><td><code>find /var -name '*.log' -size +100M -mtime -7</code></td></tr>
+<tr><td>Search text recursively</td><td><code>grep -rIn --include='*.js' 'TODO' .</code> (or <code>rg TODO</code>)</td></tr>
+<tr><td>Follow a log</td><td><code>tail -f /var/log/syslog</code></td></tr>
+<tr><td>Disk usage by directory</td><td><code>du -sh * | sort -h</code></td></tr>
+<tr><td>Filesystem free space / inodes</td><td><code>df -h</code> / <code>df -i</code></td></tr>
+<tr><td>Permissions: owner, mode</td><td><code>chown user:group f</code>, <code>chmod 640 f</code>, <code>chmod -R u=rwX,g=rX,o= dir</code></td></tr>
+<tr><td>Count/sort/uniq pattern</td><td><code>awk '{print $1}' access.log | sort | uniq -c | sort -nr | head</code></td></tr>
+<tr><td>Replace in files</td><td><code>sed -i 's/old/new/g' file</code></td></tr>
+<tr><td>Archive / extract</td><td><code>tar czf a.tgz dir/</code> / <code>tar xzf a.tgz -C /dest</code></td></tr>
+<tr><td>Copy over SSH efficiently</td><td><code>rsync -avz --delete src/ user@host:/dest/</code></td></tr>
+<tr><td>Run on many files</td><td><code>xargs -P4 -n1</code>, <code>find ... -exec cmd {} +</code></td></tr>
+</table>
+
+<h2>Linux: processes, resources, system</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Process list</td><td><code>ps aux --sort=-%mem | head</code>, <code>htop</code></td></tr>
+<tr><td>Kill politely / forcibly</td><td><code>kill -TERM PID</code> / <code>kill -9 PID</code></td></tr>
+<tr><td>Who is listening on which port</td><td><code>ss -tlnp</code> (or <code>lsof -i :8080</code>)</td></tr>
+<tr><td>Memory, CPU, load</td><td><code>free -h</code>, <code>uptime</code>, <code>vmstat 1</code></td></tr>
+<tr><td>Disk IO</td><td><code>iostat -x 1</code>, <code>iotop</code></td></tr>
+<tr><td>Open files by process</td><td><code>lsof -p PID</code></td></tr>
+<tr><td>Kernel messages / OOM kills</td><td><code>dmesg -T | tail</code>, <code>journalctl -k | grep -i oom</code></td></tr>
+<tr><td>OS version, kernel</td><td><code>cat /etc/os-release</code>, <code>uname -r</code></td></tr>
+<tr><td>Users and sudo</td><td><code>id</code>, <code>sudo -l</code>, <code>last</code>, <code>adduser</code>, <code>usermod -aG docker u</code></td></tr>
+<tr><td>Scheduled jobs</td><td><code>crontab -e</code>; <code>* * * * *</code> = min hour dom mon dow</td></tr>
+<tr><td>Packages (Debian/Ubuntu)</td><td><code>apt update &amp;&amp; apt upgrade</code>, <code>apt install x</code>, <code>dpkg -l | grep x</code></td></tr>
+<tr><td>Packages (RHEL/Fedora)</td><td><code>dnf install x</code>, <code>rpm -qa | grep x</code></td></tr>
+</table>
+
+<h2>Networking and debugging</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>HTTP request with headers, timing</td><td><code>curl -sS -D- -o /dev/null -w '%{http_code} %{time_total}s\n' URL</code></td></tr>
+<tr><td>Verbose TLS / force resolve</td><td><code>curl -v URL</code>; <code>curl --resolve host:443:1.2.3.4 https://host</code></td></tr>
+<tr><td>DNS lookup</td><td><code>dig +short A host</code>, <code>dig @1.1.1.1 host MX</code>, <code>dig +trace host</code></td></tr>
+<tr><td>Path to host</td><td><code>traceroute host</code>, <code>mtr -rw host</code></td></tr>
+<tr><td>Port reachable?</td><td><code>nc -zv host 443</code></td></tr>
+<tr><td>Certificate details / expiry</td><td><code>openssl s_client -connect host:443 -servername host | openssl x509 -noout -dates -subject</code></td></tr>
+<tr><td>Packet capture</td><td><code>tcpdump -i any port 80 -n</code></td></tr>
+<tr><td>Interfaces and routes</td><td><code>ip a</code>, <code>ip r</code></td></tr>
+<tr><td>Firewall (ufw)</td><td><code>ufw status verbose</code>, <code>ufw allow 443/tcp</code></td></tr>
+</table>
+
+<h2>systemd</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Start / stop / restart / reload</td><td><code>systemctl start|stop|restart|reload app</code></td></tr>
+<tr><td>Enable at boot (and start now)</td><td><code>systemctl enable --now app</code></td></tr>
+<tr><td>Status and recent logs</td><td><code>systemctl status app</code></td></tr>
+<tr><td>Failed units</td><td><code>systemctl --failed</code></td></tr>
+<tr><td>Reload after editing unit files</td><td><code>systemctl daemon-reload</code></td></tr>
+<tr><td>Edit with override drop-in</td><td><code>systemctl edit app</code></td></tr>
+<tr><td>Logs for a unit, follow</td><td><code>journalctl -u app -f</code></td></tr>
+<tr><td>Logs since / priority</td><td><code>journalctl -u app --since "1 hour ago" -p err</code></td></tr>
+<tr><td>This boot / previous boot</td><td><code>journalctl -b</code> / <code>journalctl -b -1</code></td></tr>
+<tr><td>Timers</td><td><code>systemctl list-timers</code></td></tr>
+<tr><td>Boot time analysis</td><td><code>systemd-analyze blame</code>, <code>systemd-analyze security app</code></td></tr>
+</table>
+<pre><code>[Unit]
+Description=My app
+After=network-online.target
+[Service]
+User=app
+WorkingDirectory=/opt/app
+EnvironmentFile=/etc/app.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+<h2>Docker</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Build / tag / push</td><td><code>docker build -t repo/app:1.0 .</code>, <code>docker push repo/app:1.0</code></td></tr>
+<tr><td>Run detached with port, env, volume</td><td><code>docker run -d --name web -p 8080:80 -e KEY=v -v data:/data --restart unless-stopped img</code></td></tr>
+<tr><td>List running / all</td><td><code>docker ps</code> / <code>docker ps -a</code></td></tr>
+<tr><td>Logs, follow</td><td><code>docker logs -f --tail 100 web</code></td></tr>
+<tr><td>Shell into container</td><td><code>docker exec -it web sh</code></td></tr>
+<tr><td>Inspect config / IP</td><td><code>docker inspect web</code></td></tr>
+<tr><td>Resource usage</td><td><code>docker stats</code></td></tr>
+<tr><td>Stop / remove</td><td><code>docker stop web &amp;&amp; docker rm web</code></td></tr>
+<tr><td>Images: list, remove dangling</td><td><code>docker images</code>, <code>docker image prune</code></td></tr>
+<tr><td>Clean up everything unused (careful)</td><td><code>docker system prune -a --volumes</code></td></tr>
+<tr><td>Layer history</td><td><code>docker history --no-trunc img</code></td></tr>
+<tr><td>Copy files</td><td><code>docker cp web:/etc/nginx/nginx.conf .</code></td></tr>
+<tr><td>Networks / volumes</td><td><code>docker network ls</code>, <code>docker volume ls</code></td></tr>
+</table>
+<h3>Compose</h3>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Up (build, detached)</td><td><code>docker compose up -d --build</code></td></tr>
+<tr><td>Down (and delete volumes)</td><td><code>docker compose down</code> (<code>-v</code>)</td></tr>
+<tr><td>Status / logs</td><td><code>docker compose ps</code>, <code>docker compose logs -f svc</code></td></tr>
+<tr><td>One-off command</td><td><code>docker compose run --rm svc cmd</code></td></tr>
+<tr><td>Exec in running service</td><td><code>docker compose exec svc sh</code></td></tr>
+<tr><td>Pull and recreate one service</td><td><code>docker compose pull svc &amp;&amp; docker compose up -d --no-deps svc</code></td></tr>
+<tr><td>Render final config</td><td><code>docker compose config</code></td></tr>
+</table>
+
+<h2>kubectl</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Contexts and namespaces</td><td><code>kubectl config get-contexts</code>, <code>kubectl config use-context X</code>, <code>kubectl config set-context --current --namespace=NS</code></td></tr>
+<tr><td>List resources</td><td><code>kubectl get pods,svc,deploy -n NS -o wide</code>, <code>-A</code> for all namespaces</td></tr>
+<tr><td>Describe (events!)</td><td><code>kubectl describe pod P</code></td></tr>
+<tr><td>Logs</td><td><code>kubectl logs -f P -c container</code>, <code>--previous</code> for crashed container</td></tr>
+<tr><td>Exec / debug</td><td><code>kubectl exec -it P -- sh</code>, <code>kubectl debug -it P --image=busybox --target=app</code></td></tr>
+<tr><td>Apply / delete manifests</td><td><code>kubectl apply -f dir/</code>, <code>kubectl delete -f f.yaml</code>, <code>kubectl diff -f f.yaml</code></td></tr>
+<tr><td>Rollout status / history / undo</td><td><code>kubectl rollout status deploy/X</code>, <code>rollout history</code>, <code>rollout undo deploy/X</code></td></tr>
+<tr><td>Restart a deployment</td><td><code>kubectl rollout restart deploy/X</code></td></tr>
+<tr><td>Scale / set image</td><td><code>kubectl scale deploy/X --replicas=5</code>, <code>kubectl set image deploy/X app=img:2</code></td></tr>
+<tr><td>Port forward</td><td><code>kubectl port-forward svc/X 8080:80</code></td></tr>
+<tr><td>Resource usage</td><td><code>kubectl top pods</code>, <code>kubectl top nodes</code></td></tr>
+<tr><td>Events sorted</td><td><code>kubectl get events --sort-by=.lastTimestamp</code></td></tr>
+<tr><td>Generate YAML</td><td><code>kubectl create deploy x --image=img --dry-run=client -o yaml</code></td></tr>
+<tr><td>Secrets (decode)</td><td><code>kubectl get secret S -o jsonpath='{.data.key}' | base64 -d</code></td></tr>
+<tr><td>Permission check</td><td><code>kubectl auth can-i create pods --as system:serviceaccount:NS:SA</code></td></tr>
+<tr><td>Explain a field</td><td><code>kubectl explain deploy.spec.strategy</code></td></tr>
+</table>
+<h3>Pod status quick diagnosis</h3>
+<table>
+<tr><th>Status</th><th>Usual cause</th><th>First command</th></tr>
+<tr><td>Pending</td><td>No node fits (resources, taints, PVC unbound)</td><td><code>describe pod</code> events</td></tr>
+<tr><td>ImagePullBackOff</td><td>Wrong tag or missing registry credentials</td><td><code>describe pod</code></td></tr>
+<tr><td>CrashLoopBackOff</td><td>App exits on start (config, dependency)</td><td><code>logs --previous</code></td></tr>
+<tr><td>OOMKilled</td><td>Memory limit too low or leak</td><td><code>describe pod</code> last state</td></tr>
+<tr><td>Running but not Ready</td><td>Readiness probe failing</td><td><code>describe pod</code>, check probe path/port</td></tr>
+<tr><td>Service has no endpoints</td><td>Selector does not match pod labels</td><td><code>kubectl get endpoints svc</code></td></tr>
+</table>
+
+<h2>git</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Status, short log graph</td><td><code>git status -sb</code>, <code>git log --oneline --graph --decorate -20</code></td></tr>
+<tr><td>Stage parts / commit</td><td><code>git add -p</code>, <code>git commit -m "msg"</code></td></tr>
+<tr><td>New branch / switch</td><td><code>git switch -c feat/x</code>, <code>git switch main</code></td></tr>
+<tr><td>Update from remote</td><td><code>git fetch --prune</code>, <code>git pull --rebase</code></td></tr>
+<tr><td>Rebase onto main</td><td><code>git rebase origin/main</code> (resolve, <code>git rebase --continue</code>)</td></tr>
+<tr><td>Squash last N commits interactively</td><td><code>git rebase -i HEAD~N</code></td></tr>
+<tr><td>Undo last commit, keep changes</td><td><code>git reset --soft HEAD~1</code></td></tr>
+<tr><td>Safely undo a pushed commit</td><td><code>git revert SHA</code></td></tr>
+<tr><td>Discard local changes to a file</td><td><code>git restore path</code></td></tr>
+<tr><td>Stash / restore work</td><td><code>git stash -u</code>, <code>git stash pop</code></td></tr>
+<tr><td>Find the commit that broke it</td><td><code>git bisect start; git bisect bad; git bisect good SHA</code></td></tr>
+<tr><td>Who changed this line</td><td><code>git blame -L 10,20 file</code></td></tr>
+<tr><td>Recover "lost" commits</td><td><code>git reflog</code>, <code>git switch -c rescue SHA</code></td></tr>
+<tr><td>Safer force push</td><td><code>git push --force-with-lease</code></td></tr>
+<tr><td>Tag a release</td><td><code>git tag -a v1.2.0 -m "msg" &amp;&amp; git push origin v1.2.0</code></td></tr>
+<tr><td>Search history for a string</td><td><code>git log -S'secret' --oneline</code></td></tr>
+</table>
+
+<h2>nginx</h2>
+<table>
+<tr><th>Task</th><th>Command or snippet</th></tr>
+<tr><td>Test config, graceful reload</td><td><code>nginx -t &amp;&amp; systemctl reload nginx</code></td></tr>
+<tr><td>Logs</td><td><code>/var/log/nginx/access.log</code>, <code>error.log</code></td></tr>
+<tr><td>Reverse proxy</td><td><code>proxy_pass http://127.0.0.1:3000;</code> + <code>proxy_set_header Host $host;</code> + <code>X-Forwarded-For $proxy_add_x_forwarded_for</code></td></tr>
+<tr><td>HTTP to HTTPS redirect</td><td><code>return 301 https://$host$request_uri;</code></td></tr>
+<tr><td>Static files / SPA fallback</td><td><code>root /var/www/app; try_files $uri /index.html;</code></td></tr>
+<tr><td>WebSocket proxy</td><td><code>proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";</code></td></tr>
+<tr><td>Load balancing</td><td><code>upstream app { least_conn; server 10.0.0.1:3000; server 10.0.0.2:3000; }</code></td></tr>
+<tr><td>Gzip</td><td><code>gzip on; gzip_types text/css application/json application/javascript;</code></td></tr>
+<tr><td>Rate limit</td><td><code>limit_req_zone $binary_remote_addr zone=z:10m rate=10r/s;</code> then <code>limit_req zone=z burst=20;</code></td></tr>
+<tr><td>Caching static assets</td><td><code>location ~* \.(js|css|png)$ { expires 1y; add_header Cache-Control "public, immutable"; }</code></td></tr>
+<tr><td>Upload size limit</td><td><code>client_max_body_size 20m;</code></td></tr>
+<tr><td>TLS certificate (certbot)</td><td><code>certbot --nginx -d example.com --redirect</code>, <code>certbot renew --dry-run</code></td></tr>
+</table>
+<table>
+<tr><th>Error</th><th>Typical cause</th></tr>
+<tr><td>502 Bad Gateway</td><td>Upstream down or wrong port; check app and <code>error.log</code></td></tr>
+<tr><td>504 Gateway Timeout</td><td>Upstream too slow; raise <code>proxy_read_timeout</code> or fix the app</td></tr>
+<tr><td>413 Request Entity Too Large</td><td><code>client_max_body_size</code></td></tr>
+<tr><td>403 on static files</td><td>File permissions or directory not traversable by nginx user</td></tr>
+</table>
+
+<h2>Terraform and AWS CLI essentials</h2>
+<table>
+<tr><th>Task</th><th>Command</th></tr>
+<tr><td>Init, format, validate</td><td><code>terraform init</code>, <code>terraform fmt -recursive</code>, <code>terraform validate</code></td></tr>
+<tr><td>Plan to file, apply it</td><td><code>terraform plan -out tfplan</code>, <code>terraform apply tfplan</code></td></tr>
+<tr><td>State inspection</td><td><code>terraform state list</code>, <code>terraform state show addr</code></td></tr>
+<tr><td>Import existing resource</td><td><code>terraform import addr id</code> (or <code>import</code> blocks)</td></tr>
+<tr><td>Who am I (AWS)</td><td><code>aws sts get-caller-identity</code></td></tr>
+<tr><td>List EC2 instances</td><td><code>aws ec2 describe-instances --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output table</code></td></tr>
+<tr><td>S3 sync</td><td><code>aws s3 sync ./dist s3://bucket --delete</code></td></tr>
+</table>
+
+<h2>Handy one-liners</h2>
+<pre><code># what is eating my disk?
+du -xh / 2&gt;/dev/null | sort -rh | head -20
+# what is using port 3000?
+sudo lsof -i :3000
+# top client IPs in nginx
+awk '{print $1}' /var/log/nginx/access.log | sort | uniq -c | sort -nr | head
+# requests per status code
+awk '{print $9}' /var/log/nginx/access.log | sort | uniq -c | sort -nr
+# watch a command every 2s
+watch -n2 'docker ps --format "table {{.Names}}\t{{.Status}}"'
+# generate a strong random secret
+openssl rand -base64 32
+# quick file server
+python3 -m http.server 8000
+# test a webhook locally with a throwaway payload
+curl -X POST -H 'content-type: application/json' -d '{"ping":true}' localhost:3000/hook</code></pre>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Without looking, write the command to follow the last 100 lines of a systemd service's logs. Check yourself against the table.</li>
+<li>Create a pod that crashes (<code>kubectl run bad --image=busybox -- false</code>) and diagnose it using only the diagnosis table.</li>
+<li>Turn the five commands you forget most often into shell aliases or a personal <code>~/cheats.md</code>.</li>
+</ol></div>

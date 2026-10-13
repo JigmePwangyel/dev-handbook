@@ -1,0 +1,156 @@
+<h1>GitOps</h1>
+<p class="lead">GitOps takes infrastructure as code one step further: git is the single source of truth for what should run, and an automated agent inside the environment continuously makes reality match it. Deployments become pull requests; rollbacks become reverts.</p>
+
+<h2>The problem with push-based deployment</h2>
+<p>In a classic CI/CD pipeline, the CI server builds the image and then <em>pushes</em> the change: <code>kubectl apply</code> or <code>helm upgrade</code> from a CI job. This works but has weaknesses:</p>
+<ul>
+<li>CI needs powerful credentials to your production cluster, which is a juicy target (a compromised pipeline owns production).</li>
+<li>The cluster may be behind a firewall that CI cannot reach.</li>
+<li>Someone runs <code>kubectl edit</code> in production and nobody notices: drift between git and reality.</li>
+<li>"What is running in prod right now?" requires checking the cluster, not the repo.</li>
+<li>A failed or partial pipeline run leaves an unknown state.</li>
+</ul>
+
+<h2>The four principles</h2>
+<ol>
+<li><strong>Declarative</strong>: the whole system is described as desired state (Kubernetes YAML, Helm, Kustomize).</li>
+<li><strong>Versioned and immutable</strong>: the desired state is stored in git, with full history, review and audit.</li>
+<li><strong>Pulled automatically</strong>: an agent in the cluster pulls approved changes; humans do not push.</li>
+<li><strong>Continuously reconciled</strong>: the agent constantly compares live state to git and corrects drift.</li>
+</ol>
+<p>This is the same reconciliation loop Kubernetes itself uses (see the architecture lesson), applied one level up: Kubernetes reconciles Pods to the spec; the GitOps controller reconciles the spec to git.</p>
+
+<h2>Pull vs push</h2>
+<pre class="diagram">
+ PUSH (traditional CI/CD)                 PULL (GitOps)
+ CI ──kubectl apply──▶ cluster           CI ──commit──▶ config repo
+ (CI holds cluster credentials)                              ▲ pulls
+                                          cluster [GitOps agent] ──┘ applies, watches, repairs
+                                          (cluster holds read-only git credentials)
+</pre>
+<table>
+<tr><th></th><th>Push</th><th>Pull (GitOps)</th></tr>
+<tr><td>Credentials</td><td>CI has cluster admin</td><td>Cluster has read-only access to git; CI never touches the cluster</td></tr>
+<tr><td>Drift</td><td>Undetected until next deploy</td><td>Detected and optionally auto-corrected</td></tr>
+<tr><td>Audit trail</td><td>CI logs</td><td>git history</td></tr>
+<tr><td>Disaster recovery</td><td>Re-run pipelines</td><td>Point a new cluster at the repo; it rebuilds itself</td></tr>
+<tr><td>Simplicity</td><td>Simple, direct</td><td>Extra component to run; image tag updates need a separate step</td></tr>
+</table>
+
+<h2>The tools: Argo CD and Flux</h2>
+<p>Both are CNCF graduated projects.</p>
+<table>
+<tr><th></th><th>Argo CD</th><th>Flux</th></tr>
+<tr><td>Style</td><td>Application-centric, rich web UI and CLI</td><td>Toolkit of controllers, CLI/CRD driven, no built-in UI (add-ons exist)</td></tr>
+<tr><td>Core object</td><td><code>Application</code>, <code>ApplicationSet</code></td><td><code>GitRepository</code>, <code>Kustomization</code>, <code>HelmRelease</code></td></tr>
+<tr><td>Strengths</td><td>Visual diff and sync status, multi-cluster, SSO/RBAC, popular with platform teams</td><td>Lightweight, composable, strong image automation and Helm support, notifications</td></tr>
+</table>
+
+<h3>Argo CD example</h3>
+<pre><code># Install
+kubectl create namespace argocd
+kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# An Application: "keep this path of this repo synced to this namespace"
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/acme/platform-config.git
+    targetRevision: main
+    path: apps/shop/overlays/production      # Kustomize overlay, or a Helm chart
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop
+  syncPolicy:
+    automated:
+      prune: true        # delete resources removed from git
+      selfHeal: true     # revert manual changes in the cluster
+    syncOptions:
+      - CreateNamespace=true</code></pre>
+
+<h3>Flux example</h3>
+<pre><code>flux bootstrap github --owner=acme --repository=platform-config --path=clusters/prod --personal
+
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata: { name: platform-config, namespace: flux-system }
+spec:
+  interval: 1m
+  url: https://github.com/acme/platform-config
+  ref: { branch: main }
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata: { name: shop, namespace: flux-system }
+spec:
+  interval: 5m
+  path: ./apps/shop/overlays/production
+  prune: true
+  sourceRef: { kind: GitRepository, name: platform-config }
+  healthChecks:
+    - { apiVersion: apps/v1, kind: Deployment, name: shop, namespace: shop }</code></pre>
+
+<h2>Repository layout</h2>
+<p>Separate <strong>application source code</strong> from <strong>deployment configuration</strong>. Reasons: different change frequency, different access control (not every developer can edit prod), and config commits (image bumps) do not trigger source builds in a loop.</p>
+<pre class="diagram">
+ app repo (shop)                         config repo (platform-config)
+ ├── src/                                ├── apps/
+ ├── Dockerfile                          │   └── shop/
+ └── .github/workflows/ci.yml            │       ├── base/            deployment, service, ...
+                                         │       └── overlays/
+                                         │           ├── dev/         image tag, 1 replica
+                                         │           ├── staging/
+                                         │           └── production/  image tag, 6 replicas
+                                         ├── infrastructure/          ingress, cert-manager, monitoring
+                                         └── clusters/
+                                             ├── dev/                 which apps/overlays this cluster runs
+                                             └── prod/
+</pre>
+<p>Environments are directories (or Helm values files), not long-lived branches. Branch-per-environment causes painful merges and drift between branches. Promotion from staging to production is a pull request changing the image tag (or a config copy) in the production overlay.</p>
+
+<h2>The complete flow</h2>
+<pre class="diagram">
+ 1. Developer merges code to app repo
+ 2. CI: test ─▶ build image ─▶ scan ─▶ push shop:2.4.0 to registry
+ 3. CI (or Flux image automation / Argo CD Image Updater) opens a commit/PR in the CONFIG repo:
+        overlays/staging: newTag 2.3.1 ─▶ 2.4.0
+ 4. Review/auto-merge ─▶ GitOps agent in the staging cluster sees the new commit
+ 5. Agent renders manifests, diffs against live state, applies the change
+ 6. Kubernetes performs a rolling update; agent reports Healthy / Degraded
+ 7. After verification, a PR bumps overlays/production to 2.4.0 ─▶ same sync in prod
+ 8. Rollback: git revert that commit ─▶ the agent restores the previous state
+ 9. Someone runs kubectl edit in prod? selfHeal reverts it (and the event is visible)
+</pre>
+
+<h2>Secrets in GitOps</h2>
+<p>Git must not hold plaintext secrets. Use Sealed Secrets, SOPS-encrypted files (native Flux support) or External Secrets Operator referencing a vault (see the Kubernetes configuration lesson). Git then contains only encrypted values or references.</p>
+
+<h2>GitOps for infrastructure, not just Kubernetes</h2>
+<p>The pattern extends beyond clusters: Terraform changes flow through PR, plan and merge (previous lesson), which is GitOps-like in workflow. Operators such as Crossplane or the Flux Terraform controller reconcile cloud resources from the cluster continuously. A common stack: Terraform creates the cluster and a bootstrap of Argo CD or Flux; from then on Kubernetes workloads and add-ons are managed from git.</p>
+
+<h2>Trade-offs and pitfalls</h2>
+<ul>
+<li><strong>Extra moving parts</strong>: another controller to operate, upgrade and secure. Its repository access is the new crown jewel: protect main with required reviews and signed commits.</li>
+<li><strong>Feedback is slower and less direct</strong> than a push pipeline: "did my deploy work?" means watching the agent's status; wire up notifications (Slack, GitHub status).</li>
+<li><strong>Image tag updates</strong> need a deliberate mechanism (CI commit, image automation); latency and commit noise are real.</li>
+<li><strong>Auto-prune is dangerous</strong>: deleting a manifest from git deletes the resource (even a PVC). Use finalizers, <code>Prune=false</code> annotations on stateful things, and review diffs carefully.</li>
+<li><strong>Ordering and dependencies</strong>: CRDs before custom resources, namespaces before workloads. Use sync waves (Argo) or <code>dependsOn</code> (Flux).</li>
+<li><strong>Helm hook and non-declarative edge cases</strong>, such as data migrations, need Jobs and care.</li>
+<li><strong>Fields mutated by controllers</strong> (HPA changing replicas) appear as drift; configure ignore differences.</li>
+<li>Do not use <code>selfHeal</code> blindly during an incident when you need to hotfix live; pause sync, then back-port to git.</li>
+</ul>
+
+<div class="callout key"><strong>Why it matters</strong><p>With GitOps the answer to "what changed, who approved it, and how do we undo it?" is always "look at git". Combined with Terraform and immutable images, your entire stack becomes reviewable, reproducible and recoverable from a repository.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>On a kind cluster install Argo CD, then port-forward the UI (<code>kubectl port-forward svc/argocd-server -n argocd 8080:443</code>).</li>
+<li>Create a config repo with a Kustomize base and a <code>dev</code> overlay of a simple nginx Deployment; register it as an Application with automated sync.</li>
+<li>Change replicas in git and watch the cluster follow. Then <code>kubectl scale</code> manually and watch selfHeal revert it.</li>
+<li>Break the repo (invalid YAML) to see how failures are reported, then <code>git revert</code> to recover.</li>
+</ol></div>

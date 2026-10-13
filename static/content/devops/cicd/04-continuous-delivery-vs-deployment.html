@@ -1,0 +1,114 @@
+<h1>Continuous Delivery vs Continuous Deployment</h1>
+<p class="lead">"CD" means two different things, and mixing them up causes real confusion. Both extend CI by automating the path to production. They differ in one decision: does a human press the final button?</p>
+
+<h2>Why CD exists</h2>
+<p>CI leaves you with a tested artifact on main. Without CD, getting that artifact to users is a separate, manual, error-prone project: a ticket to ops, a deployment window, a wiki checklist. That final step is where a lot of lead time and risk hide. CD closes the gap so the path from "merged" to "running in production" is automated, repeatable and boring.</p>
+
+<h2>Definitions</h2>
+<table>
+<tr><th>Term</th><th>Definition</th><th>Production deploy trigger</th></tr>
+<tr><td><strong>Continuous Integration</strong></td><td>Merge often; automatically build and test every change</td><td>n/a</td></tr>
+<tr><td><strong>Continuous Delivery</strong></td><td>Every change that passes the pipeline is <em>releasable</em>; deploying to production is a manual, one-click business decision</td><td>Human approval</td></tr>
+<tr><td><strong>Continuous Deployment</strong></td><td>Every change that passes the pipeline is deployed to production <em>automatically</em></td><td>None, fully automated</td></tr>
+</table>
+<pre class="diagram">
+ commit ─▶ build ─▶ unit/int tests ─▶ package ─▶ deploy staging ─▶ acceptance tests ─┐
+                                                                                      │
+   Continuous DELIVERY:      ┌────────── [ human approves ] ◀─────────────────────────┤
+                             ▼                                                         │
+                       deploy production                                               │
+   Continuous DEPLOYMENT:                                                              │
+                       deploy production ◀─────────────────────────────────────────────┘
+                         (automatic, with canary + auto-rollback)
+</pre>
+<div class="callout key"><strong>The only difference</strong><p>In delivery, the pipeline is <em>capable</em> of deploying at any time and a person decides when. In deployment, the pipeline always deploys. Delivery is a capability; deployment is a policy. Most organisations should first achieve delivery, then decide whether deployment fits their risk profile.</p></div>
+
+<h2>Deploy is not release</h2>
+<p>A powerful mental split: <strong>deployment</strong> is putting code on production servers. <strong>Release</strong> is exposing a feature to users. With <strong>feature flags</strong>, you deploy dark code continuously, then release by flipping a flag, for 1% of users, then 10%, then everyone. Deploys become technical, frequent and low-drama; releases become a business decision, reversible in seconds without a redeploy.</p>
+<pre><code>// the code ships to production but is invisible until the flag is on
+if (flags.isEnabled('new-checkout', { userId })) {
+  return renderNewCheckout();
+}
+return renderOldCheckout();</code></pre>
+<p>Remember to delete flags after rollout; stale flags are tech debt and a source of untested combinations.</p>
+
+<h2>Environment promotion</h2>
+<p>Changes move through a series of environments, each more production-like and more costly to break.</p>
+<table>
+<tr><th>Environment</th><th>Purpose</th><th>Typical trigger</th><th>Data</th></tr>
+<tr><td>Preview / ephemeral</td><td>Review a PR in a live URL</td><td>Each PR; destroyed on close</td><td>Seed/fake</td></tr>
+<tr><td>Dev / integration</td><td>Shared playground, integration with other services</td><td>Every merge to main</td><td>Fake</td></tr>
+<tr><td>Staging / pre-prod</td><td>Production clone for acceptance, performance, rehearsal</td><td>Every merge, or release candidate</td><td>Anonymised or synthetic</td></tr>
+<tr><td>Production</td><td>Real users</td><td>Approval or automatic</td><td>Real</td></tr>
+</table>
+<h3>Rules of promotion</h3>
+<ul>
+<li><strong>Promote the artifact, not the code.</strong> The image <code>shop:3f9a1c2</code> that passed staging is the one deployed to prod. No rebuild.</li>
+<li><strong>Configuration differs, binaries don't.</strong> Environment-specific values come from environment config and a secrets manager.</li>
+<li><strong>Keep staging as close to prod as is affordable</strong> (same Kubernetes version, same DB engine and version, same topology in miniature). Drift is how "it passed staging" lies.</li>
+<li><strong>Gate each hop</strong> with automated checks (tests, health checks, security scans) and, where needed, approvals.</li>
+</ul>
+<pre class="diagram">
+          artifact: shop:3f9a1c2 (built once)
+  ┌─────────┐   ┌─────────┐   ┌──────────┐ approve ┌────────────┐
+  │   dev   │──▶│ staging │──▶│ smoke +  │────────▶│ production │
+  │ auto    │   │ auto    │   │ e2e pass │         │ (canary →  │
+  └─────────┘   └─────────┘   └──────────┘         │  100%)     │
+                                                    └────────────┘
+</pre>
+
+<h2>Approvals and gates</h2>
+<p>Approvals are controls, and they have a cost. Use them intentionally.</p>
+<ul>
+<li><strong>Manual approval</strong> (GitHub environment "required reviewers", GitLab <code>when: manual</code>, Jenkins <code>input</code>): good for regulated industries, high-blast-radius changes, or until trust in tests is earned.</li>
+<li><strong>Automated gates:</strong> tests, vulnerability scan thresholds, SLO checks ("error budget remaining?"), time windows (no deploys Friday afternoon), change-freeze calendars.</li>
+<li><strong>Separation of duties:</strong> the author of a change cannot be the sole approver of its deployment; the platform enforces this, not a policy document.</li>
+</ul>
+<div class="callout warn"><strong>Approval theater</strong><p>A manager clicking "Approve" without looking at anything adds delay but no safety. Real safety comes from tests, progressive rollout and fast rollback. If you must keep approvals for compliance, make the information they need visible (diff, test results, risk) and keep the approval fast, ideally minutes.</p></div>
+
+<h2>Progressive delivery: making deployment safe</h2>
+<p>Continuous deployment is only responsible if blast radius is small and rollback is automatic. Combine CD with:</p>
+<ul>
+<li><strong>Rolling update:</strong> replace instances gradually, health-checking each batch.</li>
+<li><strong>Blue-green:</strong> run the new version beside the old, switch traffic at once, switch back instantly if bad.</li>
+<li><strong>Canary:</strong> send 1-5% of traffic to the new version, compare error rate and latency against the baseline, then expand (tools: Argo Rollouts, Flagger, service mesh, load balancer weights).</li>
+<li><strong>Automated rollback</strong> triggered by SLO/metric regression.</li>
+<li><strong>Database migrations that are backward compatible</strong> (expand then contract), so old and new code can both run during rollout and rollback is possible.</li>
+</ul>
+<p>These strategies are covered in depth in the Deploying section; the key point here is that they are what lets "every merge goes to prod" be a safe sentence.</p>
+
+<h2>Release trains</h2>
+<p>A <strong>release train</strong> ships on a fixed schedule (say, every two weeks or every Tuesday) with whatever is ready; if your feature misses the train, it takes the next one. It is common for mobile apps (app store review), on-prem software and big organisations.</p>
+<ul>
+<li><strong>Pros:</strong> predictable cadence for marketing, support and customers; amortises release overhead; works when the deploy channel is slow (app stores).</li>
+<li><strong>Cons:</strong> batching increases risk and lead time; features wait for the train; pressure to rush onto it.</li>
+<li><strong>Tip:</strong> even on a train, keep main always releasable and use feature flags; the train just selects a commit to cut, it should not require stabilisation heroics.</li>
+</ul>
+
+<h2>Which should you choose?</h2>
+<table>
+<tr><th>Situation</th><th>Choice</th></tr>
+<tr><td>Web SaaS, strong tests, flags, good observability</td><td>Continuous deployment</td></tr>
+<tr><td>Web app, still building trust in tests</td><td>Continuous delivery with one-click prod</td></tr>
+<tr><td>Regulated (finance, health), change approval boards</td><td>Delivery with automated evidence collection and an approval gate</td></tr>
+<tr><td>Mobile apps</td><td>Delivery to store/TestFlight on every merge; scheduled release trains; staged rollout in store</td></tr>
+<tr><td>Libraries / packages</td><td>Automated release on tag or commit-type (semantic-release)</td></tr>
+<tr><td>Embedded / on-prem</td><td>Delivery to a release candidate channel; customers upgrade on their schedule</td></tr>
+</table>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>"We do CD" but production deploys still need three tickets.</strong> That is automation of one stage, not delivery.</li>
+<li><strong>Rebuilding per environment.</strong> Breaks traceability.</li>
+<li><strong>Shared mutable staging</strong> that ten teams fight over. Prefer ephemeral environments.</li>
+<li><strong>Skipping observability.</strong> You cannot deploy continuously if you cannot tell within minutes whether the deploy hurt.</li>
+<li><strong>Irreversible changes</strong> (destructive migrations) bundled into a routine deploy.</li>
+<li><strong>Deploy windows by fear.</strong> If "never on Fridays" is a rule, your rollback or monitoring is not trusted. Fix that, don't schedule around it.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Draw your project's path from merge to production. Mark every manual step and every wait. These are your CD backlog.</li>
+<li>Decide: delivery or deployment? List what would need to be true (tests, flags, monitoring, rollback) to move one step toward deployment.</li>
+<li>In GitHub, create an <code>environment</code> named <code>production</code> with a required reviewer and reference it from a job; observe the pause for approval (you will build this in the GitHub Actions lesson).</li>
+</ol></div>

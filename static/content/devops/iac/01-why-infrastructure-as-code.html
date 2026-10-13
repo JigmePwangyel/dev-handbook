@@ -1,0 +1,90 @@
+<h1>Why Infrastructure as Code?</h1>
+<p class="lead">Servers, networks, databases and DNS records are infrastructure. If you create them by clicking through a cloud console, nobody can review, repeat or undo what you did. Infrastructure as Code (IaC) means describing infrastructure in text files and letting a tool make reality match.</p>
+
+<h2>The pain of ClickOps</h2>
+<p>"ClickOps" is building infrastructure by hand in a web console or via ad-hoc CLI commands. It feels fast the first time. Then:</p>
+<ul>
+<li><strong>No memory.</strong> Six months later nobody knows why that security group allows port 8443 from an odd IP, or who changed it.</li>
+<li><strong>Not repeatable.</strong> You need a staging environment "just like production". You click for two days and it is subtly different.</li>
+<li><strong>Not reviewable.</strong> A risky change (open a database to the internet) is made with no second pair of eyes.</li>
+<li><strong>Disaster recovery is a fantasy.</strong> If the region fails or an account is compromised, can you rebuild everything in an hour? From memory?</li>
+<li><strong>Knowledge lives in one head.</strong> The person who clicked it leaves.</li>
+</ul>
+
+<h3>Snowflakes and drift</h3>
+<p>A <strong>snowflake server</strong> is a machine that was hand-tuned over time and is unique: nobody dares touch it because nobody can recreate it. <strong>Configuration drift</strong> is the gradual divergence between machines (or between reality and documentation) as people make small manual changes: a hotfix applied to two of three servers, a package upgraded on one. Drift causes the worst class of bug: "works on node A but not node B".</p>
+<pre class="diagram">
+ Day 0    prod-1 ≡ prod-2 ≡ prod-3          (identical, from the same recipe)
+ Day 90   prod-1 + hotfix, prod-2 + manual tweak, prod-3 unchanged
+ Day 180  nobody knows what differs. Rebuilding any of them is risky.
+</pre>
+
+<h2>What IaC gives you</h2>
+<table>
+<tr><th>Benefit</th><th>How</th></tr>
+<tr><td>Version control</td><td>Infrastructure lives in git: history, blame, rollback via revert</td></tr>
+<tr><td>Code review</td><td>Pull requests and a visible plan before any change happens</td></tr>
+<tr><td>Repeatability</td><td>Same code produces dev, staging and prod; only variables differ</td></tr>
+<tr><td>Speed</td><td>Stand up an entire environment with one command, tear it down to save money</td></tr>
+<tr><td>Documentation</td><td>The code is an always-accurate description of what exists</td></tr>
+<tr><td>Disaster recovery</td><td>Rebuild from code plus data backups</td></tr>
+<tr><td>Consistency and policy</td><td>Automated checks: no public buckets, mandatory tags, encrypted disks</td></tr>
+<tr><td>Testing</td><td>Validate and even test infrastructure changes before applying</td></tr>
+</table>
+
+<h2>Declarative vs imperative</h2>
+<p>This is the central design choice in IaC tools.</p>
+<ul>
+<li><strong>Imperative</strong> (procedural): you write the <em>steps</em>. "Create a VM. Then attach this disk. Then open port 80." A shell script with the AWS CLI is imperative. Running it twice might create two VMs. You must handle "already exists" yourself.</li>
+<li><strong>Declarative</strong>: you write the <em>desired end state</em>. "There is one VM of this size with this disk and port 80 open." The tool compares to what exists, works out the difference and makes only the needed changes. Running it twice does nothing the second time.</li>
+</ul>
+<pre><code># Imperative: order and existence checks are YOUR problem
+aws ec2 run-instances --image-id ami-0abc --instance-type t3.micro
+aws ec2 authorize-security-group-ingress --group-id sg-123 --protocol tcp --port 80 --cidr 0.0.0.0/0
+
+# Declarative (Terraform): describe the end state; the tool computes the steps
+resource "aws_instance" "web" {
+  ami           = "ami-0abc"
+  instance_type = "t3.micro"
+}</code></pre>
+<p>Declarative tools (Terraform/OpenTofu, CloudFormation, Kubernetes manifests, Ansible modules to a degree) are <strong>idempotent</strong>: applying the same description repeatedly converges to the same result. Imperative code in general-purpose languages (Pulumi, AWS CDK) can still be declarative in effect: your program builds a desired-state graph that the engine reconciles.</p>
+
+<div class="callout key"><strong>Idempotency is the superpower</strong><p>An operation is idempotent if doing it once or ten times yields the same state. It makes automation safe to re-run, safe to retry after a partial failure, and safe to run on a schedule to correct drift.</p></div>
+
+<h2>Two kinds of IaC tool</h2>
+<table>
+<tr><th>Category</th><th>Job</th><th>Examples</th></tr>
+<tr><td>Provisioning</td><td>Create the infrastructure: networks, VMs, databases, DNS, IAM</td><td>Terraform, OpenTofu, Pulumi, CloudFormation, AWS CDK, Crossplane</td></tr>
+<tr><td>Configuration management</td><td>Configure what runs on machines: packages, files, services</td><td>Ansible, Chef, Puppet, Salt</td></tr>
+<tr><td>Image building</td><td>Bake machine images ahead of time</td><td>Packer, Docker</td></tr>
+<tr><td>Delivery / reconciliation</td><td>Keep clusters matching git</td><td>Argo CD, Flux</td></tr>
+</table>
+<p>They compose: Terraform creates the VMs and network, Packer provides the image, Ansible (or cloud-init) configures anything that remains, and GitOps keeps the Kubernetes workloads in sync. The next lessons cover each.</p>
+
+<h2>Principles to adopt</h2>
+<ol>
+<li><strong>Everything in git.</strong> If it is not in code, it does not exist.</li>
+<li><strong>Change only via the pipeline.</strong> Console access becomes read-only for production (break-glass excepted, then back-port the change to code).</li>
+<li><strong>Small, frequent changes</strong> with a reviewed plan.</li>
+<li><strong>Environments from one codebase</strong>, differing only in variables.</li>
+<li><strong>No secrets in code.</strong> Reference a secret manager.</li>
+<li><strong>Detect drift</strong> by scheduled plans that alert on differences.</li>
+</ol>
+
+<h2>Trade-offs and honest caveats</h2>
+<ul>
+<li>There is a learning curve and up-front investment; for one throwaway VM, a console click is fine.</li>
+<li>Code can be wrong at scale: a bad <code>destroy</code> is faster than a bad click. Reviews, plans and guard rails matter more, not less.</li>
+<li>State management (what the tool believes exists) is a new thing to protect, as you will see in the Terraform lessons.</li>
+<li>Adopting IaC on existing hand-built infrastructure means importing it incrementally; start with new resources.</li>
+<li>Cloud APIs change; providers and modules need maintenance.</li>
+</ul>
+
+<div class="callout tip"><strong>Start small</strong><p>You do not need to codify everything on day one. Begin with a new project or one environment, or capture the most error-prone piece (security groups, DNS, IAM) first. Use the console for exploration, but "promote" what you learn into code.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>List the infrastructure behind one app you run: servers, DNS records, buckets, databases, IAM roles. Mark each as "in code", "documented" or "only in someone's head".</li>
+<li>Pick the riskiest "only in someone's head" item and think about how long a full rebuild would take.</li>
+<li>Write the one-sentence declarative description of one thing (for example "a bucket named X, private, versioned") versus the three imperative commands needed.</li>
+</ol></div>

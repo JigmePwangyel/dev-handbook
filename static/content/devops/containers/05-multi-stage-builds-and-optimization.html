@@ -1,0 +1,149 @@
+<h1>Multi-Stage Builds and Optimization</h1>
+<p class="lead">Compilers, dev dependencies and build tools are needed to build your app but are dead weight (and attack surface) when you run it. Multi-stage builds let one Dockerfile use a fat image to build and a tiny image to ship. Combine that with smart cache ordering, BuildKit features and multi-arch builds, and you get fast builds and small, safe images.</p>
+
+<h2>The problem</h2>
+<p>A single-stage Go or Node build leaves behind everything it used: the 800 MB Go toolchain, <code>gcc</code>, <code>node_modules/.cache</code>, TypeScript sources, test files. Before multi-stage, teams maintained two Dockerfiles plus a shell script to copy artifacts between them. Now it is built in.</p>
+
+<h2>How multi-stage works</h2>
+<p>Each <code>FROM</code> starts a new stage with a fresh filesystem. <code>COPY --from=&lt;stage&gt;</code> pulls specific files from an earlier stage. Only the <em>last</em> stage becomes the final image (unless you pick another with <code>--target</code>); earlier stages are discarded.</p>
+<pre class="diagram">
+ Stage "deps"          Stage "build"              Stage "runtime" (final)
+ ┌────────────────┐    ┌───────────────────┐     ┌─────────────────────┐
+ │ node:22        │    │ FROM deps         │     │ node:22-slim        │
+ │ npm ci (all)   │───▶│ COPY src          │──┐  │ COPY --from=build   │
+ └────────────────┘    │ npm run build     │  └─▶│   /app/dist         │
+                       └───────────────────┘     │ COPY prod node_mods │
+      discarded              discarded           └─────────────────────┘
+                                                   ← this is what ships
+</pre>
+
+<h3>Node.js with TypeScript</h3>
+<pre><code># syntax=docker/dockerfile:1
+FROM node:22-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+FROM deps AS build
+COPY . .
+RUN npm run build                      # tsc -&gt; /app/dist
+
+FROM node:22-slim AS prod-deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+
+FROM node:22-slim AS runtime
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json ./
+USER node
+CMD ["node", "dist/server.js"]</code></pre>
+
+<h3>Useful targets</h3>
+<p>Add a <code>test</code> or <code>dev</code> stage and select it with <code>--target</code>:</p>
+<pre><code>FROM build AS test
+RUN npm test
+
+# docker build --target test .          # run tests in CI, never ships
+# docker build --target runtime -t myapp .</code></pre>
+
+<h2>Choosing a base image</h2>
+<table>
+<tr><th>Base</th><th>Pros</th><th>Cons</th></tr>
+<tr><td><strong>Full</strong> (<code>node:22</code>, <code>python:3.13</code>)</td><td>Has compilers and tools; easy debugging</td><td>Large (~1 GB), many CVEs</td></tr>
+<tr><td><strong>Slim</strong> (<code>-slim</code>, Debian)</td><td>glibc, small, broad compatibility; default sensible choice</td><td>No build tools; needs apt for native deps</td></tr>
+<tr><td><strong>Alpine</strong> (<code>-alpine</code>)</td><td>Tiny (musl libc, BusyBox), quick pulls</td><td>musl differences cause subtle bugs: Python wheels often must compile from source (slow), DNS and performance quirks, some native Node modules fail</td></tr>
+<tr><td><strong>Distroless</strong> (<code>gcr.io/distroless/*</code>)</td><td>No shell, no package manager; minimal attack surface; <code>:nonroot</code> tags</td><td>Cannot <code>docker exec ... sh</code>; debugging needs <code>:debug</code> variants or ephemeral containers</td></tr>
+<tr><td><strong>scratch</strong></td><td>Literally empty; ideal for static Go/Rust binaries</td><td>No CA certs, timezone data or users unless you copy them in</td></tr>
+<tr><td><strong>Chainguard / hardened images</strong></td><td>Minimal, frequently patched, SBOMs included</td><td>Some tiers paid; different conventions</td></tr>
+</table>
+<div class="callout tip"><strong>Rule of thumb</strong><p>Start with <code>-slim</code>. Move to distroless or scratch for compiled languages when you want minimal size and attack surface. Use Alpine when you understand the musl trade-offs. Smaller is not automatically better: an image that breaks in production is more expensive than 100 MB.</p></div>
+
+<h2>Layer cache ordering</h2>
+<p>Order instructions from least to most frequently changing. Dependencies change weekly, source changes every commit:</p>
+<pre><code># Python
+COPY requirements.txt .
+RUN pip install -r requirements.txt     # cached until requirements change
+COPY . .                                # busts only layers after it</code></pre>
+<p>Apply the same logic to system packages (top), language dependencies (middle), source (bottom), build step (end). Copy only what each step needs, e.g. <code>COPY go.mod go.sum ./</code> before <code>go mod download</code>.</p>
+
+<h2>BuildKit</h2>
+<p>BuildKit is the modern build engine and the default since Docker 23. It builds independent stages in parallel, skips stages the target does not need, and offers powerful mounts. Enable features with the first line <code>&#35; syntax=docker/dockerfile:1</code>. Use <code>docker buildx build</code> for the extended CLI.</p>
+
+<h3>Cache mounts</h3>
+<p>Layer caching is all-or-nothing: if <code>package.json</code> changes, <code>npm ci</code> re-downloads everything. A cache mount persists a directory <em>across builds</em> without becoming part of the image:</p>
+<pre><code>RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    go build -o /out/server ./cmd/server
+RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/apt \
+    apt-get update &amp;&amp; apt-get install -y --no-install-recommends libpq5</code></pre>
+
+<h3>Secret mounts</h3>
+<p>Need a private npm token at build time? Never use <code>ARG</code> or <code>COPY</code>. Mount it as a file that exists only during that one <code>RUN</code> and is never written to a layer:</p>
+<pre><code>RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci
+
+# docker build --secret id=npmrc,src=$HOME/.npmrc -t myapp .</code></pre>
+<p>Similarly <code>--mount=type=ssh</code> forwards your SSH agent for private git dependencies.</p>
+
+<h3>Bind mounts and heredocs</h3>
+<pre><code>RUN --mount=type=bind,source=requirements.txt,target=requirements.txt \
+    pip install -r requirements.txt            # no COPY layer needed
+
+RUN &lt;&lt;EOF
+set -e
+apt-get update
+apt-get install -y --no-install-recommends curl
+rm -rf /var/lib/apt/lists/*
+EOF</code></pre>
+
+<h3>CI cache export</h3>
+<p>CI runners start empty, so the cache is lost each run. Export it:</p>
+<pre><code>docker buildx build \
+  --cache-from type=registry,ref=ghcr.io/acme/myapp:buildcache \
+  --cache-to   type=registry,ref=ghcr.io/acme/myapp:buildcache,mode=max \
+  -t ghcr.io/acme/myapp:1.4.2 --push .
+# On GitHub Actions: --cache-from type=gha --cache-to type=gha,mode=max</code></pre>
+
+<h2>Multi-architecture images</h2>
+<p>Apple Silicon laptops and AWS Graviton servers are <code>arm64</code>; most older servers are <code>amd64</code>. An image built for one will not run natively on the other. Build one tag that serves both:</p>
+<pre><code>docker buildx create --name multi --use
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/acme/myapp:1.4.2 --push .
+docker buildx imagetools inspect ghcr.io/acme/myapp:1.4.2   # shows both platforms</code></pre>
+<p>Pushing creates a manifest list; clients automatically pull the matching platform. Non-native platforms build under QEMU emulation (slow for compiled languages). Faster: cross-compile in the build stage using <code>FROM --platform=$BUILDPLATFORM</code> and the <code>TARGETARCH</code> arg:</p>
+<pre><code>FROM --platform=$BUILDPLATFORM golang:1.24 AS build
+ARG TARGETOS TARGETARCH
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -o /out/server .</code></pre>
+
+<h2>Measuring the result</h2>
+<pre><code>docker build -t myapp:fat -f Dockerfile.single .
+docker build -t myapp:slim .
+docker images myapp
+dive myapp:slim                    # visualize wasted space per layer
+docker buildx build --progress=plain .   # full, unfolded build log</code></pre>
+<table>
+<tr><th>Example</th><th>Single-stage</th><th>Optimized</th></tr>
+<tr><td>Go API</td><td>~850 MB (golang image)</td><td>~12 MB (distroless/static)</td></tr>
+<tr><td>Node + TS API</td><td>~1.2 GB</td><td>~180 MB (slim, prod deps only)</td></tr>
+<tr><td>Python API</td><td>~1.0 GB</td><td>~150 MB (slim, no cache)</td></tr>
+</table>
+
+<h2>Pitfalls and trade-offs</h2>
+<ul>
+<li><strong>Forgetting runtime-only needs</strong> when going distroless/scratch: CA certificates, <code>/etc/passwd</code>, timezone data, shared libraries (a dynamically linked Go binary fails on scratch; set <code>CGO_ENABLED=0</code>).</li>
+<li><strong>Cache mounts are not shared by default across CI runners</strong>; they speed local builds more than ephemeral CI.</li>
+<li><strong>Over-optimizing</strong>: debugging a shell-less image is harder. Keep a <code>debug</code> target.</li>
+<li><strong>Alpine + Python</strong>: often slower and bigger once compilers are added. Prefer <code>python:3.13-slim</code>.</li>
+<li><strong>Cache never refreshes</strong>: a cached <code>apt-get update</code> layer hides security fixes. Rebuild with <code>--pull --no-cache</code> on a schedule.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write a tiny Go "hello server". Build it single-stage (<code>FROM golang</code>) and multi-stage with distroless. Compare <code>docker images</code> sizes.</li>
+<li>Add a cache mount to a Python Dockerfile, change <code>requirements.txt</code> by one line and compare the second build time with and without the mount.</li>
+<li>Try <code>docker run --rm -it your-distroless-image sh</code> and read the error. Then build the <code>:debug</code> variant and retry.</li>
+<li>Run <code>docker buildx build --platform linux/amd64,linux/arm64 .</code> (without <code>--push</code> use <code>--output type=image,push=false</code> or a local registry) and inspect the result.</li>
+</ol></div>

@@ -1,0 +1,173 @@
+<h1>Shell Scripting for Automation</h1>
+<p class="lead">A script is a saved list of commands that runs the same way every time. It is the first step from "I deployed it by hand" to "anyone (or any pipeline) can deploy it". The risk is that bash fails silently by default, so safe habits matter.</p>
+
+<h2>Why script</h2>
+<p>Manual steps get forgotten, mistyped and undocumented. A script is documentation that executes. Every CI job, Dockerfile <code>RUN</code> line, cron entry and cloud-init file is ultimately shell. Use bash for glue (30-200 lines); when logic gets complex (data structures, many branches, APIs) switch to Python or Go.</p>
+
+<h2>Your first script</h2>
+<pre><code>#!/usr/bin/env bash
+# hello.sh
+name="${1:-world}"          # first argument, default "world"
+echo "Hello, $name"</code></pre>
+<pre><code>chmod +x hello.sh
+./hello.sh Alice            # Hello, Alice
+bash hello.sh               # also works without chmod</code></pre>
+<p>The first line, the <em>shebang</em>, selects the interpreter. <code>#!/usr/bin/env bash</code> finds bash on the PATH.</p>
+
+<h2>The safety header</h2>
+<p>By default, bash keeps going after errors, treats unset variables as empty and ignores failures in pipelines. That turns <code>rm -rf "$BUILD_DIR/"*</code> with a typo into a disaster. Start every script with:</p>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'</code></pre>
+<table>
+<tr><th>Option</th><th>Effect</th></tr>
+<tr><td><code>-e</code></td><td>Exit immediately if a command fails (nonzero status)</td></tr>
+<tr><td><code>-u</code></td><td>Error on use of an unset variable</td></tr>
+<tr><td><code>-o pipefail</code></td><td>A pipeline fails if <em>any</em> stage fails, not just the last</td></tr>
+<tr><td><code>IFS=$'\n\t'</code></td><td>Split words on newline/tab only, safer with filenames containing spaces</td></tr>
+<tr><td><code>set -x</code></td><td>Trace: print each command as it runs (debugging; leaks secrets in logs)</td></tr>
+</table>
+<div class="callout warn"><strong>set -e is not magic</strong><p>It does not trigger inside <code>if</code> conditions, <code>&amp;&amp;</code>/<code>||</code> lists or a <code>!</code>-negated command. Handle expected failures explicitly: <code>grep -q foo file || true</code>, or test with <code>if</code>.</p></div>
+
+<h2>Variables, quoting, defaults</h2>
+<pre><code>APP_DIR=/opt/myapp                       # no spaces around =
+readonly KEEP=5                          # constant
+echo "Deploying to ${APP_DIR}/releases"  # braces delimit names
+: "${DEPLOY_ENV:?DEPLOY_ENV must be set}"  # abort with message if unset/empty
+PORT="${PORT:-3000}"                     # default value
+files=(a.txt "b c.txt")                  # array
+for f in "${files[@]}"; do echo "$f"; done   # quote "${arr[@]}" to preserve elements
+now=$(date -u +%Y%m%d%H%M%S)             # command substitution
+echo "${file%.txt}"                      # strip suffix; ${file##*/} = basename</code></pre>
+<p><strong>Always quote</strong> expansions: <code>"$var"</code>. Unquoted, a value with spaces or <code>*</code> gets split or globbed.</p>
+
+<h2>Conditionals, loops, functions</h2>
+<pre><code>if [[ -f "$file" ]]; then echo "exists"; elif [[ -d "$file" ]]; then echo "dir"; else echo "no"; fi
+
+[[ -z "$x" ]]        # empty            [[ -n "$x" ]]   # non-empty
+[[ "$a" == "$b" ]]   # string equal     [[ $n -gt 5 ]]  # numeric greater
+[[ -e path ]] [[ -r path ]] [[ -x path ]]   # exists / readable / executable
+command -v docker &gt;/dev/null 2&gt;&amp;1 || { echo "docker missing" &gt;&amp;2; exit 1; }
+
+for i in 1 2 3; do echo "$i"; done
+for f in /var/log/*.log; do wc -l "$f"; done
+while read -r line; do echo "got: $line"; done &lt; hosts.txt
+until curl -fsS localhost:3000/healthz &gt;/dev/null; do sleep 1; done   # wait for service
+
+case "$1" in
+  start)   echo "starting" ;;
+  stop)    echo "stopping" ;;
+  *)       echo "usage: $0 {start|stop}" &gt;&amp;2; exit 2 ;;
+esac
+
+log() { printf '%s [%s] %s\n' "$(date -Is)" "$1" "${*:2}"; }
+die() { log ERROR "$*" &gt;&amp;2; exit 1; }
+log INFO "started"</code></pre>
+<p>Use <code>[[ ]]</code> (bash) over <code>[ ]</code>. Scripts using <code>#!/bin/sh</code> must stick to POSIX features (no arrays, no <code>[[</code>).</p>
+
+<h2>Cleanup with trap</h2>
+<pre><code>tmp=$(mktemp -d)
+cleanup() { rm -rf "$tmp"; }
+trap cleanup EXIT                        # runs on any exit, including errors
+trap 'echo "failed at line $LINENO" &gt;&amp;2' ERR</code></pre>
+
+<h2>Real example: a deploy script</h2>
+<p>Deploys a prebuilt tarball using the release-directory pattern: each version in its own folder, <code>current</code> is a symlink, switching is atomic and rollback is just re-pointing the link.</p>
+<pre class="diagram">
+ /opt/myapp
+ ├── releases/
+ │   ├── 20261005101500/   (previous)
+ │   └── 20261005113000/   (new)
+ ├── shared/               (uploads, .env: survive deploys)
+ └── current ─▶ releases/20261005113000
+</pre>
+<pre><code>#!/usr/bin/env bash
+# deploy.sh &lt;artifact.tar.gz&gt;
+set -euo pipefail
+
+APP_DIR=/opt/myapp
+SERVICE=myapp
+KEEP=5
+HEALTH_URL="http://127.0.0.1:3000/healthz"
+
+log() { printf '%s %s\n' "$(date -Is)" "$*"; }
+die() { log "ERROR: $*" &gt;&amp;2; exit 1; }
+
+[[ $# -eq 1 ]] || die "usage: $0 &lt;artifact.tar.gz&gt;"
+artifact=$1
+[[ -f "$artifact" ]] || die "artifact not found: $artifact"
+
+# Prevent two deploys at once
+exec 9&gt;/tmp/myapp-deploy.lock
+flock -n 9 || die "another deploy is running"
+
+release="$APP_DIR/releases/$(date +%Y%m%d%H%M%S)"
+previous=$(readlink -f "$APP_DIR/current" || true)
+
+log "Unpacking to $release"
+mkdir -p "$release"
+tar -xzf "$artifact" -C "$release"
+ln -sfn "$APP_DIR/shared/.env" "$release/.env"
+
+log "Installing production dependencies"
+(cd "$release" &amp;&amp; npm ci --omit=dev)
+
+rollback() {
+  if [[ -n "$previous" &amp;&amp; -d "$previous" ]]; then
+    log "Rolling back to $previous"
+    ln -sfn "$previous" "$APP_DIR/current"
+    sudo systemctl restart "$SERVICE"
+  fi
+}
+
+log "Switching current symlink"
+ln -sfn "$release" "$APP_DIR/current"
+sudo systemctl restart "$SERVICE"
+
+log "Waiting for health check"
+for i in $(seq 1 30); do
+  if curl -fsS "$HEALTH_URL" &gt;/dev/null; then
+    log "Healthy after ${i}s"
+    # prune old releases, keep newest $KEEP
+    ls -1dt "$APP_DIR"/releases/*/ | tail -n +$((KEEP + 1)) | xargs -r rm -rf
+    log "Deploy OK: $release"
+    exit 0
+  fi
+  sleep 1
+done
+
+log "Health check failed"
+rollback
+die "deploy failed, rolled back"</code></pre>
+<p>Run it from your laptop or CI:</p>
+<pre><code>scp build.tar.gz web1:/tmp/ &amp;&amp; ssh web1 '/opt/myapp/bin/deploy.sh /tmp/build.tar.gz'</code></pre>
+<p>Notice the DevOps principles at work: idempotent-ish steps, locking, health verification, automatic rollback, retained history, and logging with timestamps.</p>
+
+<h2>Best practices checklist</h2>
+<ul>
+<li><code>set -euo pipefail</code> and quote everything.</li>
+<li>Check prerequisites first (<code>command -v</code>), fail fast with clear messages to stderr.</li>
+<li>Make scripts <strong>idempotent</strong>: safe to run twice (<code>mkdir -p</code>, <code>ln -sfn</code>, check-before-create).</li>
+<li>Never hard-code secrets; read from environment or a root-only file.</li>
+<li>Use <code>mktemp</code> and <code>trap</code> for temp files; never fixed names in <code>/tmp</code>.</li>
+<li>Lint with <strong>ShellCheck</strong> (<code>apt install shellcheck</code>): it catches quoting bugs and more. Format with <code>shfmt</code>. Run both in CI.</li>
+<li>Add <code>--dry-run</code> modes for destructive scripts, and print usage on bad input.</li>
+<li>Avoid parsing <code>ls</code>; use globs or <code>find -print0 | xargs -0</code>.</li>
+</ul>
+
+<h2>Bash vs alternatives</h2>
+<table>
+<tr><th>Tool</th><th>Choose when</th></tr>
+<tr><td>Bash</td><td>Glue commands, small tasks, CI steps, available everywhere</td></tr>
+<tr><td>Python</td><td>Parsing JSON/YAML, APIs, complex logic, tests</td></tr>
+<tr><td>Make / Just / Taskfile</td><td>Named project tasks (<code>make deploy</code>)</td></tr>
+<tr><td>Ansible/Terraform</td><td>Declarative server configuration and provisioning at scale (later sections)</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write <code>backup.sh</code> that tars a directory into <code>/var/backups/NAME-DATE.tar.gz</code>, keeps only the 7 newest, and exits nonzero with a message on any failure.</li>
+<li>Run <code>shellcheck</code> on it and fix every warning.</li>
+<li>Adapt the deploy script to your app and test a failing health check to see the rollback work (hint: make <code>/healthz</code> return 500).</li>
+<li>Add a <code>--dry-run</code> flag that only prints the steps.</li>
+</ol></div>

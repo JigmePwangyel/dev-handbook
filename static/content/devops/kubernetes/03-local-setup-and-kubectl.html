@@ -1,0 +1,127 @@
+<h1>Local Setup and kubectl Essentials</h1>
+<p class="lead">You do not need a cloud account to learn Kubernetes. A full cluster runs on your laptop in under a minute. This lesson sets one up, teaches the kubectl commands you will use daily, and dissects the shape of every Kubernetes YAML file.</p>
+
+<h2>Choosing a local cluster</h2>
+<table>
+<tr><th>Tool</th><th>How it works</th><th>Best for</th></tr>
+<tr><td><strong>kind</strong></td><td>Runs each "node" as a Docker container; multi-node supported</td><td>CI pipelines, testing, learning multi-node behaviour</td></tr>
+<tr><td><strong>minikube</strong></td><td>VM or container with a single node, many addons (<code>minikube addons enable ingress</code>)</td><td>Beginners, trying addons</td></tr>
+<tr><td><strong>k3d</strong></td><td>Runs k3s (lightweight Kubernetes) in Docker</td><td>Fast, low-memory clusters</td></tr>
+<tr><td>Docker Desktop / Rancher Desktop</td><td>Built-in single-node cluster toggle</td><td>Zero extra install</td></tr>
+</table>
+<p>All need a container runtime (Docker, Podman or similar) running first.</p>
+
+<h3>Install and create a cluster with kind</h3>
+<pre><code># macOS (Linux: download the binary from the kind releases page)
+brew install kind kubectl
+
+# single-node cluster
+kind create cluster --name dev
+
+# or multi-node, with a port mapped for later ingress experiments
+cat &lt;&lt;'EOF' &gt; kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 8080
+  - role: worker
+  - role: worker
+EOF
+kind create cluster --name dev --config kind-config.yaml
+
+kubectl cluster-info --context kind-dev
+kubectl get nodes</code></pre>
+<p>Alternatives: <code>minikube start</code> or <code>k3d cluster create dev --agents 2</code>. Delete with <code>kind delete cluster --name dev</code>.</p>
+
+<h3>Loading local images</h3>
+<p>A local cluster cannot see images in your Docker daemon automatically. Load them in: <code>kind load docker-image myapp:dev --name dev</code> (minikube: <code>minikube image load myapp:dev</code>). Use a non-<code>latest</code> tag, since <code>:latest</code> defaults to <code>imagePullPolicy: Always</code> and the cluster will try to pull from a registry.</p>
+
+<h2>kubectl and contexts</h2>
+<p>kubectl reads <code>~/.kube/config</code>, which lists <strong>clusters</strong>, <strong>users</strong> (credentials) and <strong>contexts</strong> (a cluster + user + default namespace). The current context determines which cluster every command hits.</p>
+<pre><code>kubectl config get-contexts            # list
+kubectl config current-context
+kubectl config use-context kind-dev    # switch cluster
+kubectl config set-context --current --namespace=staging   # default namespace</code></pre>
+<div class="callout warn"><strong>Production foot-gun</strong><p>Running <code>kubectl delete</code> against the wrong context is a classic outage. Show the current context in your shell prompt (kube-ps1) and consider tools like <code>kubectx</code>/<code>kubens</code>. Prefer separate kubeconfig files per environment and CI-driven changes to production.</p></div>
+
+<h2>Daily commands</h2>
+<pre><code># Read
+kubectl get pods                       # in current namespace
+kubectl get pods -A                    # all namespaces
+kubectl get pods -o wide               # node and IP
+kubectl get deploy,svc,pods -l app=web # multiple kinds, label selector
+kubectl get pod web-1 -o yaml          # full object
+kubectl describe pod web-1             # human-readable detail + Events
+kubectl logs web-1                     # stdout/stderr
+kubectl logs -f web-1 -c sidecar --previous   # follow, specific container, last crash
+kubectl api-resources                  # every kind the cluster knows
+kubectl explain deployment.spec.strategy      # built-in schema docs
+
+# Write
+kubectl apply -f manifest.yaml         # create or update declaratively
+kubectl apply -f dir/ -R               # a whole folder
+kubectl delete -f manifest.yaml
+kubectl create deployment web --image=nginx:1.27 --dry-run=client -o yaml &gt; web.yaml
+kubectl diff -f manifest.yaml          # preview what apply would change
+
+# Interact
+kubectl exec -it web-1 -- sh
+kubectl port-forward svc/web 8080:80   # localhost:8080 -> Service port 80
+kubectl scale deploy/web --replicas=5
+kubectl top pods                       # needs metrics-server</code></pre>
+<p>Set up an alias (<code>alias k=kubectl</code>) and shell completion (<code>source &lt;(kubectl completion zsh)</code>).</p>
+
+<h3>Imperative vs declarative</h3>
+<p><code>kubectl create</code>/<code>run</code>/<code>scale</code> are imperative shortcuts, handy for experiments. <code>kubectl apply -f</code> is declarative and the right way to manage anything real: the YAML file in git is the source of truth. A good trick is generating YAML with <code>--dry-run=client -o yaml</code> and then editing it.</p>
+
+<h2>Anatomy of a manifest</h2>
+<p>Every Kubernetes object has the same four top-level fields:</p>
+<pre><code>apiVersion: apps/v1          # API group and version of this kind
+kind: Deployment             # the type of object
+metadata:                    # identity
+  name: web                  # unique within kind + namespace
+  namespace: default
+  labels:                    # key/values you query and select by
+    app: web
+  annotations:               # non-identifying metadata (tools, notes)
+    owner: team-shop
+spec:                        # DESIRED state; shape depends on kind
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+# status:                    # ACTUAL state, written by Kubernetes, never by you</code></pre>
+<ul>
+<li><strong>apiVersion</strong>: find it with <code>kubectl api-resources</code> or <code>kubectl explain</code>. Core objects (Pod, Service) use <code>v1</code>; Deployments use <code>apps/v1</code>; Ingress <code>networking.k8s.io/v1</code>.</li>
+<li><strong>Labels and selectors</strong> are how objects find each other. A Service picks Pods by label; a Deployment owns Pods that match its selector. A mismatch is the most common beginner bug.</li>
+<li>Multiple objects can live in one file separated by <code>---</code>.</li>
+</ul>
+
+<div class="callout tip"><strong>Learn from the cluster itself</strong><p><code>kubectl explain pod.spec.containers --recursive</code> prints every legal field with types, offline. Much faster than searching docs.</p></div>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>YAML indentation is semantic. Use an editor with a Kubernetes schema plugin and run <code>kubectl apply --dry-run=server</code> to validate against the real API.</li>
+<li>Unquoted values like <code>yes</code>, <code>on</code> or <code>1.20</code> may be parsed as booleans or floats. Quote strings in env values.</li>
+<li><code>kubectl edit</code> changes live objects and leaves your files out of date. Edit the file and apply.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a kind cluster with two workers; run <code>kubectl get nodes -o wide</code>.</li>
+<li>Run <code>kubectl create deployment hello --image=nginx:1.27 --replicas=2 --dry-run=client -o yaml &gt; hello.yaml</code>, apply it, then <code>kubectl port-forward deploy/hello 8080:80</code> and curl it.</li>
+<li>Delete one Pod with <code>kubectl delete pod</code> and watch it come back with <code>kubectl get pods -w</code>.</li>
+</ol></div>

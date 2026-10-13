@@ -1,0 +1,144 @@
+<h1>Databases and Storage in the Cloud</h1>
+<p class="lead">Compute is disposable; data is not. State is where cloud projects get hurt: lost backups, corrupt failovers, surprise bills. This lesson covers the three kinds of storage, managed databases, backups, replicas and the S3 patterns you will use constantly.</p>
+
+<h2>Three kinds of storage</h2>
+<table>
+<tr><th></th><th>Block</th><th>File</th><th>Object</th></tr>
+<tr><td>Looks like</td><td>A raw disk</td><td>A shared network folder (NFS/SMB)</td><td>Key &rarr; blob over HTTP API</td></tr>
+<tr><td>AWS</td><td>EBS</td><td>EFS / FSx</td><td>S3</td></tr>
+<tr><td>GCP</td><td>Persistent Disk</td><td>Filestore</td><td>Cloud Storage</td></tr>
+<tr><td>Azure</td><td>Managed Disks</td><td>Azure Files</td><td>Blob Storage</td></tr>
+<tr><td>Access</td><td>One VM (OS mounts it)</td><td>Many VMs at once</td><td>Anyone with credentials, via URL</td></tr>
+<tr><td>Latency</td><td>Lowest (sub-ms to ms)</td><td>Low (ms)</td><td>Higher (tens of ms)</td></tr>
+<tr><td>Edits</td><td>In-place, byte-level</td><td>In-place</td><td>Replace whole object only</td></tr>
+<tr><td>Scale</td><td>TBs, one AZ</td><td>PBs, regional</td><td>Effectively unlimited</td></tr>
+<tr><td>Cost (approx/GB-mo)</td><td>~$0.08</td><td>~$0.30</td><td>~$0.023</td></tr>
+<tr><td>Use for</td><td>Databases, OS disks</td><td>Shared legacy files, CMS uploads</td><td>Uploads, backups, logs, static assets, data lakes</td></tr>
+</table>
+<div class="callout key"><strong>Rule of thumb</strong><p>If your app writes user files to local disk, move them to object storage. Local disks vanish with the container/instance and cannot be shared across replicas, which breaks horizontal scaling.</p></div>
+
+<h2>Managed databases</h2>
+<h3>Why not run Postgres yourself on EC2?</h3>
+<p>You can, but you then own: installation, security patches, major version upgrades, backup scripts and restore drills, replication setup, failover logic, disk growth, monitoring, and 3 a.m. pages. A managed database (RDS, Aurora, Cloud SQL, Azure Database) automates all of that for roughly 20-40% premium. For almost every team the premium is worth it.</p>
+<table>
+<tr><th>You get</th><th>You still own</th></tr>
+<tr><td>Automated backups + point-in-time recovery</td><td>Schema design, indexes, slow queries</td></tr>
+<tr><td>Minor-version patching in maintenance windows</td><td>Instance sizing and cost</td></tr>
+<tr><td>Multi-AZ synchronous standby with automatic failover</td><td>Connection management and pooling</td></tr>
+<tr><td>Read replicas, storage autoscaling, encryption</td><td>Testing restores, major upgrades, security groups</td></tr>
+</table>
+
+<h3>Choosing a database type</h3>
+<table>
+<tr><th>Need</th><th>Option</th></tr>
+<tr><td>Relational, transactions, SQL (default choice)</td><td>PostgreSQL on RDS/Aurora/Cloud SQL</td></tr>
+<tr><td>Key-value at huge scale, single-digit-ms</td><td>DynamoDB, Firestore</td></tr>
+<tr><td>Cache, sessions, rate limits, queues</td><td>Redis/Valkey (ElastiCache, Memorystore)</td></tr>
+<tr><td>Full-text search / log analytics</td><td>OpenSearch / Elasticsearch</td></tr>
+<tr><td>Analytics over huge data</td><td>BigQuery, Redshift, Snowflake</td></tr>
+<tr><td>Time series</td><td>Timescale, Prometheus, InfluxDB</td></tr>
+</table>
+<p>Start with Postgres. It handles JSON, full-text search, geospatial and queues well enough that you can defer specialised stores until measured need.</p>
+
+<h2>High availability vs read scaling: Multi-AZ vs replicas</h2>
+<p>These are frequently confused:</p>
+<pre class="diagram">
+ MULTI-AZ (availability)                    READ REPLICA (scale reads)
+ ┌────────┐ sync  ┌─────────┐               ┌─────────┐ async  ┌──────────┐
+ │Primary │──────▶│ Standby │               │ Primary │───────▶│ Replica  │ ◀─ SELECTs
+ │ AZ-a   │       │  AZ-b   │               │         │        │ (lag!)   │
+ └────────┘       └─────────┘               └─────────┘        └──────────┘
+ Standby serves NO traffic.                 Replicas serve reads, may lag by ms-seconds.
+ Automatic failover ~60-120 s.              Can be promoted manually; can be cross-region.
+</pre>
+<ul>
+<li><strong>Multi-AZ</strong> protects against an AZ failure or instance crash. Use for all production databases.</li>
+<li><strong>Read replicas</strong> offload read-heavy traffic and reports. Reads can be <em>stale</em> (replication lag): do not read-your-own-write from a replica without care.</li>
+<li>Writes always go to the single primary; scaling writes means a bigger instance, sharding, or a different data model.</li>
+</ul>
+
+<h2>Backups: the part that saves your job</h2>
+<ul>
+<li><strong>Automated snapshots + PITR</strong>: enable them, set retention (7-35 days). Point-in-time recovery lets you restore to any second.</li>
+<li><strong>Restores create a new instance</strong>; they do not rewind in place. Practise it and time it.</li>
+<li><strong>Cross-region / cross-account copies</strong> protect against region loss, ransomware and account compromise. Use AWS Backup with vault lock.</li>
+<li><strong>Logical dumps</strong> (<code>pg_dump</code>) as an extra, portable layer.</li>
+<li><strong>Deletion protection</strong> on, and a final snapshot on delete.</li>
+</ul>
+<pre><code># Create a snapshot and restore it to a new instance
+aws rds create-db-snapshot --db-instance-identifier prod-db \
+  --db-snapshot-identifier prod-db-2026-10-05
+
+aws rds restore-db-instance-to-point-in-time \
+  --source-db-instance-identifier prod-db \
+  --target-db-instance-identifier prod-db-restore-test \
+  --restore-time 2026-10-05T09:15:00Z</code></pre>
+<div class="callout warn"><strong>A backup you have never restored is a hope, not a backup</strong><p>Schedule a recurring restore drill into a scratch environment. Verify row counts and app startup against it. Record RTO (how long restore takes) and RPO (how much data you could lose).</p></div>
+
+<h2>Connection and security basics</h2>
+<ul>
+<li>Put databases in <strong>private subnets</strong>; allow only the app security group.</li>
+<li><strong>Encrypt at rest</strong> (KMS) and in transit (<code>sslmode=require</code>).</li>
+<li>Keep credentials in Secrets Manager with rotation, or use IAM database authentication.</li>
+<li>Use a <strong>connection pooler</strong> (RDS Proxy, PgBouncer): every Postgres connection costs memory, and serverless/autoscaled apps can open thousands.</li>
+</ul>
+
+<h2>S3 patterns</h2>
+<h3>Presigned URLs for uploads</h3>
+<p>Do not proxy large uploads through your servers. Have the app hand the browser a short-lived signed URL; the browser uploads straight to S3.</p>
+<pre><code>import boto3
+s3 = boto3.client("s3")
+url = s3.generate_presigned_url(
+    "put_object",
+    Params={"Bucket": "acme-uploads", "Key": "users/42/avatar.png",
+            "ContentType": "image/png"},
+    ExpiresIn=300,
+)
+# browser: fetch(url, {method: "PUT", body: file, headers: {"Content-Type": "image/png"}})</code></pre>
+<h3>Other essentials</h3>
+<ul>
+<li><strong>Static website / SPA hosting</strong>: private bucket + CloudFront with Origin Access Control.</li>
+<li><strong>Block Public Access</strong> on at account level; grant access through IAM or presigned URLs.</li>
+<li><strong>Versioning</strong>: keeps old versions, protecting against accidental overwrite/delete. Add <strong>MFA delete</strong> or Object Lock for compliance.</li>
+<li><strong>Lifecycle rules</strong>: transition to cheaper classes and expire old data.</li>
+<li><strong>Event notifications</strong>: S3 &rarr; Lambda/SQS on object creation (thumbnails, virus scan, ETL).</li>
+<li><strong>Cross-region replication</strong> for DR or locality.</li>
+</ul>
+<pre><code>{
+  "Rules": [{
+    "ID": "logs-tiering",
+    "Status": "Enabled",
+    "Filter": { "Prefix": "logs/" },
+    "Transitions": [
+      { "Days": 30,  "StorageClass": "STANDARD_IA" },
+      { "Days": 90,  "StorageClass": "GLACIER_IR" }
+    ],
+    "Expiration": { "Days": 365 }
+  }]
+}</code></pre>
+<table>
+<tr><th>S3 storage class</th><th>Use</th></tr>
+<tr><td>Standard</td><td>Hot data</td></tr>
+<tr><td>Intelligent-Tiering</td><td>Unknown or changing access patterns (auto-moves)</td></tr>
+<tr><td>Standard-IA / One Zone-IA</td><td>Infrequent access, millisecond retrieval</td></tr>
+<tr><td>Glacier Instant / Flexible / Deep Archive</td><td>Archives; cheaper storage, retrieval fees and delays</td></tr>
+</table>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Public buckets</strong> and leaked data: still the headline breach type.</li>
+<li><strong>Unbounded growth</strong>: logs and old snapshots accumulate; add lifecycle and retention policies.</li>
+<li><strong>Treating S3 as a filesystem</strong>: listing millions of keys is slow; design key prefixes and avoid rename-heavy workflows.</li>
+<li><strong>Reading stale replicas</strong> for just-written data.</li>
+<li><strong>Single-AZ databases in production</strong> and no tested restore.</li>
+<li><strong>Egress costs</strong>: serving big files straight from S3 to the internet is pricey; front with CloudFront.</li>
+<li><strong>Major version upgrades</strong> postponed until end-of-life forces a rushed migration.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a small RDS Postgres (private subnet, Multi-AZ off for cost). Connect via an SSM tunnel or bastion, create a table, take a snapshot, then restore to a new instance and compare.</li>
+<li>Create an S3 bucket with versioning; overwrite an object and recover the previous version.</li>
+<li>Add a lifecycle rule transitioning <code>logs/</code> to Standard-IA after 30 days and expiring after one year.</li>
+<li>Implement presigned-URL uploads from a tiny web page.</li>
+</ol></div>

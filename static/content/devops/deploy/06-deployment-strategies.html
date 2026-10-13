@@ -1,0 +1,167 @@
+<h1>Deployment Strategies</h1>
+<p class="lead">"Stop the old version, start the new one" works until the first time it fails with real users watching. Deployment strategies are different answers to one question: how do you move users from version A to version B while limiting the damage if B is broken?</p>
+
+<h2>What you are trading</h2>
+<p>Every strategy balances four things:</p>
+<ul>
+<li><strong>Downtime</strong>: is there a gap where nobody can be served?</li>
+<li><strong>Blast radius</strong>: if the new version is bad, how many users see it before you notice?</li>
+<li><strong>Rollback speed</strong>: how fast can you get back to the good version?</li>
+<li><strong>Cost and complexity</strong>: extra capacity, extra tooling, harder database changes.</li>
+</ul>
+<p>Underneath all of them, remember the rule from the migrations lesson: two versions of the app will coexist, so the database and any shared state must support both.</p>
+
+<h2>1. Recreate (big bang)</h2>
+<pre class="diagram">
+ Time ──▶
+ v1  ████████████████│
+                     │  (downtime)
+ v2                  │░░░░░████████████████
+                  stop v1   start v2
+</pre>
+<p>Stop everything, deploy, start again. It is what <code>git pull &amp;&amp; systemctl restart</code> does.</p>
+<ul>
+<li><strong>Pros</strong>: simplest; no version coexistence (migrations can be breaking); cheapest.</li>
+<li><strong>Cons</strong>: downtime on every release; the whole user base meets any bug; slow recovery.</li>
+<li><strong>Use for</strong>: internal tools, dev/staging, apps with maintenance windows, major migrations that cannot coexist.</li>
+</ul>
+
+<h2>2. Rolling update</h2>
+<pre class="diagram">
+ Servers:   [v1] [v1] [v1] [v1]
+ step 1:    [v2] [v1] [v1] [v1]     take one out of the LB, update, health check, put back
+ step 2:    [v2] [v2] [v1] [v1]
+ step 3:    [v2] [v2] [v2] [v1]
+ step 4:    [v2] [v2] [v2] [v2]
+</pre>
+<p>Replace instances gradually, a few at a time (batch size, "max surge", "max unavailable"). Traffic flows throughout. This is the default in Kubernetes Deployments, ECS and Auto Scaling group instance refresh.</p>
+<ul>
+<li><strong>Pros</strong>: no downtime; no duplicate full environment; native in most platforms.</li>
+<li><strong>Cons</strong>: v1 and v2 serve simultaneously (need compatibility); rollback is another rolling update (minutes); a bug is already on part of the fleet when detected; capacity dips if you remove instances before adding new ones.</li>
+<li><strong>Use for</strong>: the default for stateless services with backward-compatible changes.</li>
+</ul>
+<pre><code># Kubernetes rolling update parameters
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 25%         # extra pods allowed above desired during the rollout
+    maxUnavailable: 0     # never drop below desired capacity
+# Needs a readinessProbe, otherwise "ready" is declared before the app can serve</code></pre>
+
+<h2>3. Blue-green</h2>
+<pre class="diagram">
+              ┌─────────────┐
+ Users ─────▶ │ Router / LB │───────────────┐ (switch)
+              └─────────────┘               │
+                     │ today                ▼ after verification
+                     ▼                 ┌────────────┐
+              ┌────────────┐           │ GREEN (v2) │  full copy, already running and tested
+              │ BLUE  (v1) │           └────────────┘
+              └────────────┘            keep BLUE idle for instant rollback
+</pre>
+<p>Run two complete, identical environments. Blue serves production. Deploy v2 to green, test it with real infrastructure (smoke tests, internal traffic), then flip the router/DNS/LB target group so all traffic goes to green at once. To roll back, flip back.</p>
+<ul>
+<li><strong>Pros</strong>: near-zero downtime; instant, simple rollback; the new version is tested in a production-like environment before users see it.</li>
+<li><strong>Cons</strong>: double the infrastructure during the release; the switch is all-or-nothing (100 percent of users hit v2 immediately); database must serve both (shared DB means expand/contract; separate DBs means data sync pain); in-flight requests and sessions at switch time; warm-up (cold caches).</li>
+<li><strong>Use for</strong>: when fast rollback matters and extra capacity is affordable (cheap with cloud or containers).</li>
+</ul>
+<p>On a single VPS you can emulate it with two app instances on different ports and an nginx <code>proxy_pass</code> pointing at one; switching means editing the upstream and <code>nginx -s reload</code>. On AWS, swap target groups on an ALB listener, or use CodeDeploy blue/green; on Kubernetes, switch a Service selector.</p>
+
+<h2>4. Canary</h2>
+<pre class="diagram">
+ 100% ─ v1 ████████████████████████████████████████
+
+  stage 1:  v1 95% ███████████████████░  v2 5%  █       watch error rate, latency, business KPIs
+  stage 2:  v1 75% ███████████████░░░░░  v2 25% █████
+  stage 3:  v1 50% ██████████░░░░░░░░░░  v2 50% ██████████
+  done:                                  v2 100%
+  any stage fails ──▶ route 100% back to v1 (smallest possible blast radius)
+</pre>
+<p>Named after the canary in the coal mine. Send a small share of real traffic (1 to 5 percent, or only employees or one region) to v2, compare its metrics against v1, and increase gradually only while healthy.</p>
+<ul>
+<li><strong>Pros</strong>: minimal blast radius; real production validation; data-driven promotion; automatic rollback possible (Argo Rollouts, Flagger, Spinnaker/Kayenta, AWS CodeDeploy, Istio/Envoy weighted routing).</li>
+<li><strong>Cons</strong>: needs good observability (without metrics a canary is blind); needs fine-grained traffic splitting; more complex; slow; both versions must be compatible; low traffic means too few samples to detect problems; sticky users (decide whether a user stays on one version).</li>
+<li><strong>Use for</strong>: high-traffic services where a bad release is costly.</li>
+</ul>
+<pre><code># nginx: crude canary with weighted upstream (about 10% to canary)
+upstream app {
+    server 10.0.1.11:3000 weight=9;
+    server 10.0.1.12:3000 weight=1;      # canary running v2
+}
+# Better: pin specific users via a cookie or header
+map $http_x_canary $backend { default stable; "1" canary; }</code></pre>
+
+<h2>5. Shadow (mirroring / dark launch)</h2>
+<pre class="diagram">
+ Users ──▶ LB ──▶ v1 (production)  ──▶ response to the user
+            │
+            └────▶ copy of each request ──▶ v2 (shadow)  ──▶ response DISCARDED, compared/logged
+</pre>
+<p>Duplicate live traffic to the new version, but ignore its responses. Users are never affected; you compare behaviour, performance and diffs against production load.</p>
+<ul>
+<li><strong>Pros</strong>: zero user impact; tests with real traffic shape and volume; great for rewrites and migrations (new database, new language, new algorithm).</li>
+<li><strong>Cons</strong>: the shadow must not cause side effects (duplicate emails, payments, writes to the shared database): requires stubbing or a separate datastore; doubles load; nondeterministic comparison; engineering effort.</li>
+<li><strong>Tools</strong>: nginx <code>mirror</code> directive, Envoy/Istio traffic mirroring, GitHub Scientist-style libraries.</li>
+</ul>
+
+<h2>6. A/B testing</h2>
+<p>Not a safety mechanism, but an <em>experiment</em>: route different user segments (by cookie, user id hash, geography, plan) to different <em>versions of a feature</em> to measure which performs better on a business metric (conversion, retention). It needs a stable assignment per user and statistical analysis. Canary asks "is v2 healthy?" A/B asks "is v2 better for the business?" They can use the same routing machinery but have different goals and durations (A/B runs for days or weeks).</p>
+
+<h2>7. Feature flags (decouple deploy from release)</h2>
+<pre><code>// The code ships dark; the flag decides who sees it
+if (flags.isEnabled('new-checkout', { userId: user.id, plan: user.plan })) {
+  return newCheckout(req);
+}
+return oldCheckout(req);</code></pre>
+<p>A feature flag is a runtime conditional controlled outside the code (config service, LaunchDarkly, Unleash, Flagsmith, OpenFeature standard, or a database table). You deploy the code with the feature <strong>off</strong>, then turn it on for staff, then 1 percent, then everyone, and can turn it off in seconds <em>without a deploy or a rollback</em>.</p>
+<ul>
+<li><strong>Pros</strong>: separates deployment (technical act) from release (business decision); instant kill switch; enables trunk-based development, canary by user, A/B tests, gradual rollouts, per-customer features.</li>
+<li><strong>Cons</strong>: code complexity (two paths); tests multiply; flags rot into permanent clutter ("flag debt"); a flag service becomes a dependency (needs safe defaults and caching); flags interacting in unforeseen ways; schema must support both paths.</li>
+<li><strong>Discipline</strong>: give each flag an owner and an expiry date; delete it once fully rolled out; default to the safe state if the flag service is unreachable.</li>
+</ul>
+
+<h2>Comparison</h2>
+<table>
+<tr><th>Strategy</th><th>Downtime</th><th>Blast radius</th><th>Rollback</th><th>Extra cost</th><th>Complexity</th></tr>
+<tr><td>Recreate</td><td>Yes</td><td>100%</td><td>Slow (redeploy)</td><td>None</td><td>Lowest</td></tr>
+<tr><td>Rolling</td><td>No</td><td>Grows during rollout</td><td>Minutes (re-roll)</td><td>Small (surge)</td><td>Low</td></tr>
+<tr><td>Blue-green</td><td>No</td><td>100% at switch</td><td>Instant (flip)</td><td>2x during release</td><td>Medium</td></tr>
+<tr><td>Canary</td><td>No</td><td>Small, controlled</td><td>Fast (shift weight)</td><td>Small</td><td>High (needs metrics)</td></tr>
+<tr><td>Shadow</td><td>No</td><td>None (users unaffected)</td><td>n/a</td><td>High (duplicate load)</td><td>High</td></tr>
+<tr><td>A/B test</td><td>No</td><td>Segment only</td><td>Flag off</td><td>Low</td><td>High (experiment design)</td></tr>
+<tr><td>Feature flags</td><td>No</td><td>Per flag, per user</td><td>Instant (toggle)</td><td>Low</td><td>Medium (flag hygiene)</td></tr>
+</table>
+
+<h2>Combining strategies</h2>
+<p>Real systems combine them. A typical modern setup: <strong>rolling or blue-green</strong> for the deploy mechanism, <strong>canary</strong> analysis to gate promotion, <strong>feature flags</strong> to release functionality independently, and <strong>expand/contract</strong> migrations to keep it all compatible. Shadowing is reserved for big rewrites.</p>
+
+<h2>Choosing</h2>
+<ol>
+<li>Internal tool, few users, downtime fine: <strong>recreate</strong>.</li>
+<li>Normal web service, backward-compatible changes: <strong>rolling</strong>, with health checks.</li>
+<li>Need one-click rollback, can afford duplicate capacity: <strong>blue-green</strong>.</li>
+<li>High traffic, strong monitoring, risky changes: <strong>canary</strong>, automated.</li>
+<li>Rewriting a critical component: <strong>shadow</strong> first, then canary.</li>
+<li>Product experiments or gradual feature rollout: <strong>feature flags</strong> (and A/B).</li>
+</ol>
+
+<div class="callout warn"><strong>No strategy rescues a missing health check or metric</strong><p>All of the above depend on knowing whether the new version is healthy. Without readiness probes, error-rate dashboards and alerting, a rolling update will happily roll out a broken version to 100 percent, just slowly. Build observability first or alongside.</p></div>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Forgetting that v1 and v2 share the database, caches, queues and message formats. A new message schema consumed by old workers breaks them.</li>
+<li>Blue-green with sessions stored in app memory: users are logged out at the switch.</li>
+<li>Canary on too little traffic: 1 percent of 100 requests per hour tells you nothing.</li>
+<li>Choosing the strategy before the problem. A single-server hobby app does not need canaries.</li>
+<li>Permanently-on "temporary" flags.</li>
+<li>Rolling back code but not config or flags that were changed at the same time.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Build two tiny apps that return "v1" and "v2" on ports 3001 and 3002. With nginx, simulate a blue-green flip: <code>proxy_pass</code> to 3001, <code>curl</code> in a loop, change to 3002, <code>nginx -s reload</code>, and observe no failed requests.</li>
+<li>Do a canary: <code>upstream</code> with weights 9 and 1. Run 100 requests and count versions. Make v2 fail 50 percent of the time and compute the overall error rate; at what weight would your alert fire?</li>
+<li>Try nginx mirroring: <code>mirror /shadow; location = /shadow { internal; proxy_pass http://127.0.0.1:3002$request_uri; }</code> and watch v2's logs receive copies.</li>
+<li>Implement a feature flag as an environment variable or JSON file read per request, flip it live and observe the behaviour without a restart.</li>
+<li>For a service you know, fill in the comparison table: which strategy fits, what would break if v1 and v2 ran concurrently?</li>
+</ol></div>

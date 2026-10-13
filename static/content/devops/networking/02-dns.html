@@ -1,0 +1,138 @@
+<h1>DNS: The Internet's Phone Book</h1>
+<p class="lead">Humans use names like <code>app.example.com</code>; networks use IP addresses. DNS translates between them. It is also the root cause of a startling share of outages, and the lever you pull for most deployment cutovers.</p>
+
+<h2>Why DNS exists</h2>
+<p>Without DNS you would give users <code>203.0.113.10</code>. When you moved servers, every user and every config file would need updating. DNS adds a level of indirection: users hold a stable <em>name</em>, and you change what it points to. Almost every migration, failover and traffic-shifting trick relies on this indirection.</p>
+
+<h2>How resolution works</h2>
+<p>When your laptop looks up <code>www.example.com</code>, several parties cooperate:</p>
+<pre class="diagram">
+ Browser ──▶ OS stub resolver ──▶ Recursive resolver (ISP, 1.1.1.1, 8.8.8.8)
+                                        │ (cache miss)
+              1. ask a ROOT server ─────┤  "who handles .com?"       → TLD servers
+              2. ask a .com TLD server ─┤  "who handles example.com?" → authoritative NS
+              3. ask example.com's      │
+                 AUTHORITATIVE server ──┘  "www.example.com?"        → 203.0.113.10
+                                        │
+                      answer cached for TTL seconds, returned to you
+</pre>
+<ul>
+<li><strong>Stub resolver</strong>: the tiny client in your OS. It forwards the question and caches briefly.</li>
+<li><strong>Recursive resolver</strong>: does the legwork and caches answers for many users.</li>
+<li><strong>Root servers</strong>: know only who runs each top-level domain.</li>
+<li><strong>TLD servers</strong>: know which name servers are authoritative for each domain under them.</li>
+<li><strong>Authoritative servers</strong>: hold the real records. Your DNS provider (Cloudflare, Route 53, your registrar) runs these.</li>
+</ul>
+<p>Caching at every level is why DNS is fast, and also why changes are not instant.</p>
+
+<h2>Record types</h2>
+<table>
+<tr><th>Type</th><th>Maps</th><th>Example</th></tr>
+<tr><td><code>A</code></td><td>Name to IPv4</td><td><code>app.example.com. 300 IN A 203.0.113.10</code></td></tr>
+<tr><td><code>AAAA</code></td><td>Name to IPv6</td><td><code>app 300 IN AAAA 2001:db8::10</code></td></tr>
+<tr><td><code>CNAME</code></td><td>Name to another name (alias)</td><td><code>www 300 IN CNAME app.example.com.</code></td></tr>
+<tr><td><code>MX</code></td><td>Mail servers, with priority</td><td><code>@ IN MX 10 mail.example.com.</code></td></tr>
+<tr><td><code>TXT</code></td><td>Free text: SPF, DKIM, domain verification</td><td><code>@ IN TXT "v=spf1 include:_spf.google.com ~all"</code></td></tr>
+<tr><td><code>NS</code></td><td>Which servers are authoritative for the zone</td><td><code>@ IN NS ns1.dnsprovider.com.</code></td></tr>
+<tr><td><code>SOA</code></td><td>Zone metadata (serial, refresh, negative TTL)</td><td>Managed by your provider</td></tr>
+<tr><td><code>CAA</code></td><td>Which CAs may issue certificates</td><td><code>@ IN CAA 0 issue "letsencrypt.org"</code></td></tr>
+<tr><td><code>SRV</code></td><td>Host + port for a service</td><td>Used by some internal service discovery</td></tr>
+<tr><td><code>PTR</code></td><td>IP to name (reverse DNS)</td><td>Important for mail servers</td></tr>
+</table>
+
+<h3>The apex CNAME problem</h3>
+<p>A <code>CNAME</code> cannot coexist with other records at the same name, and the zone apex (<code>example.com</code> itself) must have <code>SOA</code> and <code>NS</code> records. So you cannot put a standard CNAME at the apex. Solutions: use an <code>A</code> record at the apex; or use your provider's proprietary "ALIAS"/"ANAME"/"CNAME flattening" (Route 53 Alias, Cloudflare flattening) which resolves the target server-side and returns A records.</p>
+
+<h2>TTL and "propagation"</h2>
+<p>Every record has a <strong>TTL</strong> (time to live, in seconds): how long resolvers may cache it. TTL 300 means "reuse this answer for up to 5 minutes."</p>
+<p>"DNS propagation" is a misleading term. Nothing is pushed anywhere. Your authoritative server changes instantly; the delay is the world's recursive resolvers still holding the old answer until their cached copy expires. A change from IP X to IP Y takes up to the <em>old</em> TTL to be seen everywhere. Some resolvers and ISPs ignore low TTLs, and browsers and JVMs add their own caches.</p>
+
+<div class="callout tip"><strong>The migration playbook</strong><p>24 to 48 hours before a planned cutover, lower the TTL to 60 to 300 seconds. Wait out the old TTL. Switch the record. Verify. Later raise the TTL again (3600 or more) to reduce query load and improve resilience. Lowering the TTL at the moment of cutover does nothing: caches already hold the old value with the old TTL.</p></div>
+
+<table>
+<tr><th>TTL</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>60 to 300 s</td><td>Fast failover and cutover</td><td>More queries; slightly slower first lookups</td></tr>
+<tr><td>3600 s (1 h)</td><td>Good default for stable records</td><td>Hour-long wait to change</td></tr>
+<tr><td>86400 s (1 day)</td><td>Cheapest; resilient to DNS provider hiccups</td><td>Painful to change</td></tr>
+</table>
+<p>Negative caching: a lookup for a name that does not exist (<code>NXDOMAIN</code>) is also cached, for the SOA's minimum TTL. If you query a hostname before creating its record, you may keep seeing "not found" for a while.</p>
+
+<h2>dig: your main tool</h2>
+<pre><code># Full answer with all sections
+dig example.com
+
+# Just the answer
+dig +short example.com
+dig +short AAAA example.com
+dig +short MX example.com
+dig +short TXT example.com
+dig +short CNAME www.example.com
+
+# Ask a specific resolver (bypass your local cache/ISP)
+dig @1.1.1.1 example.com
+dig @8.8.8.8 example.com
+
+# Ask the authoritative server directly: the source of truth, no caching
+dig NS example.com +short
+dig @ns1.dnsprovider.com example.com
+
+# Follow the whole delegation chain from the root
+dig +trace example.com
+
+# Reverse lookup
+dig -x 203.0.113.10 +short</code></pre>
+<p>Reading the full output:</p>
+<pre><code>;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 4321
+;; ANSWER SECTION:
+example.com.   287   IN   A   203.0.113.10
+;;             ^^^ remaining TTL (counts down on each query to the same cache)
+
+;; Query time: 12 msec
+;; SERVER: 1.1.1.1#53(1.1.1.1)</code></pre>
+<p>Key statuses: <code>NOERROR</code> (ok, possibly with an empty answer), <code>NXDOMAIN</code> (name does not exist), <code>SERVFAIL</code> (resolver could not get a valid answer; often a broken DNSSEC setup or dead name servers), <code>REFUSED</code>. Alternatives: <code>nslookup</code>, <code>host</code>, and <code>resolvectl query</code> on systemd systems.</p>
+
+<h2>Setting up a domain for your app</h2>
+<ol>
+<li><strong>Register</strong> the domain with a registrar (Namecheap, Cloudflare Registrar, Porkbun, Route 53 Domains).</li>
+<li><strong>Choose where DNS is hosted.</strong> The registrar's default or a dedicated provider. At the registrar, set the domain's <code>NS</code> records (delegation) to the provider's name servers.</li>
+<li><strong>Create records</strong> in that provider's zone:</li>
+</ol>
+<pre><code>@     300  A      203.0.113.10        ; example.com
+www   300  CNAME  example.com.        ; www.example.com
+api   300  A      203.0.113.20        ; api.example.com
+@     300  CAA    0 issue "letsencrypt.org"</code></pre>
+<p>Note: <code>NS</code> records at the registrar (delegation) and the records in the zone are two different things. Beginners edit the wrong place and see no effect. Check with <code>dig NS example.com +short</code> to see who really is authoritative.</p>
+
+<h2>DNS as a deployment tool</h2>
+<ul>
+<li><strong>Cutover</strong>: point the name at the new server.</li>
+<li><strong>Weighted routing</strong> (Route 53, Cloudflare): 5 percent of answers to the new stack. A crude canary.</li>
+<li><strong>Health-checked failover</strong>: the provider stops returning an unhealthy IP.</li>
+<li><strong>Geo/latency routing</strong>: answer with the nearest region.</li>
+<li><strong>Wildcards</strong>: <code>*.example.com</code> catches all subdomains (useful for preview environments per pull request).</li>
+<li><strong>Split-horizon</strong>: internal resolvers return private IPs for the same name that resolves publicly elsewhere. Cloud private zones (Route 53 private hosted zones) do this.</li>
+</ul>
+<p>Limit: DNS-based traffic shifting is coarse, because clients cache answers and you cannot drain instantly. Load balancers (see that lesson) are the precise tool.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Trailing dots</strong>: in zone files <code>example.com.</code> is absolute; <code>example.com</code> without a dot gets the zone name appended (<code>example.com.example.com.</code>). Web UIs usually hide this, but file-based zones bite.</li>
+<li><strong>CNAME at apex or alongside MX/TXT</strong> breaks mail and verification.</li>
+<li><strong>Dangling records</strong>: a CNAME to a deleted cloud resource can be claimed by an attacker (subdomain takeover). Clean up DNS when you delete infrastructure.</li>
+<li><strong>Expired domains</strong> take everything down. Enable auto-renew and keep a valid payment method.</li>
+<li><strong>Forgetting the local cache</strong>: your machine may still hold the old answer. Flush with <code>sudo resolvectl flush-caches</code> (Linux) or <code>sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder</code> (macOS). Test with <code>dig @1.1.1.1</code> instead.</li>
+<li><strong>Single DNS provider</strong> is a single point of failure for the entire company. Large organisations use two.</li>
+<li><strong>Testing before DNS is ready</strong>: use <code>curl --resolve app.example.com:443:203.0.113.10 https://app.example.com/</code> or temporarily edit <code>/etc/hosts</code>.</li>
+</ul>
+
+<div class="callout info"><strong>DNSSEC and DoH</strong><p>DNSSEC signs records so resolvers can detect tampering (a misconfiguration can make your domain fail to resolve entirely, so enable it deliberately and keep DS records in sync). DNS over HTTPS/TLS encrypts the client-to-resolver hop for privacy. Neither changes how records work.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>dig +trace github.com</code> and identify the root, TLD and authoritative steps.</li>
+<li>Run <code>dig github.com</code> twice a few seconds apart and watch the TTL count down.</li>
+<li>Find a domain's mail servers (<code>dig +short MX gmail.com</code>), name servers and SPF record (<code>dig +short TXT gmail.com</code>).</li>
+<li>Compare <code>dig @1.1.1.1 +short example.com</code> with <code>dig @8.8.8.8 +short example.com</code> for a CDN-fronted site; you may see different IPs (geo routing).</li>
+<li>Test a site without DNS: <code>curl -I --resolve example.com:443:93.184.215.14 https://example.com/</code>.</li>
+<li>If you own a domain, create a test record <code>test.yourdomain.com</code> with TTL 60, change its value, and time how long <code>dig</code> takes to show the new value.</li>
+</ol></div>

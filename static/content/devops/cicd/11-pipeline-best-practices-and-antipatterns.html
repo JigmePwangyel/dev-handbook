@@ -1,0 +1,169 @@
+<h1>Pipeline Best Practices and Anti-Patterns</h1>
+<p class="lead">Building a first pipeline is easy. Keeping it fast, trusted and maintainable for years, with dozens of engineers and hundreds of repos, is the real craft. This lesson collects the practices that separate pipelines people love from pipelines people route around.</p>
+
+<h2>Why pipelines decay</h2>
+<p>A pipeline is a product with users: your developers. Like any product it accumulates debt. Tests get slower one at a time. A flaky test is "retried" until it is normal. Someone copies a workflow into 40 repos and the copies drift. Nobody owns it. Eventually engineers merge without waiting, or bypass the system, and you have lost the safety you built it for. The principles below are how you prevent that.</p>
+
+<h2>Best practices</h2>
+<h3>1. Treat the pipeline as code</h3>
+<ul>
+<li>Definitions in Git, reviewed via PR, tested on branches. No click-configured jobs.</li>
+<li>Keep logic in scripts you can run locally (<code>make ci</code>, <code>./scripts/test.sh</code>, <code>npm run</code>); keep the CI file a thin orchestrator. Developers should reproduce a failure on their laptop without pushing 12 "fix ci" commits.</li>
+<li>Lint your pipeline code (<code>actionlint</code>, GitLab CI Lint, <code>hadolint</code>, <code>shellcheck</code>).</li>
+<li>Share via reusable workflows, templates, components or shared libraries; version and pin them.</li>
+</ul>
+<h3>2. Keep it fast</h3>
+<table>
+<tr><th>Technique</th><th>Typical win</th></tr>
+<tr><td>Run cheap checks first, fail fast</td><td>Seconds to failure instead of minutes</td></tr>
+<tr><td>Parallelise independent jobs; shard long suites</td><td>Time = longest branch, not the sum</td></tr>
+<tr><td>Cache dependencies and Docker layers (order Dockerfile: dependency manifests before source)</td><td>Minutes saved per run</td></tr>
+<tr><td>Run only affected tests/builds (path filters, Nx/Turborepo/Bazel)</td><td>Large in monorepos</td></tr>
+<tr><td>Cancel superseded runs</td><td>Saves cost and queue time</td></tr>
+<tr><td>Bigger or faster runners for the hot path</td><td>Cheap compared to waiting engineers</td></tr>
+<tr><td>Move slow tests off the PR path (post-merge, nightly)</td><td>Fast PR feedback, still covered</td></tr>
+</table>
+<p>Set an explicit <strong>budget</strong>, for example "PR feedback under 10 minutes, p90", measure against it, and treat regressions like bugs.</p>
+<h3>3. Build once, promote the artifact</h3>
+<p>One immutable, uniquely identified artifact (image digest) flows through every environment. Environment differences are injected configuration. Deploy by SHA or digest, never <code>latest</code>.</p>
+<h3>4. Make runs reproducible</h3>
+<ul>
+<li>Pin tool versions (<code>.nvmrc</code>, <code>.tool-versions</code>, base image digests), use lockfiles and <code>npm ci</code>.</li>
+<li>Run in containers or clean ephemeral runners; no state carried over between runs.</li>
+<li>Avoid depending on external services you do not control (flaky mirrors); use proxies/caches for registries.</li>
+</ul>
+<h3>5. Fail loudly and clearly</h3>
+<ul>
+<li><code>set -euo pipefail</code> in shell steps so errors stop the job.</li>
+<li>Set <code>timeout-minutes</code> everywhere.</li>
+<li>Upload logs, test reports and screenshots/videos as artifacts; surface results in the PR (annotations, JUnit summaries).</li>
+<li>Notify the owner, not a firehose channel. Alert fatigue kills attention.</li>
+</ul>
+<h3>6. Own it</h3>
+<p>Assign owners (a platform or developer-experience team), define SLOs for the pipeline itself (availability, queue time, p90 duration), and review them regularly. Keep a changelog of pipeline changes.</p>
+
+<h2>Anti-pattern: flaky tests</h2>
+<p>A flaky test passes and fails on the same code. It is the most corrosive pipeline problem because it destroys trust: when red may mean nothing, people stop reading red.</p>
+<p><strong>Common causes:</strong> timing and race conditions (<code>sleep(2)</code>), shared state or order dependence, reliance on wall-clock time or timezone, unseeded randomness, un-awaited async work, port collisions, network calls to real third parties, resource contention on shared runners, test data left by previous tests.</p>
+<p><strong>What to do:</strong></p>
+<ol>
+<li><strong>Measure it.</strong> Track per-test failure-then-pass-on-retry rates (most CI vendors and tools like BuildPulse or Datadog CI Visibility report this).</li>
+<li><strong>Quarantine fast.</strong> Move a flaky test to a non-blocking job and file a ticket with an owner and a deadline. A quarantined test with no owner is a deleted test.</li>
+<li><strong>Fix the cause,</strong> not the symptom: wait on conditions (poll for readiness) rather than fixed sleeps; inject a fake clock; isolate data per test; mock third parties at the network edge.</li>
+<li><strong>Retries are a bandage.</strong> A limited retry (once) for E2E tests can be pragmatic, but report retried-then-passed tests as flaky, and never blanket-retry whole pipelines.</li>
+<li><strong>Reproduce with repetition:</strong> run the test 100 times in a loop or with <code>--repeat-each</code>; run it under CPU constraints.</li>
+</ol>
+<div class="callout warn"><strong>The cost of "just re-run it"</strong><p>If 5% of runs fail spuriously and a PR needs 6 checks to pass, a large fraction of PRs fail at least once for no reason. Multiply by developers and wait times: flakiness silently taxes lead time, and teaches people that red is normal.</p></div>
+
+<h2>Anti-pattern: slow pipelines</h2>
+<ul>
+<li><strong>Symptoms:</strong> PRs sit for 40 minutes; developers batch commits; "I'll merge while it's running".</li>
+<li><strong>Diagnose:</strong> find the critical path; use the platform's timing view; identify the top three slow steps (usually dependency install, test suites, Docker builds).</li>
+<li><strong>Fix:</strong> see the table above. Also remove duplicate work (building the same thing in three jobs), trim image sizes, use multi-stage Docker builds with layer caching, and split the monolith pipeline into per-package pipelines.</li>
+</ul>
+
+<h2>More anti-patterns</h2>
+<table>
+<tr><th>Anti-pattern</th><th>Why it hurts</th><th>Instead</th></tr>
+<tr><td>Rebuilding per environment</td><td>Prod runs something never tested</td><td>Build once, promote</td></tr>
+<tr><td>Deploying <code>latest</code></td><td>Unknowable, unrollbackable</td><td>Immutable SHA/digest tags</td></tr>
+<tr><td>Long-lived feature branches</td><td>Integration hell returns</td><td>Trunk-based + flags</td></tr>
+<tr><td>Manual steps in the "automated" flow</td><td>Not repeatable; hero dependency</td><td>Script it; keep only intentional approvals</td></tr>
+<tr><td>Secrets in repo or baked in images</td><td>Leaks</td><td>OIDC, secrets manager, runtime injection</td></tr>
+<tr><td>Copy-pasted pipelines across repos</td><td>Drift, painful security updates</td><td>Reusable workflows/templates, versioned</td></tr>
+<tr><td>Snowflake CI server configured by hand</td><td>Cannot recreate it</td><td>Config as code, ephemeral runners</td></tr>
+<tr><td>Ignoring red main</td><td>Everyone's PRs now fail or are untrustworthy</td><td>Stop the line: revert first</td></tr>
+<tr><td>Pipeline passes but tells you nothing (no real tests)</td><td>False confidence</td><td>Invest in meaningful tests; review what gates assert</td></tr>
+<tr><td>No post-deploy verification</td><td>Broken deploys discovered by users</td><td>Smoke tests, health checks, canary analysis</td></tr>
+<tr><td>Tests depend on deploying to a shared staging</td><td>Queues and clobbering</td><td>Ephemeral per-PR environments</td></tr>
+<tr><td>Friday-afternoon freeze as the only safety</td><td>Safety by fear, bigger batches</td><td>Fast rollback + progressive rollout</td></tr>
+</table>
+
+<h2>Rollbacks: design them before you need them</h2>
+<p>Every deploy must have a tested way back. Options, from fastest to slowest:</p>
+<ol>
+<li><strong>Feature flag off</strong> (seconds): for risky features, the quickest remedy and needs no deploy.</li>
+<li><strong>Traffic shift back</strong> (blue-green swap, canary abort): seconds to a minute.</li>
+<li><strong>Redeploy the previous artifact</strong> (<code>kubectl rollout undo deployment/shop</code>, or run the deploy workflow with the previous digest): minutes. This is why you keep immutable, versioned artifacts and expose a manual <code>workflow_dispatch</code> with a "version" input.</li>
+<li><strong>Revert the commit and let the pipeline redeploy</strong> (<code>git revert</code>): minutes to tens of minutes; leaves a clear history; the default for GitOps.</li>
+<li><strong>Roll forward</strong> with a hotfix: sometimes the only option after a data migration.</li>
+</ol>
+<p><strong>Databases are the hard part.</strong> Code rolls back easily; schema and data do not. Use the <em>expand/contract</em> pattern: first deploy a backward-compatible schema (add nullable column), then deploy code that uses it, and only later remove the old column. Never ship a destructive migration in the same release as the code that stops needing it.</p>
+<pre><code># manual rollback workflow (GitHub Actions)
+on:
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: "Previously released image digest to redeploy"
+        required: true
+
+# Kubernetes quick rollback
+kubectl rollout undo deployment/shop
+kubectl rollout status deployment/shop --timeout=120s</code></pre>
+<p>Rehearse rollbacks. A rollback procedure that has never been run is a hope, not a procedure.</p>
+
+<h2>Monorepos</h2>
+<p>A monorepo keeps many projects in one repository. It makes atomic cross-project changes and shared tooling easy, but naive CI (run everything on every change) does not scale.</p>
+<ul>
+<li><strong>Affected-only builds:</strong> compute which packages changed and which depend on them (Nx <code>affected</code>, Turborepo <code>--filter=...[origin/main]</code>, Bazel, Pants, Gradle composite builds).</li>
+<li><strong>Remote build cache:</strong> share task outputs across developers and CI so unchanged work is never redone.</li>
+<li><strong>Path filters</strong> per workflow: <code>on.push.paths</code> in GitHub, <code>rules:changes</code> in GitLab. Beware: required checks that are skipped by path filters can block merges; use the "gate job" pattern.</li>
+<li><strong>Per-service pipelines</strong> generated dynamically (GitLab child pipelines, GitHub reusable workflows with a matrix computed by a first job).</li>
+<li><strong>Code owners and permissions</strong> per directory.</li>
+<li><strong>Merge queues</strong> to keep a busy main green.</li>
+</ul>
+<p>Polyrepo trades the opposite way: simple, independent pipelines, but cross-repo changes and version coordination are painful. Pick based on team coupling, not fashion.</p>
+
+<h2>Measure the pipeline and the delivery</h2>
+<p>You cannot improve what you do not measure. Track two families of metrics:</p>
+<table>
+<tr><th>Pipeline health</th><th>Delivery performance (DORA)</th></tr>
+<tr><td>Duration p50 / p90 (PR and main)</td><td>Deployment frequency</td></tr>
+<tr><td>Queue/wait time for runners</td><td>Lead time for changes</td></tr>
+<tr><td>Success rate on main</td><td>Change failure rate</td></tr>
+<tr><td>Flaky-test rate; retries per run</td><td>Time to restore service</td></tr>
+<tr><td>Cost per run / per month</td><td>Rework rate</td></tr>
+<tr><td>Time red main stays red (MTTR of the build)</td><td>Reliability vs SLOs</td></tr>
+</table>
+<p>Dashboards: your CI vendor's analytics, Four Keys, Grafana fed by CI webhooks, DX/Swarmia/LinearB-style tools. Review monthly, pick one metric to improve, and avoid using these as individual performance scores (Goodhart again).</p>
+
+<h2>Cost management</h2>
+<ul>
+<li>Cancel redundant runs; set <code>timeout</code>s; limit matrix size to what is meaningful.</li>
+<li>Avoid expensive runners (macOS, large) unless needed; prefer Linux and ARM where possible.</li>
+<li>Autoscale self-hosted runners to zero; use spot/preemptible instances for stateless build agents.</li>
+<li>Set retention on artifacts, caches and logs.</li>
+<li>Compare against the cost of developer waiting time: 50 engineers losing 10 minutes per PR per day dwarfs most CI bills.</li>
+</ul>
+
+<h2>Evolving the pipeline</h2>
+<ol>
+<li><strong>Start simple:</strong> lint + test + build on PRs.</li>
+<li><strong>Add the artifact and deploy to staging</strong> on main.</li>
+<li><strong>Add security scanning</strong> and branch protection gates.</li>
+<li><strong>Add post-deploy verification and approval-gated production.</strong></li>
+<li><strong>Add progressive delivery and automated rollback;</strong> consider continuous deployment.</li>
+<li><strong>Productise:</strong> templates, golden paths, metrics, ownership.</li>
+</ol>
+<div class="callout key"><strong>Principle recap</strong><p>Small batches. Fast feedback. Build once. Same pipeline for everyone. Trust the red. Make rollback boring. Measure and improve continuously.</p></div>
+
+<h2>A review checklist</h2>
+<ul>
+<li>Is PR feedback under ~10 minutes at p90?</li>
+<li>Does main stay green, and is a red main fixed within the hour?</li>
+<li>Is there exactly one build per commit, promoted unchanged to prod?</li>
+<li>Can any engineer reproduce CI locally with one command?</li>
+<li>Are secrets short-lived, scoped, and absent from fork PRs?</li>
+<li>Are actions/images/templates pinned and updated by automation?</li>
+<li>Do we know our flaky tests, and does each have an owner?</li>
+<li>Have we rolled back in the last quarter, on purpose, to practice?</li>
+<li>Do we track DORA metrics and act on them?</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Score your project against the review checklist. Pick the two weakest items and write a concrete fix for each.</li>
+<li>Export the last 50 pipeline runs (via <code>gh run list --json</code> or the GitLab API) and compute success rate and p90 duration.</li>
+<li>Find a test that failed and then passed on re-run in the last month. Reproduce it by running it 100 times and identify the cause.</li>
+<li>Practice a rollback in staging: deploy a deliberately bad version, then restore the previous digest using only your pipeline. Time it.</li>
+</ol></div>

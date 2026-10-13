@@ -1,0 +1,140 @@
+<h1>Logging</h1>
+<p class="lead">Logs are the oldest telemetry: a diary your program writes about what it is doing. Done well they let you reconstruct any request after the fact. Done badly they are an expensive pile of unsearchable text, or worse, a leak of customer secrets.</p>
+
+<h2>From printf to structured logs</h2>
+<p>Traditional logs are free-form text:</p>
+<pre><code>2026-10-05 09:14:22 ERROR Payment failed for user 42 order 881: card declined</code></pre>
+<p>A human can read this, but a machine must parse it with fragile regexes, and any change to the wording breaks queries. <strong>Structured logging</strong> emits one JSON object per line with consistent fields:</p>
+<pre><code>{"ts":"2026-10-05T09:14:22.318Z","level":"error","service":"checkout",
+ "version":"1.8.3","msg":"payment failed","user_id":42,"order_id":881,
+ "reason":"card_declined","provider":"stripe","duration_ms":412,
+ "trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","request_id":"req_8f2a1c"}</code></pre>
+<p>Now you can query "all <code>level=error</code> where <code>reason=card_declined</code> for <code>version=1.8.3</code>" and count, group and graph it. The message stays constant; variable data goes in fields (never interpolate IDs into the message string, or each event looks unique).</p>
+<pre><code>// Node (pino)
+import pino from "pino";
+const log = pino({ level: process.env.LOG_LEVEL ?? "info",
+                   base: { service: "checkout", version: process.env.APP_VERSION } });
+log.error({ order_id: 881, user_id: 42, reason: "card_declined" }, "payment failed");
+
+# Python (structlog)
+import structlog
+log = structlog.get_logger()
+log.error("payment failed", order_id=881, user_id=42, reason="card_declined")
+
+// Go (slog, standard library)
+slog.Error("payment failed", "order_id", 881, "user_id", 42, "reason", "card_declined")</code></pre>
+
+<h2>Log levels</h2>
+<table>
+<tr><th>Level</th><th>Meaning</th><th>Production default?</th></tr>
+<tr><td><code>DEBUG</code></td><td>Detailed diagnostics for developers</td><td>Off (enable temporarily per service)</td></tr>
+<tr><td><code>INFO</code></td><td>Normal significant events: startup, request completed, job finished</td><td>On</td></tr>
+<tr><td><code>WARN</code></td><td>Unexpected but handled: retry succeeded, deprecated call, nearing limits</td><td>On</td></tr>
+<tr><td><code>ERROR</code></td><td>An operation failed; someone may need to look</td><td>On</td></tr>
+<tr><td><code>FATAL</code>/<code>CRITICAL</code></td><td>Process cannot continue</td><td>On</td></tr>
+</table>
+<p>Discipline matters: if everything is <code>ERROR</code>, nothing is. A user typing a wrong password is <code>INFO</code>/<code>WARN</code>, not <code>ERROR</code>. Reserve <code>ERROR</code> for things that indicate a bug or an unavailable dependency. Make the level configurable at runtime by environment variable.</p>
+
+<h2>Where logs should go: stdout</h2>
+<p>The twelve-factor rule: <strong>applications write logs as an event stream to stdout/stderr</strong> and do not manage files, rotation or shipping themselves. The platform (Docker, Kubernetes, systemd, ECS) captures the stream and a collector forwards it. This keeps apps simple and portable.</p>
+<pre><code>docker logs -f --tail 100 web
+kubectl logs -f deploy/checkout --since=15m
+journalctl -u myapp -f -o json-pretty</code></pre>
+
+<h2>Correlation IDs</h2>
+<p>One user action fans out across a load balancer, API, three microservices and a queue. Without a shared identifier you cannot stitch their logs together. Generate a <strong>request/correlation ID</strong> at the edge (or accept the incoming header), put it in every log line, and pass it on every outgoing call.</p>
+<pre class="diagram">
+ Browser ─▶ Gateway ──────▶ Orders ──────▶ Payments ──────▶ Inventory
+            X-Request-ID    X-Request-ID   X-Request-ID      X-Request-ID
+            = req_8f2a1c    = req_8f2a1c   = req_8f2a1c      = req_8f2a1c
+   every log line in every service carries  request_id=req_8f2a1c
+   ⇒ one search in the log system shows the whole story
+</pre>
+<pre><code>// Express middleware + AsyncLocalStorage
+import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+const als = new AsyncLocalStorage();
+
+app.use((req, res, next) =&gt; {
+  const id = req.header("x-request-id") ?? randomUUID();
+  res.setHeader("x-request-id", id);
+  als.run({ request_id: id }, next);
+});
+const log = pino({ mixin: () =&gt; als.getStore() ?? {} });   // adds request_id to every line</code></pre>
+<p>With distributed tracing (next lessons) the <code>trace_id</code> plays the same role and also links logs to traces. Put it in your logs and you can jump from a slow trace straight to its log lines.</p>
+
+<h2>Centralised logging</h2>
+<p>When you have many instances and ephemeral containers, SSHing into hosts to <code>grep</code> does not work: containers vanish with their logs. Ship logs to a central searchable store.</p>
+<pre class="diagram">
+ app (stdout) ─▶ agent/collector ─▶ (buffer: Kafka/Kinesis, optional) ─▶ storage+search ─▶ UI
+ container logs   Fluent Bit /        absorbs bursts                      Loki / Elasticsearch    Grafana /
+                  Vector / Promtail /                                      / OpenSearch / vendor   Kibana
+                  OTel Collector
+</pre>
+
+<h3>ELK / Elastic stack</h3>
+<p><strong>E</strong>lasticsearch (indexed search engine), <strong>L</strong>ogstash (or Beats / Fluent Bit for shipping and parsing), <strong>K</strong>ibana (UI). Full-text indexing of every field makes arbitrary search fast and powerful, at the price of CPU, RAM and disk. OpenSearch is the AWS-backed fork. Good when you need rich full-text search and analytics over logs.</p>
+
+<h3>Grafana Loki</h3>
+<p>"Like Prometheus, but for logs". Loki indexes only <em>labels</em> (<code>app</code>, <code>namespace</code>, <code>env</code>) and stores compressed log chunks in cheap object storage (S3). Much cheaper to run; queries filter by labels then grep within. Query with <strong>LogQL</strong>:</p>
+<pre><code>{app="checkout", env="prod"} |= "payment failed"
+{app="checkout"} | json | level="error" | reason="card_declined"
+sum by (reason) (rate({app="checkout"} | json | level="error" [5m]))
+{app=~".+"} | json | request_id="req_8f2a1c"</code></pre>
+<p>Keep labels low-cardinality (service, env, level); put user/request IDs in the log body, not labels.</p>
+
+<table>
+<tr><th></th><th>ELK/OpenSearch</th><th>Loki</th><th>CloudWatch Logs / Datadog</th></tr>
+<tr><td>Indexing</td><td>Everything</td><td>Labels only</td><td>Varies</td></tr>
+<tr><td>Cost</td><td>High (storage + compute)</td><td>Low</td><td>Per GB ingested (can be high)</td></tr>
+<tr><td>Ops burden</td><td>High self-hosted</td><td>Moderate</td><td>None (managed)</td></tr>
+<tr><td>Best for</td><td>Search-heavy, analytics</td><td>Kubernetes, Grafana users</td><td>Small teams, speed</td></tr>
+</table>
+<p>A minimal Fluent Bit config tailing container logs to Loki:</p>
+<pre><code>[INPUT]
+    Name   tail
+    Path   /var/log/containers/*.log
+    Parser docker
+[OUTPUT]
+    Name   loki
+    Match  *
+    Host   loki.monitoring.svc
+    Port   3100
+    Labels job=fluentbit, env=prod</code></pre>
+
+<h2>What NOT to log</h2>
+<div class="callout warn"><strong>Logs are a data-leak vector</strong><p>Log systems are widely accessible, long-retained and replicated. Treat anything written to a log as published to every engineer, forever.</p></div>
+<ul>
+<li><strong>Secrets</strong>: passwords, API keys, tokens, session cookies, <code>Authorization</code> headers, private keys, connection strings.</li>
+<li><strong>Personal data</strong>: full card numbers (PCI), government IDs, health data, raw emails/phones where avoidable (GDPR). Hash or mask: <code>user_id</code> beats <code>email</code>.</li>
+<li><strong>Entire request/response bodies</strong> by default; log selected fields.</li>
+<li><strong>Noise</strong>: per-iteration loop messages, health-check requests every second, successful cache hits.</li>
+<li><strong>Exceptions swallowed and relogged at every layer</strong> (one error, ten log lines). Log once, where it is handled, with full stack trace and context.</li>
+</ul>
+<p>Add redaction at the logger level (pino <code>redact</code>, structlog processors) and scan logs in CI/staging for patterns like card numbers and bearer tokens.</p>
+
+<h2>Retention, cost and sampling</h2>
+<ul>
+<li>Typical: 7-30 days hot and searchable, then archive to S3 (compliance may require a year or more).</li>
+<li>Logs are usually the most expensive telemetry. Drop DEBUG in prod, sample high-volume INFO (e.g. keep 10% of successful request logs, 100% of errors), and filter health checks at the collector.</li>
+<li>Prefer metrics for counting; do not <code>grep | wc -l</code> logs for dashboards.</li>
+<li>Protect with access controls and audit who can read production logs.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Unstructured, inconsistent field names (<code>userId</code>, <code>user_id</code>, <code>uid</code>): agree on a schema.</li>
+<li>Missing timestamps in UTC, or no service/version/environment fields.</li>
+<li>Logging to local files in containers: lost on restart, fill the disk.</li>
+<li>Synchronous logging blocking request threads; use async/buffered appenders.</li>
+<li>Multi-line stack traces split into separate log events; use JSON so the trace is one field.</li>
+<li>No correlation ID: you can see errors but cannot connect them to a request.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Convert one service from <code>console.log</code>/<code>print</code> to structured JSON with fields <code>service</code>, <code>version</code>, <code>level</code>, <code>request_id</code>.</li>
+<li>Add middleware that generates or propagates <code>X-Request-ID</code> and includes it in every log line and downstream HTTP call.</li>
+<li>Run Loki + Grafana with Docker Compose (<code>grafana/loki</code>, <code>grafana/promtail</code>), ship your container logs and write a LogQL query that charts errors per minute.</li>
+<li>Audit one service: grep a day of logs for <code>password</code>, <code>token</code>, <code>@</code>. What leaked?</li>
+</ol></div>

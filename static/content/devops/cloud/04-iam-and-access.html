@@ -1,0 +1,135 @@
+<h1>IAM and Access Control</h1>
+<p class="lead">Identity and Access Management answers one question for every API call: <em>who</em> is asking, and are they <em>allowed</em> to do <em>this</em> to <em>that</em>? Most cloud security incidents are IAM failures, so this is the most valuable cloud skill to get right.</p>
+
+<h2>Why IAM exists</h2>
+<p>Imagine one shared admin password and one access key that every engineer, server and CI job uses. When something is deleted you cannot tell who did it; when someone leaves you must rotate the key everywhere; and a leaked key hands over everything. IAM solves this with <strong>individual identities</strong>, <strong>fine-grained permissions</strong>, <strong>temporary credentials</strong> and <strong>audit trails</strong>.</p>
+
+<h2>Core concepts</h2>
+<table>
+<tr><th>Concept</th><th>Meaning</th></tr>
+<tr><td><strong>Root user</strong></td><td>The account owner. Unlimited power. Lock it away with MFA; use it only for the few tasks that require it.</td></tr>
+<tr><td><strong>User</strong></td><td>A long-lived identity for a person (or, legacy, a program). Modern practice: humans sign in through SSO (IAM Identity Center) instead of IAM users.</td></tr>
+<tr><td><strong>Group</strong></td><td>A set of users that share policies (e.g. <code>developers</code>).</td></tr>
+<tr><td><strong>Role</strong></td><td>An identity with permissions but <em>no password or permanent keys</em>. Anyone/anything authorised can <em>assume</em> it and receive temporary credentials.</td></tr>
+<tr><td><strong>Policy</strong></td><td>A JSON document listing allowed/denied actions on resources.</td></tr>
+<tr><td><strong>Principal</strong></td><td>The entity making the request (user, role, service, account).</td></tr>
+</table>
+
+<h2>Anatomy of a policy</h2>
+<p>A policy is a list of statements. Each has an <strong>Effect</strong> (Allow/Deny), <strong>Action</strong>s, <strong>Resource</strong>s, and optional <strong>Condition</strong>s.</p>
+<pre><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadWriteAppBucketObjects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::acme-app-uploads/*"
+    },
+    {
+      "Sid": "ListTheBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::acme-app-uploads"
+    },
+    {
+      "Sid": "DenyUnencryptedTransport",
+      "Effect": "Deny",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::acme-app-uploads", "arn:aws:s3:::acme-app-uploads/*"],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    }
+  ]
+}</code></pre>
+<p>Note the two resource ARNs: object-level actions apply to <code>bucket/*</code>, bucket-level actions (<code>ListBucket</code>) to the bucket itself. This distinction trips up everyone once.</p>
+
+<h3>How a decision is made</h3>
+<ol>
+<li>Everything is <strong>implicitly denied</strong> by default.</li>
+<li>An explicit <strong>Allow</strong> in an applicable policy grants access.</li>
+<li>An explicit <strong>Deny</strong> anywhere always wins over any Allow.</li>
+<li>Organisation-level <strong>SCPs</strong> and <strong>permission boundaries</strong> further cap what can be granted.</li>
+</ol>
+
+<h2>Least privilege</h2>
+<div class="callout key"><strong>The principle</strong><p>Grant only the permissions needed for the task, on only the resources needed, for only as long as needed. A compromised identity can then do limited damage.</p></div>
+<table>
+<tr><th>Bad</th><th>Better</th></tr>
+<tr><td><code>"Action": "*", "Resource": "*"</code></td><td>Specific actions on specific ARNs</td></tr>
+<tr><td><code>s3:*</code> on all buckets</td><td><code>s3:GetObject</code> on one bucket prefix</td></tr>
+<tr><td>Shared admin user</td><td>Individual SSO users with role-based access</td></tr>
+<tr><td>Permanent access keys in CI</td><td>OIDC federation to a short-lived role</td></tr>
+</table>
+<p>Practical workflow: start with an AWS-managed policy to get going, then use <strong>IAM Access Analyzer</strong> (policy generation from CloudTrail activity) and the "last accessed" data to trim down. Test with the policy simulator before deploying.</p>
+
+<h2>Roles for machines</h2>
+<p>Applications need to call AWS (read S3, fetch secrets). The wrong way is to paste an access key into an environment variable or config file: it lives forever, ends up in git, and is copied around. The right way is a <strong>role</strong>.</p>
+<pre class="diagram">
+ EC2 instance / ECS task / Lambda
+        │  "who am I?"
+        ▼
+ Instance metadata / task endpoint ──▶ STS issues TEMPORARY credentials
+        │                                (access key + secret + token, ~1-6 h, auto-rotated)
+        ▼
+ AWS SDK uses them automatically ──▶ S3, Secrets Manager, ...
+</pre>
+<p>A role has two policies: a <strong>trust policy</strong> (who may assume it) and <strong>permissions policies</strong> (what it can do).</p>
+<pre><code># Trust policy: lets ECS tasks assume this role
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}</code></pre>
+<p>With the role attached, your code needs no credentials at all:</p>
+<pre><code>import boto3
+s3 = boto3.client("s3")          # SDK finds role credentials automatically
+s3.put_object(Bucket="acme-app-uploads", Key="hello.txt", Body=b"hi")</code></pre>
+<p>Variants of the same idea: <strong>EC2 instance profiles</strong>, <strong>ECS task roles</strong> (distinct from the task <em>execution</em> role that pulls images), <strong>IRSA / EKS Pod Identity</strong> for Kubernetes pods, and <strong>GitHub Actions OIDC</strong> so CI assumes a role without stored secrets.</p>
+<pre><code># GitHub Actions: no long-lived keys
+permissions:
+  id-token: write
+  contents: read
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/gha-deploy
+      aws-region: eu-west-1</code></pre>
+
+<h2>Humans: SSO, roles and MFA</h2>
+<ul>
+<li>Use <strong>IAM Identity Center</strong> (or your IdP such as Okta/Entra) so people log in once and get short-lived role sessions: <code>aws sso login --profile dev</code>.</li>
+<li>Enforce <strong>MFA</strong>, ideally phishing-resistant (passkeys / FIDO2 hardware keys) rather than SMS. Root user always gets MFA.</li>
+<li>Separate AWS <strong>accounts</strong> for prod, staging and dev (via AWS Organizations). Accounts are the hardest security boundary; a dev mistake cannot touch prod.</li>
+<li>Use "break glass" admin roles for emergencies, with alerts when used.</li>
+</ul>
+
+<h2>Auditing</h2>
+<ul>
+<li><strong>CloudTrail</strong> records every API call; send it to a locked-down bucket in a separate security account.</li>
+<li>Alert on: root login, IAM policy changes, disabling of CloudTrail, console login without MFA.</li>
+<li>Regularly review unused users, keys older than 90 days, and the credential report (<code>aws iam generate-credential-report</code>).</li>
+</ul>
+
+<h2>Common pitfalls</h2>
+<div class="callout warn"><strong>Leaked keys are found in minutes</strong><p>Bots scan public GitHub for <code>AKIA...</code> keys continuously and spin up crypto miners within minutes of a push. If a key leaks: <em>deactivate it first</em>, then investigate via CloudTrail, then rotate. Deleting the commit is not enough. Use pre-commit scanners like gitleaks and enable GitHub secret scanning.</p></div>
+<ul>
+<li><strong><code>AdministratorAccess</code> for everything</strong> "just to make it work". Then it never gets tightened.</li>
+<li><strong>Wildcards in <code>iam:PassRole</code> or <code>iam:*</code></strong>: lets a user escalate to admin by creating/attaching powerful roles.</li>
+<li><strong>Public S3 buckets</strong>: enable account-wide "Block Public Access".</li>
+<li><strong>Confusing authentication with authorisation</strong>: being logged in does not mean being allowed.</li>
+<li><strong>Debugging <code>AccessDenied</code></strong>: check identity policy, resource policy (bucket policy), SCPs, permission boundary, and KMS key policy. Read the error: it often names the missing action.</li>
+</ul>
+
+<h2>Equivalents</h2>
+<p>GCP: IAM roles bound to members at org/folder/project/resource level, and <em>service accounts</em> for workloads (use Workload Identity). Azure: Entra ID plus Azure RBAC role assignments with <em>managed identities</em> for workloads. The model is the same: identities, roles, scopes, short-lived tokens.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>aws sts get-caller-identity</code>. Are you root, a user, or an assumed role?</li>
+<li>Write a policy allowing read-only access to <code>s3://my-bucket/reports/*</code> only. Test it with the policy simulator or by attaching it to a test role.</li>
+<li>Create a role for EC2 with S3 read access, attach it to an instance, and run <code>aws s3 ls</code> on it without configuring any keys. Then run <code>curl http://169.254.169.254/latest/meta-data/iam/security-credentials/</code> (with IMDSv2 token) and observe the temporary credentials.</li>
+<li>Search your repos for committed secrets: <code>gitleaks detect</code>.</li>
+</ol></div>

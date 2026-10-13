@@ -1,0 +1,110 @@
+<h1>Performance and Load Testing</h1>
+<p class="lead">You do not know how your system behaves under load until you load it. Load testing finds the breaking point before your customers do, and gives you the numbers needed for capacity planning. This lesson shows how to test with k6, how to read the results and how to hunt the bottleneck.</p>
+
+<h2>Types of performance tests</h2>
+<table>
+<tr><th>Type</th><th>Shape</th><th>Question</th></tr>
+<tr><td>Smoke</td><td>1-2 users, 1 minute</td><td>Does the script and system work at all?</td></tr>
+<tr><td>Load</td><td>Expected peak, sustained 10-30 min</td><td>Do we meet our SLOs at normal peak?</td></tr>
+<tr><td>Stress</td><td>Ramp beyond peak until failure</td><td>Where does it break and how (gracefully or catastrophically)?</td></tr>
+<tr><td>Spike</td><td>Sudden jump 10x then back</td><td>Do autoscaling, queues and caches cope?</td></tr>
+<tr><td>Soak</td><td>Moderate load for hours</td><td>Memory leaks, connection leaks, disk growth?</td></tr>
+</table>
+
+<h2>Metrics that matter</h2>
+<ul>
+<li><strong>Throughput</strong>: requests per second.</li>
+<li><strong>Latency percentiles</strong>: p50, p95, p99. Averages hide pain; if p99 is 8 seconds, one in a hundred users is suffering, and with many requests per page view that is most of your users.</li>
+<li><strong>Error rate</strong>: non-2xx and timeouts.</li>
+<li><strong>Saturation</strong>: CPU, memory, connections, queue depth, disk IO. (This is the Google SRE "four golden signals": latency, traffic, errors, saturation.)</li>
+</ul>
+<div class="callout key"><strong>Latency rises non-linearly</strong><p>Latency stays flat as load increases, then curves up sharply as a resource saturates (the "knee"). Operating near 100% utilisation of anything means queueing delay explodes. Plan to run steady-state at 50-70% of the knee.</p></div>
+
+<h2>k6 in practice</h2>
+<p>k6 (Grafana Labs) scripts tests in JavaScript, runs as a single fast binary, and supports thresholds that make CI fail when performance regresses.</p>
+<pre><code>// load-test.js
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+
+export const options = {
+  stages: [
+    { duration: '2m', target: 50 },    // ramp up to 50 virtual users
+    { duration: '10m', target: 50 },   // hold
+    { duration: '1m', target: 0 },     // ramp down
+  ],
+  thresholds: {
+    http_req_failed:   ['rate&lt;0.01'],            // under 1% errors
+    http_req_duration: ['p(95)&lt;300', 'p(99)&lt;800'], // latency SLO in ms
+  },
+};
+
+export default function () {
+  const res = http.get(`${__ENV.BASE_URL}/api/products`);
+  check(res, {
+    'status is 200': (r) =&gt; r.status === 200,
+    'body not empty': (r) =&gt; r.body.length &gt; 0,
+  });
+  sleep(1);   // think time: real users pause
+}</code></pre>
+<pre><code>k6 run -e BASE_URL=https://staging.example.com load-test.js
+# stream results to Prometheus/Grafana for correlation with server metrics
+k6 run --out experimental-prometheus-rw load-test.js</code></pre>
+<p>Sample output includes <code>http_req_duration ... avg=120ms p(90)=210ms p(95)=290ms</code> and a threshold pass/fail. For realistic modelling prefer the <strong>open model</strong> (arrival-rate executors such as <code>constant-arrival-rate</code>) over fixed virtual users: real traffic does not slow down just because your server did, whereas closed-model tests politely back off and hide overload ("coordinated omission").</p>
+<pre><code>scenarios: {
+  steady: { executor: 'constant-arrival-rate', rate: 200, timeUnit: '1s',
+            duration: '10m', preAllocatedVUs: 100, maxVUs: 500 },
+}</code></pre>
+
+<h3>Rules for valid tests</h3>
+<ul>
+<li>Test a production-like environment: same instance sizes, same data volume (a 100-row test DB lies), same config. Never casually load-test production or third-party services you do not own.</li>
+<li>Run the generator on a separate machine, close to the target; check it is not itself the bottleneck (CPU).</li>
+<li>Use realistic traffic mixes and varied data (cache-busting parameters, many users), or you test your cache and not your system.</li>
+<li>Warm up first; JIT, caches and connection pools matter.</li>
+<li>Change one thing at a time and keep results in version control.</li>
+<li>Put a quick test in CI with strict thresholds to catch regressions (a smoke-level performance gate).</li>
+</ul>
+
+<h2>Bottleneck hunting</h2>
+<p>While the test runs, watch the system side. The methodology of Brendan Gregg's <strong>USE method</strong> is the shortcut: for every resource check <strong>U</strong>tilisation, <strong>S</strong>aturation, <strong>E</strong>rrors.</p>
+<table>
+<tr><th>Symptom during test</th><th>Probable bottleneck</th><th>Tools</th></tr>
+<tr><td>App CPU at 100%, latency up</td><td>CPU-bound code, JSON/serialisation, regex, logging volume</td><td><code>top</code>, flame graphs (<code>perf</code>, pprof, <code>clinic.js</code>, py-spy)</td></tr>
+<tr><td>App CPU low, latency high</td><td>Waiting: DB, downstream API, locks, pool exhaustion</td><td>Tracing (OpenTelemetry), pool metrics</td></tr>
+<tr><td>DB CPU high</td><td>Missing index, N+1 queries, heavy aggregates</td><td><code>pg_stat_statements</code>, <code>EXPLAIN ANALYZE</code></td></tr>
+<tr><td>DB connections maxed</td><td>Pool too large/small, leaks</td><td><code>pg_stat_activity</code>, PgBouncer stats</td></tr>
+<tr><td>Memory climbing</td><td>Leak, unbounded cache, GC pressure</td><td>Heap snapshots, <code>free -m</code>, GC logs</td></tr>
+<tr><td>Disk await high</td><td>IO-bound DB or logging</td><td><code>iostat -x 1</code></td></tr>
+<tr><td>Errors with low resource use</td><td>Limits: file descriptors, <code>net.core.somaxconn</code>, worker threads, rate limiter</td><td><code>ulimit -n</code>, <code>ss -s</code>, nginx error log</td></tr>
+<tr><td>Latency spikes at regular intervals</td><td>GC pauses, cron jobs, checkpointing, DNS</td><td>Correlate timestamps</td></tr>
+</table>
+<pre><code># a quick host-level look while the test runs
+vmstat 1          # r (run queue) &gt; cores = CPU saturation; si/so = swapping
+iostat -x 1       # %util and await for disks
+ss -s             # socket counts; TIME_WAIT piles
+pidstat -u -r 1   # per-process CPU / memory</code></pre>
+<p>Method: find the first saturated resource, fix or relieve it, rerun, and expect the bottleneck to move somewhere else. Stop when you meet the target with headroom. The slowest code is rarely where you guess, so profile instead of speculating.</p>
+
+<h2>Capacity planning</h2>
+<ol>
+<li><strong>Define targets</strong>: peak requests per second, latency SLO, growth forecast (for example 3x in a year), and event peaks (marketing launch, Black Friday).</li>
+<li><strong>Measure unit capacity</strong>: with a load test, find the throughput a single instance sustains while meeting the SLO (say 220 rps per app instance).</li>
+<li><strong>Compute</strong>: instances = peak rps / (unit capacity * target utilisation) plus redundancy.</li>
+</ol>
+<pre><code>peak = 1500 rps;  unit = 220 rps;  target utilisation = 65%
+instances = 1500 / (220 * 0.65) = 10.5  -&gt; 11
++ N+1 (survive losing one) -&gt; 12 instances</code></pre>
+<ol start="4">
+<li><strong>Find the next constraint</strong>: 12 app instances times pool of 10 means 120 DB connections. Does the DB cope? Do the same maths for DB, cache, bandwidth, third-party API quotas and your cloud account limits.</li>
+<li><strong>Revisit regularly</strong>: re-test after significant releases and track trends from monitoring to see when you will hit limits (disk fill date, connection trend).</li>
+</ol>
+<p>Use autoscaling to absorb variance, but keep minimums high enough for a sudden spike while new capacity boots, and set maximums so a bug or attack cannot create an enormous bill.</p>
+
+<div class="callout warn"><strong>Pitfalls</strong><p>Testing from your laptop over Wi-Fi, testing with one URL, ignoring think time, testing an empty database, trusting averages, and treating one passing run as proof. Also: a load test hitting a CDN-cached page measures the CDN.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run the capstone API locally (or any service) and write a k6 script with thresholds. Run it at 10, 50 and 100 VUs and plot where p95 starts to climb.</li>
+<li>While running, watch <code>docker stats</code> and <code>pg_stat_activity</code>. Identify the first resource to saturate.</li>
+<li>Fix it (an index, a pool size, caching) and rerun. Record the improvement and compute how many instances you would need for 1000 rps.</li>
+</ol></div>

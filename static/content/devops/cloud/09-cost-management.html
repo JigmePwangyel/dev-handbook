@@ -1,0 +1,136 @@
+<h1>Cost Management and FinOps</h1>
+<p class="lead">In the data center, you spent money when you bought hardware. In the cloud, every engineer's API call can spend money, continuously. Without discipline, bills grow faster than revenue. FinOps is the practice of making cost visible, owned and optimised, by engineers as well as finance.</p>
+
+<h2>Why cloud bills surprise people</h2>
+<ul>
+<li><strong>Elasticity cuts both ways</strong>: easy to create resources, easy to forget them.</li>
+<li><strong>Many meters</strong>: compute-hours, GB-months, requests, data transfer, per-endpoint hours.</li>
+<li><strong>Decentralised spending</strong>: any developer can launch a $5,000/month cluster.</li>
+<li><strong>Cost is lagging</strong>: you find out at month end.</li>
+</ul>
+<p>The FinOps cycle is <strong>Inform</strong> (visibility and allocation), <strong>Optimise</strong> (cut waste, commit smartly), <strong>Operate</strong> (governance, continuous review). It is culture plus tooling.</p>
+
+<h2>Step 1: See the spend</h2>
+<ul>
+<li><strong>Cost Explorer</strong> (AWS), Cost Management (Azure), Billing reports (GCP): group by service, account, region, tag.</li>
+<li><strong>Cost and Usage Report (CUR)</strong> exported to S3 and queried with Athena for the full detail.</li>
+<li>Separate AWS <strong>accounts</strong> per environment/team: natural cost boundaries.</li>
+<li>Third-party tools (Infracost for PRs, Vantage, CloudZero, Kubecost for K8s) add allocation and anomaly views.</li>
+</ul>
+<pre><code># Last month's cost by service, from the CLI
+aws ce get-cost-and-usage \
+  --time-period Start=2026-09-01,End=2026-10-01 \
+  --granularity MONTHLY \
+  --metrics UnblendedCost \
+  --group-by Type=DIMENSION,Key=SERVICE \
+  --query 'ResultsByTime[0].Groups[].[Keys[0],Metrics.UnblendedCost.Amount]' \
+  --output text | sort -k2 -nr | head</code></pre>
+
+<h2>Step 2: Tagging for accountability</h2>
+<p>If you cannot say who owns a resource, nobody will turn it off. Define a mandatory tag set and enforce it:</p>
+<table>
+<tr><th>Tag</th><th>Example</th><th>Purpose</th></tr>
+<tr><td><code>team</code></td><td>payments</td><td>Chargeback / showback</td></tr>
+<tr><td><code>service</code></td><td>checkout-api</td><td>Cost per product</td></tr>
+<tr><td><code>env</code></td><td>prod / staging / dev</td><td>Find non-prod waste</td></tr>
+<tr><td><code>owner</code></td><td>alice@acme.com</td><td>Who to ask</td></tr>
+<tr><td><code>expiry</code></td><td>2026-11-01</td><td>Temporary resources</td></tr>
+</table>
+<p>Activate them as <em>cost allocation tags</em> in billing, apply them by default in Terraform, and enforce with Tag Policies/SCPs or policy-as-code:</p>
+<pre><code>provider "aws" {
+  region = "eu-west-1"
+  default_tags {
+    tags = {
+      team    = "payments"
+      service = "checkout-api"
+      env     = "prod"
+      managed = "terraform"
+    }
+  }
+}</code></pre>
+
+<h2>Step 3: Budgets and alerts</h2>
+<ul>
+<li><strong>AWS Budgets</strong>: monthly budget per account/tag with alerts at 50%, 80%, 100% of actual and forecasted spend, sent to email/Slack.</li>
+<li><strong>Cost Anomaly Detection</strong>: ML-flags unusual spikes (a runaway Lambda, a crypto-miner).</li>
+<li>Per-environment guardrails: sandbox accounts with hard caps and auto-cleanup.</li>
+</ul>
+<pre><code>aws budgets create-budget --account-id 123456789012 --budget '{
+  "BudgetName": "monthly-total",
+  "BudgetLimit": {"Amount": "500", "Unit": "USD"},
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}' --notifications-with-subscribers '[{
+  "Notification": {"NotificationType": "FORECASTED",
+                   "ComparisonOperator": "GREATER_THAN",
+                   "Threshold": 80},
+  "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "team@acme.com"}]
+}]'</code></pre>
+
+<h2>Step 4: Eliminate common waste</h2>
+<table>
+<tr><th>Waste</th><th>Fix</th></tr>
+<tr><td>Idle / forgotten instances, dev environments running 24/7</td><td>Schedule off nights/weekends (saves ~65%); auto-expire sandboxes</td></tr>
+<tr><td>Over-provisioned instances (CPU under 10%)</td><td>Right-size with Compute Optimizer / metrics</td></tr>
+<tr><td>Unattached EBS volumes, old snapshots, unused Elastic IPs</td><td>Periodic cleanup, lifecycle policies (DLM)</td></tr>
+<tr><td>NAT Gateway data processing</td><td>VPC endpoints for S3/DynamoDB/ECR; one NAT per AZ only where needed</td></tr>
+<tr><td>Data transfer out / cross-AZ chatter</td><td>CloudFront, keep chatty services in the same AZ when safe, compress</td></tr>
+<tr><td>S3 data never accessed</td><td>Intelligent-Tiering, lifecycle to Glacier, expire logs, abort incomplete multipart uploads</td></tr>
+<tr><td>Excessive log retention and high-cardinality metrics</td><td>Set retention (e.g. 30 days), sample, drop debug logs in prod</td></tr>
+<tr><td>Old generation instances / x86 only</td><td>Move to current generation and ARM (Graviton): ~20% cheaper</td></tr>
+<tr><td>gp2 volumes</td><td>Migrate to gp3 (cheaper, tunable IOPS)</td></tr>
+<tr><td>Oversized databases and unused read replicas</td><td>Right-size; use Aurora Serverless v2 for variable loads</td></tr>
+</table>
+
+<h2>Step 5: Pay less per unit</h2>
+<table>
+<tr><th>Option</th><th>Discount</th><th>Commitment</th><th>Risk</th></tr>
+<tr><td>Savings Plans (Compute)</td><td>up to ~66%</td><td>$/hour for 1-3 years, flexible across instance families, Fargate, Lambda</td><td>Pay even if usage drops</td></tr>
+<tr><td>Reserved Instances</td><td>up to ~72%</td><td>Specific instance/region, 1-3 yrs</td><td>Less flexible; also for RDS, ElastiCache</td></tr>
+<tr><td>Spot instances</td><td>60-90%</td><td>None</td><td>Reclaimed with 2-minute warning</td></tr>
+<tr><td>Committed Use Discounts (GCP)</td><td>up to ~55-70%</td><td>1-3 yrs</td><td>Same idea</td></tr>
+</table>
+<p><strong>Order of operations</strong>: first remove waste and right-size, <em>then</em> commit. Committing to a bloated baseline locks in the waste. Cover the steady baseline (e.g. 60-70% of usage) with Savings Plans; leave the spiky remainder on-demand or spot.</p>
+<h3>Spot done right</h3>
+<ul>
+<li>Use for stateless, fault-tolerant work: CI runners, batch, workers, K8s node pools for non-critical pods.</li>
+<li>Diversify across many instance types and AZs (capacity-optimised allocation).</li>
+<li>Handle the interruption notice (checkpoint, drain). Keep an on-demand base for critical capacity.</li>
+</ul>
+
+<h2>Architecture is the biggest lever</h2>
+<ul>
+<li><strong>Serverless / scale-to-zero</strong> for idle-heavy workloads; containers or reserved VMs for steady high load.</li>
+<li><strong>Caching and CDNs</strong> cut compute and egress.</li>
+<li><strong>Managed vs self-managed</strong>: include engineer time in the comparison; a cheap but pager-heavy setup is not cheap.</li>
+<li><strong>Efficiency in code</strong>: a slow query or N+1 can be a cost problem as much as a performance one.</li>
+<li><strong>Cost per unit</strong> (per customer, per 1k requests) is a better health metric than the total bill: growing bills are fine if unit cost is falling.</li>
+</ul>
+
+<h2>Review rhythm</h2>
+<ol>
+<li><strong>Weekly</strong>: anomaly alerts, top movers.</li>
+<li><strong>Monthly</strong>: team showback review: what changed and why?</li>
+<li><strong>Quarterly</strong>: commitment coverage, right-sizing sweeps, architecture reviews for top five cost drivers.</li>
+<li><strong>In PRs</strong>: Infracost comments on Terraform changes show the monthly cost delta before merge.</li>
+</ol>
+
+<h2>Pitfalls</h2>
+<div class="callout warn"><strong>Classic horror stories</strong><p>A leaked key mining crypto; an infinite Lambda loop triggered by its own S3 output; a debugging log level left on in prod; a forgotten GPU instance at $30/hour; a NAT Gateway moving terabytes of images. Budgets with alerts and anomaly detection exist for exactly these.</p></div>
+<ul>
+<li><strong>Optimising too early or too hard</strong>: engineer-weeks to save $20/month. Prioritise the top 5 line items.</li>
+<li><strong>Over-committing</strong> with 3-year plans before the architecture stabilises.</li>
+<li><strong>Cost-cutting that reduces reliability</strong> (single AZ, no backups). Know which savings are safe.</li>
+<li><strong>Free tier expiry</strong> catching learners after 12 months.</li>
+<li><strong>Ignoring data transfer</strong> in architecture diagrams.</li>
+<li><strong>No owner</strong>: untagged spend is nobody's problem.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Open Cost Explorer, group the last 3 months by service, then by usage type for your top service. What surprised you?</li>
+<li>Create a monthly budget with forecast alerts to your email.</li>
+<li>Write a short script (or use <code>aws ec2 describe-volumes --filters Name=status,Values=available</code>) to list unattached EBS volumes, and find any idle load balancers or Elastic IPs.</li>
+<li>Add <code>default_tags</code> to a Terraform provider and run Infracost on a plan to see monthly cost for your change.</li>
+<li>Calculate: 10 instances at $0.10/h on-demand vs a 1-year Savings Plan at 35% off. What is the annual saving and what happens if you shrink to 5 instances after six months?</li>
+</ol></div>

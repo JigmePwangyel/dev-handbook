@@ -1,0 +1,161 @@
+<h1>SSH: Secure Remote Access</h1>
+<p class="lead">SSH is the front door to every server you will ever manage, and also what CI systems use to deploy. Understanding keys, the client config file, tunnels and hardening will save you hours and protect you from the most common attacks.</p>
+
+<h2>Why SSH, and why keys</h2>
+<p>Older tools (telnet, rsh, FTP) sent everything, including passwords, in clear text. SSH encrypts the session and authenticates both sides. Passwords work, but any server on the internet gets thousands of password-guessing attempts per day (check <code>sudo journalctl -u ssh | grep "Failed password" | wc -l</code>). <strong>Public-key authentication</strong> replaces guessable secrets with cryptography that cannot be brute-forced.</p>
+
+<h2>How key authentication works</h2>
+<pre class="diagram">
+ Your laptop                                     Server
+ ~/.ssh/id_ed25519       (private: NEVER share)
+ ~/.ssh/id_ed25519.pub   (public: copy anywhere) ──▶ ~/.ssh/authorized_keys
+
+ 1. client: "I'd like to log in as deploy, here is my public key"
+ 2. server: finds that key in authorized_keys, sends a random challenge
+ 3. client: signs the challenge with the private key (key never leaves laptop)
+ 4. server: verifies signature with public key ──▶ access granted
+</pre>
+<p>Also, on first connection the client records the server's host key in <code>~/.ssh/known_hosts</code>. If it later changes you get a loud <em>REMOTE HOST IDENTIFICATION HAS CHANGED</em> warning: either the server was rebuilt or someone is intercepting. Verify before removing the old entry (<code>ssh-keygen -R host</code>).</p>
+
+<h2>Generating and installing keys</h2>
+<pre><code>ssh-keygen -t ed25519 -C "jane@work-laptop"
+# Enter a passphrase! It encrypts the private key on disk.
+
+ssh-copy-id deploy@203.0.113.10        # appends your public key to authorized_keys
+# manual equivalent:
+cat ~/.ssh/id_ed25519.pub | ssh deploy@203.0.113.10 \
+  'mkdir -p ~/.ssh &amp;&amp; chmod 700 ~/.ssh &amp;&amp; cat &gt;&gt; ~/.ssh/authorized_keys &amp;&amp; chmod 600 ~/.ssh/authorized_keys'</code></pre>
+<table>
+<tr><th>Key type</th><th>Verdict</th></tr>
+<tr><td>ed25519</td><td>Modern default: short, fast, strong</td></tr>
+<tr><td>rsa (4096 bit)</td><td>Fine for legacy compatibility</td></tr>
+<tr><td>ecdsa</td><td>Works; ed25519 preferred</td></tr>
+<tr><td>dsa</td><td>Obsolete, disabled</td></tr>
+</table>
+<h3>ssh-agent: type the passphrase once</h3>
+<pre><code>eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519       # macOS: ssh-add --apple-use-keychain
+ssh-add -l                      # loaded keys
+ssh -A bastion                  # agent forwarding: convenient but risky; prefer ProxyJump</code></pre>
+
+<h2>The client config file</h2>
+<p>Stop typing long commands. <code>~/.ssh/config</code> (mode 600) defines aliases and defaults.</p>
+<pre><code>Host web1
+    HostName 203.0.113.10
+    User deploy
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+
+Host db1
+    HostName 10.0.1.5            # private IP, reachable only via bastion
+    User admin
+    ProxyJump bastion            # hop through bastion automatically
+
+Host bastion
+    HostName bastion.example.com
+    User jump
+
+Host *
+    ServerAliveInterval 30       # keep idle connections from dropping
+    ServerAliveCountMax 3
+    AddKeysToAgent yes
+    ControlMaster auto           # reuse one connection for many sessions (fast)
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m</code></pre>
+<pre><code>ssh web1                         # that's it
+ssh db1                          # transparently via bastion
+ssh -v web1                      # verbose debugging (-vvv for more)</code></pre>
+
+<h2>Running commands and copying files</h2>
+<pre><code>ssh web1 'uptime; df -h /'                  # run and return
+ssh web1 'sudo systemctl restart myapp'
+ssh -t web1 'sudo -i'                        # -t allocates a TTY for interactive programs
+
+scp app.tar.gz web1:/tmp/                    # simple copy
+scp -r ./dist web1:/var/www/site/
+
+rsync -avz --delete --progress ./dist/ web1:/var/www/site/
+#  -a archive (perms, times, recursion)  -v verbose  -z compress
+#  --delete  remove remote files not present locally (mirror)  --dry-run to preview
+rsync -avz -e "ssh -p 2222" ./ web1:/opt/myapp/   # custom SSH options
+rsync -avz --exclude node_modules --exclude .git ./ web1:/opt/myapp/</code></pre>
+<div class="callout tip"><strong>Prefer rsync over scp</strong><p>rsync copies only the differences, resumes interrupted transfers and has <code>--dry-run</code>. Mind the trailing slash: <code>./dist/</code> copies the <em>contents</em>, <code>./dist</code> copies the directory itself.</p></div>
+
+<h2>Tunnels (port forwarding)</h2>
+<p>SSH can carry other traffic through its encrypted connection, so you can reach services that are not exposed to the internet.</p>
+<pre><code># Local forward: make remote DB reachable at localhost:5433 on my laptop
+ssh -L 5433:localhost:5432 web1 -N
+psql -h localhost -p 5433 -U app mydb
+
+# Reach a private DB that web1 can see but you cannot
+ssh -L 5433:db.internal:5432 web1 -N
+
+# Remote forward: expose my laptop's :3000 as :8080 on the server (demo/webhook testing)
+ssh -R 8080:localhost:3000 web1 -N
+
+# Dynamic forward: SOCKS proxy for browsing via the server
+ssh -D 1080 web1 -N</code></pre>
+<pre class="diagram">
+ laptop:5433 ═══ encrypted SSH tunnel ═══▶ web1 ───▶ db.internal:5432
+ (psql connects here)                       (db port never public)
+</pre>
+<p><code>-N</code> means no remote command; add <code>-f</code> to background. This beats opening the database port to the internet, always.</p>
+
+<h2>Hardening the server</h2>
+<p>After you confirmed key login works for a non-root user (in a second terminal!), edit <code>/etc/ssh/sshd_config</code> or better a drop-in at <code>/etc/ssh/sshd_config.d/99-hardening.conf</code>:</p>
+<pre><code>PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers deploy alice
+MaxAuthTries 3
+LoginGraceTime 20
+X11Forwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2</code></pre>
+<pre><code>sudo sshd -t                       # validate config: prints nothing if OK
+sudo systemctl reload ssh          # service is "sshd" on RHEL-family
+# Keep your current session open; test a NEW login before closing it.</code></pre>
+<table>
+<tr><th>Measure</th><th>Benefit</th></tr>
+<tr><td>Disable password auth</td><td>Eliminates brute-force of passwords</td></tr>
+<tr><td>Disable root login</td><td>Attackers must also guess a username; sudo gives audit trail</td></tr>
+<tr><td>Firewall / security group on port 22</td><td>Allow only your office/VPN IPs where possible</td></tr>
+<tr><td>fail2ban or sshguard</td><td>Bans IPs after repeated failures</td></tr>
+<tr><td>Changing the port</td><td>Reduces log noise only; not real security</td></tr>
+<tr><td>Bastion host or VPN (Tailscale/WireGuard)</td><td>Private servers have no public SSH at all</td></tr>
+<tr><td>Short-lived certificates (SSH CA), SSM, Teleport</td><td>Better than long-lived static keys at scale</td></tr>
+</table>
+<pre><code>sudo apt install fail2ban
+sudo systemctl enable --now fail2ban
+sudo fail2ban-client status sshd</code></pre>
+
+<h2>SSH keys in CI/CD</h2>
+<ul>
+<li>Create a <em>dedicated</em> deploy key per project/environment, with no passphrase (CI cannot type one), stored in the CI secret store.</li>
+<li>Limit its power on the server with a restricted sudo rule, or a forced command in <code>authorized_keys</code>:
+<pre><code>command="/opt/myapp/bin/deploy.sh",no-port-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... ci-deploy</code></pre></li>
+<li>Pin the host key instead of disabling checking: <code>ssh-keyscan -H host &gt;&gt; known_hosts</code>. Never use <code>StrictHostKeyChecking=no</code> in production pipelines.</li>
+</ul>
+
+<h2>Troubleshooting</h2>
+<table>
+<tr><th>Symptom</th><th>Check</th></tr>
+<tr><td><code>Permission denied (publickey)</code></td><td><code>ssh -v</code>: is the key offered? Server's <code>authorized_keys</code> perms (700 <code>~/.ssh</code>, 600 file, home not group-writable)? Right user? <code>journalctl -u ssh</code> on the server.</td></tr>
+<tr><td><code>Connection timed out</code></td><td>Firewall/security group, wrong IP, server down</td></tr>
+<tr><td><code>Connection refused</code></td><td>sshd not running or other port: <code>ss -tlnp | grep ssh</code></td></tr>
+<tr><td><code>Too many authentication failures</code></td><td>Agent offers many keys; use <code>IdentitiesOnly yes</code></td></tr>
+<tr><td>Session freezes</td><td>Add <code>ServerAliveInterval</code>; use tmux</td></tr>
+<tr><td><code>UNPROTECTED PRIVATE KEY FILE</code></td><td><code>chmod 600</code> the key</td></tr>
+</table>
+
+<div class="callout warn"><strong>Protect the private key</strong><p>Anyone with it (and no passphrase) is you. Never commit it, paste it in chat or copy it to servers. If leaked, remove its public half from every <code>authorized_keys</code> immediately and generate a new pair.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create an alias in <code>~/.ssh/config</code> for your VPS and log in with <code>ssh myserver</code>.</li>
+<li>Run a local web server on the VPS bound to 127.0.0.1:8000 and view it in your laptop browser with <code>ssh -L 8080:localhost:8000 myserver -N</code>.</li>
+<li>Harden sshd as above, validate with <code>sshd -t</code>, test a new session, then try logging in with <code>-o PubkeyAuthentication=no</code> and confirm it is refused.</li>
+<li>Use <code>rsync -avzn</code> (dry run) to preview syncing a folder, then run it for real.</li>
+</ol></div>

@@ -1,0 +1,137 @@
+<h1>SLIs, SLOs and Error Budgets</h1>
+<p class="lead">"The site should be fast and reliable" is not an engineering target. SRE replaces vague goals with numbers: measure what users experience (SLI), decide how good is good enough (SLO), and treat the gap to perfection as a budget you can spend on shipping features.</p>
+
+<h2>Why 100% is the wrong target</h2>
+<p>Each extra nine costs roughly 10x more and slows down change. 100% is also unmeasurable: users' own networks and devices fail more often than that. Past a point, users cannot tell the difference, but you pay for it in engineering effort and lost velocity. The question becomes <em>how reliable is reliable enough?</em> and then deliberately not exceeding it, so you can move fast with the rest.</p>
+
+<h2>The vocabulary</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th><th>Example</th></tr>
+<tr><td><strong>SLI</strong> (Service Level Indicator)</td><td>A measurement of service behaviour from the user's perspective; a ratio of good events to valid events</td><td>Proportion of requests that succeed and finish under 300 ms</td></tr>
+<tr><td><strong>SLO</strong> (Service Level Objective)</td><td>An internal target for an SLI over a time window</td><td>99.9% of requests are good, over 30 days</td></tr>
+<tr><td><strong>SLA</strong> (Service Level Agreement)</td><td>A contractual promise with consequences (refunds). Looser than the SLO.</td><td>99.5% monthly uptime or service credits</td></tr>
+<tr><td><strong>Error budget</strong></td><td>100% minus the SLO: how much unreliability you may spend</td><td>0.1% of requests, or ~43 min/month of full downtime</td></tr>
+</table>
+<p>Keep the SLO stricter than the SLA so you notice trouble before you owe money.</p>
+
+<h2>Choosing good SLIs</h2>
+<p>Pick indicators that track user happiness, expressed as <code>good events / valid events</code>:</p>
+<table>
+<tr><th>Service type</th><th>SLI</th></tr>
+<tr><td>Request/response API</td><td><strong>Availability</strong>: non-5xx responses / all valid requests. <strong>Latency</strong>: requests faster than 300 ms / all requests.</td></tr>
+<tr><td>Data pipeline</td><td><strong>Freshness</strong>: data updated within 10 min. <strong>Correctness</strong>, <strong>coverage</strong>.</td></tr>
+<tr><td>Storage</td><td><strong>Durability</strong>: objects not lost. Read/write success.</td></tr>
+<tr><td>Batch job</td><td>Jobs completing by deadline.</td></tr>
+<tr><td>User journey</td><td>Checkout success rate end to end (best, as users see it).</td></tr>
+</table>
+<p>Measure as close to the user as practical: load balancer logs or client-side metrics beat internal health pings. Exclude requests that are not the service's fault (4xx from bad client input) from "bad" events but keep them in a sensible definition of "valid". Prefer <strong>percent of good events</strong> and thresholds on latency over averages.</p>
+
+<h2>The math</h2>
+<h3>Allowed downtime</h3>
+<table>
+<tr><th>SLO</th><th>Error budget</th><th>Per 30 days</th><th>Per year</th></tr>
+<tr><td>99%</td><td>1%</td><td>7 h 12 m</td><td>3 d 15 h</td></tr>
+<tr><td>99.5%</td><td>0.5%</td><td>3 h 36 m</td><td>1 d 19 h</td></tr>
+<tr><td><strong>99.9%</strong> ("three nines")</td><td>0.1%</td><td><strong>43 m 12 s</strong></td><td>8 h 46 m</td></tr>
+<tr><td>99.95%</td><td>0.05%</td><td>21 m 36 s</td><td>4 h 23 m</td></tr>
+<tr><td>99.99% ("four nines")</td><td>0.01%</td><td>4 m 19 s</td><td>52 m 36 s</td></tr>
+<tr><td>99.999%</td><td>0.001%</td><td>26 s</td><td>5 m 16 s</td></tr>
+</table>
+<p>Calculation: 30 days = 43,200 minutes. 43,200 x 0.001 = <strong>43.2 minutes</strong> of allowed full outage for a 99.9% SLO. Notice that at four nines you have under 5 minutes: not enough time for a human to even be paged and log in. Four nines therefore demands automated failover and rollback, not heroics.</p>
+
+<h3>Request-based budget</h3>
+<p>A service handles 10 million requests per month with a 99.9% availability SLO. The budget is 0.1% x 10,000,000 = <strong>10,000 failed requests</strong>. Suppose a bad deploy returns 5xx for 2% of traffic (200,000 requests/day average = 4,000 bad requests per day) for 3 days before rollback: that is 12,000 failures, and the month's budget is blown at 120%.</p>
+
+<h3>Burn rate</h3>
+<p>Burn rate is how fast you consume budget relative to the "exactly on budget" pace. Burn rate 1 means you will use precisely 100% of the budget over the window. At burn rate 14.4 you consume 2% of a 30-day budget in one hour (and would exhaust it in 50 hours). Error ratio = burn rate x (1 - SLO); for a 99.9% SLO a burn rate of 14.4 means a 1.44% error ratio.</p>
+
+<h2>Implementing SLIs in Prometheus</h2>
+<pre><code># Availability SLI over 5m: good / total
+sum(rate(http_requests_total{service="checkout",status!~"5.."}[5m]))
+/
+sum(rate(http_requests_total{service="checkout"}[5m]))
+
+# Latency SLI: share of requests faster than 300ms (histogram bucket le="0.3")
+sum(rate(http_request_duration_seconds_bucket{service="checkout",le="0.3"}[5m]))
+/
+sum(rate(http_request_duration_seconds_count{service="checkout"}[5m]))
+
+# Remaining error budget (30d window) for a 99.9% SLO
+1 - (
+  (1 - (sum(rate(http_requests_total{service="checkout",status!~"5.."}[30d]))
+        / sum(rate(http_requests_total{service="checkout"}[30d]))))
+  / 0.001
+)</code></pre>
+<p>Use recording rules to precompute the ratios at several windows (5m, 30m, 1h, 6h, 3d, 30d). Tools like <strong>Sloth</strong> and <strong>Pyrra</strong> generate SLO rules, dashboards and alerts from a short spec:</p>
+<pre><code># sloth spec
+version: "prometheus/v1"
+service: checkout
+slos:
+  - name: availability
+    objective: 99.9
+    sli:
+      events:
+        error_query: sum(rate(http_requests_total{service="checkout",status=~"5.."}[{{.window}}]))
+        total_query: sum(rate(http_requests_total{service="checkout"}[{{.window}}]))
+    alerting:
+      name: CheckoutAvailability
+      page_alert:   { labels: { severity: page } }
+      ticket_alert: { labels: { severity: ticket } }</code></pre>
+
+<h2>Burn-rate alerting</h2>
+<p>Instead of alerting on a raw error rate, alert when the budget burns too fast. The multi-window, multi-burn-rate approach from the Google SRE Workbook, for a 30-day window:</p>
+<table>
+<tr><th>Severity</th><th>Burn rate</th><th>Long window</th><th>Short window</th><th>Budget consumed</th></tr>
+<tr><td>Page</td><td>14.4</td><td>1 h</td><td>5 m</td><td>2%</td></tr>
+<tr><td>Page</td><td>6</td><td>6 h</td><td>30 m</td><td>5%</td></tr>
+<tr><td>Ticket</td><td>1</td><td>3 days</td><td>6 h</td><td>10%</td></tr>
+</table>
+<p>The long window confirms the problem is significant; the short window ensures it is still happening (so the alert resolves quickly). Fast, severe burns page immediately; slow leaks open tickets. This replaces dozens of ad hoc threshold alerts with a principled few.</p>
+<pre><code>- alert: CheckoutErrorBudgetFastBurn
+  expr: |
+    (job:slo_errors:ratio_rate1h{service="checkout"} &gt; (14.4 * 0.001))
+    and
+    (job:slo_errors:ratio_rate5m{service="checkout"} &gt; (14.4 * 0.001))
+  labels: { severity: page }</code></pre>
+
+<h2>Error budget policy</h2>
+<p>The budget is only useful if it changes behaviour. Agree on a written policy <em>in advance</em>, between product, engineering and management:</p>
+<pre><code>Error Budget Policy: checkout (SLO 99.9% / 30 days)
+
+Budget remaining &gt; 50%:   Ship normally. Take risks. Run chaos experiments.
+Budget remaining 10-50%:  Continue releases; require rollback plan and canary for risky changes.
+Budget remaining &lt; 10%:   Slow down: only low-risk changes and reliability fixes.
+Budget exhausted (0%):    Feature freeze. Engineering effort goes to reliability work
+                          (postmortem action items) until the SLI is back within SLO.
+Single incident &gt; 20% of the monthly budget: a postmortem is mandatory.
+Exceptions need sign-off from the VP Eng + Product lead.</code></pre>
+<div class="callout key"><strong>The real power: aligning incentives</strong><p>Developers want to ship; operators want stability. The error budget makes both goals one number. If you have budget left, ship faster, you are being too cautious. If it is gone, stop shipping and fix reliability. Neither side argues about opinions, they look at the data.</p></div>
+
+<h2>Setting your first SLOs</h2>
+<ol>
+<li><strong>Pick 1-3 critical user journeys</strong> (login, search, checkout).</li>
+<li><strong>Define SLIs</strong> (availability and latency) and measure them for a few weeks with no target.</li>
+<li><strong>Set the SLO near what you achieve today, slightly aspirational</strong> and check it against what users actually tolerate. Start modest (99.5%) and tighten.</li>
+<li><strong>Remember dependencies</strong>: your availability cannot exceed the product of your hard dependencies' availabilities.</li>
+<li><strong>Review quarterly</strong>; SLOs are living agreements.</li>
+<li><strong>Publish them</strong> on dashboards and in service docs.</li>
+</ol>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Measuring what is easy, not what users feel</strong> (CPU, "server up") instead of success and latency of real requests.</li>
+<li><strong>Too many SLOs</strong>: dozens that nobody tracks. A few per service are enough.</li>
+<li><strong>Setting SLOs by wishful thinking</strong> (99.99% when you are at 99.5%) and then ignoring them.</li>
+<li><strong>Making the SLO equal to the SLA</strong>, leaving no early warning.</li>
+<li><strong>No policy</strong>: the budget runs out and nothing changes.</li>
+<li><strong>Averages instead of ratios and percentiles</strong>; windows too short for low-traffic services (a handful of failures looks like a disaster; consider longer windows or synthetic traffic).</li>
+<li><strong>Counting planned maintenance inconsistently</strong>: decide explicitly.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Compute the monthly error budget in minutes for 99.5%, 99.9%, and 99.95%. Your last bad incident lasted 25 minutes: which SLOs did it break?</li>
+<li>For a service doing 50 million requests/month with a 99.95% SLO, how many failed requests are allowed? A bug fails 1.5% of requests for 40 minutes at 1,200 req/s average: how much budget did it burn?</li>
+<li>Define an availability SLI and a latency SLI for your own API in PromQL, then graph them over 7 days.</li>
+<li>Write a one-page error budget policy and get your team to agree to it.</li>
+</ol></div>

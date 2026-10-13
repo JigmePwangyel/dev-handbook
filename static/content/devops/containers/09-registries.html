@@ -1,0 +1,143 @@
+<h1>Container Registries</h1>
+<p class="lead">An image on your laptop helps nobody else. A registry is the server that stores and distributes images, the "package repository" of the container world. Your CI pushes to it; your servers, Kubernetes clusters and teammates pull from it. How you tag, secure and scan what lives there decides how safe and repeatable your deployments are.</p>
+
+<h2>How registries work</h2>
+<pre class="diagram">
+  CI pipeline                     Registry                        Production host
+ ┌───────────┐  docker push   ┌──────────────────┐  docker pull  ┌───────────────┐
+ │ build img │───────────────▶│ repo: acme/api   │──────────────▶│ run container │
+ └───────────┘                │  tags: 1.4.2,... │               └───────────────┘
+                              │  blobs (layers)  │
+                              └──────────────────┘
+</pre>
+<p>Registries speak the OCI Distribution API over HTTPS. An image reference is <code>registry-host/namespace/repo:tag</code>. When the host is omitted, Docker assumes Docker Hub: <code>nginx</code> means <code>docker.io/library/nginx:latest</code>. Pushes upload only layers the registry does not already have (by digest), so repeated pushes are fast.</p>
+
+<h2>Choosing a registry</h2>
+<table>
+<tr><th>Registry</th><th>Host</th><th>Notes</th></tr>
+<tr><td>Docker Hub</td><td><code>docker.io</code></td><td>Largest public catalog and official images. Anonymous and free-tier pulls are rate-limited, which can break CI at scale. Private repos on paid plans.</td></tr>
+<tr><td>GitHub Container Registry</td><td><code>ghcr.io</code></td><td>Tied to GitHub orgs/repos; authenticates with <code>GITHUB_TOKEN</code> in Actions; free for public images.</td></tr>
+<tr><td>GitLab Container Registry</td><td><code>registry.gitlab.com</code></td><td>Built into each GitLab project.</td></tr>
+<tr><td>Amazon ECR</td><td><code>&lt;acct&gt;.dkr.ecr.&lt;region&gt;.amazonaws.com</code></td><td>IAM-based auth, same-region pull is fast and cheap, built-in scanning, lifecycle policies, replication.</td></tr>
+<tr><td>Google Artifact Registry</td><td><code>&lt;region&gt;-docker.pkg.dev</code></td><td>GCP's registry (successor to GCR). IAM auth.</td></tr>
+<tr><td>Azure Container Registry</td><td><code>&lt;name&gt;.azurecr.io</code></td><td>Entra ID auth, geo-replication.</td></tr>
+<tr><td>Self-hosted</td><td>your own</td><td>Harbor (full-featured: RBAC, scanning, replication), the minimal <code>registry:2</code>/Distribution, Nexus, Artifactory.</td></tr>
+</table>
+<p>Rule of thumb: put images in the registry closest to where they run (ECR for AWS, Artifact Registry for GCP) for speed, IAM integration and lower egress cost. Use GHCR when your code and CI are on GitHub and you deploy anywhere.</p>
+
+<h2>Authentication and push/pull</h2>
+<pre><code># Docker Hub
+docker login -u myuser                    # prompts for a personal access token (not your password)
+
+# GHCR (use a PAT with write:packages, or GITHUB_TOKEN in Actions)
+echo "$GHCR_TOKEN" | docker login ghcr.io -u myuser --password-stdin
+
+# AWS ECR (token valid 12 hours)
+aws ecr get-login-password --region eu-west-1 \
+  | docker login --username AWS --password-stdin 123456789012.dkr.ecr.eu-west-1.amazonaws.com
+aws ecr create-repository --repository-name acme/api
+
+# Tag and push
+docker tag myapp:1.4.2 ghcr.io/acme/api:1.4.2
+docker push ghcr.io/acme/api:1.4.2
+docker pull ghcr.io/acme/api:1.4.2</code></pre>
+<div class="callout warn"><strong>Credentials are stored in <code>~/.docker/config.json</code></strong><p>Without a credential helper that file holds a base64 (not encrypted) token. Use <code>--password-stdin</code> so secrets stay out of shell history, prefer short-lived tokens or OIDC in CI, and configure a credential store (<code>osxkeychain</code>, <code>pass</code>, <code>ecr-login</code>).</p></div>
+
+<h2>Running your own registry</h2>
+<pre><code>docker run -d -p 5000:5000 --restart always --name registry \
+  -v registry-data:/var/lib/registry registry:2
+docker tag myapp:1.0 localhost:5000/myapp:1.0
+docker push localhost:5000/myapp:1.0
+curl http://localhost:5000/v2/_catalog</code></pre>
+<p>This is fine for local testing. For anything shared, you need TLS (Docker refuses plain HTTP except for <code>localhost</code> unless configured as <code>insecure-registries</code>), authentication and garbage collection. At that point use Harbor or a managed registry.</p>
+
+<h2>Tagging strategy</h2>
+<p>Tags are mutable pointers (see the layers lesson), so a deliberate scheme prevents confusion and enables rollbacks.</p>
+<table>
+<tr><th>Tag</th><th>Example</th><th>Purpose</th></tr>
+<tr><td>Git SHA</td><td><code>api:3f2a9c1</code></td><td>Traceable to an exact commit; unique per build. Best for deploys.</td></tr>
+<tr><td>Semantic version</td><td><code>api:1.4.2</code>, <code>1.4</code>, <code>1</code></td><td>Release tags for humans; moving <code>1.4</code> follows patches.</td></tr>
+<tr><td>Branch/env</td><td><code>api:main</code>, <code>api:staging</code></td><td>Moving pointers; convenient but never the sole source of truth.</td></tr>
+<tr><td>PR/preview</td><td><code>api:pr-123</code></td><td>Ephemeral test environments.</td></tr>
+<tr><td><code>latest</code></td><td><code>api:latest</code></td><td>Avoid deploying it. It tells you nothing about what is running.</td></tr>
+</table>
+<div class="callout key"><strong>Build once, promote the same image</strong><p>Build an image once in CI, tag it with the commit SHA, test it, then <em>promote</em> by adding tags (<code>staging</code>, <code>1.4.2</code>, <code>prod</code>) to that same digest. Never rebuild for production: a rebuild is a different artifact that was never tested. Deploy by digest or immutable tag. Enable <strong>tag immutability</strong> on ECR/Artifact Registry for release tags so they cannot be overwritten.</p></div>
+<pre><code># Promote without rebuilding (copies manifest, no layer re-upload)
+docker buildx imagetools create \
+  --tag ghcr.io/acme/api:1.4.2 \
+  --tag ghcr.io/acme/api:prod \
+  ghcr.io/acme/api:3f2a9c1</code></pre>
+
+<h2>Pushing from CI (GitHub Actions)</h2>
+<pre><code>name: build-and-push
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write            # lets GITHUB_TOKEN push to ghcr.io
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true</code></pre>
+<p>Pin third-party actions to a commit SHA in sensitive pipelines. For AWS, use GitHub's OIDC and an IAM role (<code>aws-actions/configure-aws-credentials</code>) instead of long-lived access keys.</p>
+
+<h2>Image scanning</h2>
+<p>Images contain OS packages and language libraries that accumulate known vulnerabilities (CVEs). Scanners compare the image's package inventory against vulnerability databases.</p>
+<pre><code>trivy image ghcr.io/acme/api:1.4.2
+trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ghcr.io/acme/api:1.4.2
+docker scout cves ghcr.io/acme/api:1.4.2       # Docker Scout
+grype ghcr.io/acme/api:1.4.2                   # Anchore Grype</code></pre>
+<ul>
+<li><strong>Scan in CI</strong> to fail the build on new critical findings, <strong>and</strong> continuously in the registry (ECR enhanced scanning, Harbor, GHCR with Dependabot/Trivy), because new CVEs are published against images you built months ago.</li>
+<li>Use <code>--ignore-unfixed</code> to focus on actionable issues; track accepted risks in an ignore file with expiry dates.</li>
+<li>Most fixes come from rebuilding on a newer base image. Automate with Renovate or Dependabot bumps.</li>
+</ul>
+
+<h3>Signing and provenance</h3>
+<p>Scanning tells you what is in an image; signing tells you who built it. Tools like Sigstore <code>cosign</code> sign images (keyless, using your CI's OIDC identity), and Kubernetes admission policies can then refuse unsigned images. Attach an SBOM (software bill of materials) and build provenance attestations with BuildKit's <code>--sbom</code> and <code>--provenance</code>.</p>
+
+<h2>Housekeeping</h2>
+<ul>
+<li>Registries grow forever. Set <strong>lifecycle/retention policies</strong>: e.g. ECR rule "expire untagged images after 7 days; keep last 30 tagged <code>pr-*</code>".</li>
+<li>Use per-repo, least-privilege tokens: CI can push, production hosts can only pull.</li>
+<li>Docker Hub rate limits: authenticate pulls, or mirror base images into your own registry (pull-through cache) so an outage or limit upstream does not stop your deploys.</li>
+<li>Do not put secrets in images. Public images are world-readable; "private" images are one misconfiguration away.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run a local <code>registry:2</code>, push an image tagged <code>localhost:5000/hello:1</code> and list it via the <code>/v2/_catalog</code> endpoint.</li>
+<li>Create a free GHCR or Docker Hub repo, log in with a token and push an image tagged both with a version and a short git SHA. Confirm both tags point to the same digest.</li>
+<li>Run <code>trivy image node:22</code> and <code>trivy image node:22-slim</code>. Compare vulnerability counts.</li>
+<li>Write the GitHub Actions workflow above for a sample repo and watch the image appear in the Packages tab.</li>
+</ol></div>

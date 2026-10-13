@@ -1,0 +1,100 @@
+<h1>DevOps Culture, History and Metrics</h1>
+<p class="lead">DevOps is first a way of working and only second a toolset. Understanding the problem it grew out of explains why every tool in this handbook looks the way it does.</p>
+
+<h2>The problem: the wall of confusion</h2>
+<p>In traditional organisations, developers were rewarded for shipping features and operations for keeping systems stable. Those goals conflict: every change risks stability. So developers "threw code over the wall", operations resisted change with approval boards and quarterly release windows, and releases became rare, huge and terrifying. Large releases contain many changes, so failures are hard to diagnose, which reinforces the fear. A vicious cycle.</p>
+<pre class="diagram">
+ Dev: "ship features"  ──code──▶  ║WALL║  ──▶ Ops: "never break prod"
+        ◀── "it works on my machine" / "your code is broken" ──
+</pre>
+
+<h2>A short history</h2>
+<table>
+<tr><th>Year</th><th>Milestone</th></tr>
+<tr><td>2001</td><td>Agile Manifesto: iterate quickly with customers (but ops stayed slow)</td></tr>
+<tr><td>2006</td><td>AWS launches EC2: servers become an API call</td></tr>
+<tr><td>2009</td><td>Flickr's "10+ deploys per day" talk; Patrick Debois organises the first <em>DevOpsDays</em></td></tr>
+<tr><td>2010</td><td>"Continuous Delivery" book by Humble and Farley</td></tr>
+<tr><td>2013</td><td>Docker released; "The Phoenix Project" popularises the ideas</td></tr>
+<tr><td>2014-15</td><td>Kubernetes open-sourced; Terraform; Google's SRE concepts reach the public</td></tr>
+<tr><td>2016</td><td>"Site Reliability Engineering" book; DORA research begins annual reports</td></tr>
+<tr><td>2018+</td><td>GitOps, DevSecOps, platform engineering</td></tr>
+<tr><td>2020s</td><td>Internal developer platforms, supply-chain security (SBOMs, signing), AI-assisted operations</td></tr>
+</table>
+
+<h2>CALMS: the framework</h2>
+<table>
+<tr><th>Letter</th><th>Meaning</th><th>In practice</th></tr>
+<tr><td><strong>C</strong>ulture</td><td>Shared ownership, blameless learning</td><td>"You build it, you run it"; on-call for developers; blameless postmortems</td></tr>
+<tr><td><strong>A</strong>utomation</td><td>Automate repetitive, error-prone work</td><td>CI/CD, IaC, automated tests and rollbacks</td></tr>
+<tr><td><strong>L</strong>ean</td><td>Small batches, limit work in progress</td><td>Small PRs, frequent releases, remove waiting time</td></tr>
+<tr><td><strong>M</strong>easurement</td><td>Decide with data</td><td>DORA metrics, SLOs, dashboards</td></tr>
+<tr><td><strong>S</strong>haring</td><td>Knowledge flows across teams</td><td>Runbooks, documentation, shared tooling, demos</td></tr>
+</table>
+
+<h2>The Three Ways (from The Phoenix Project)</h2>
+<ol>
+<li><strong>Flow</strong>: speed work from left (idea) to right (production). Smaller batches, automation, fewer hand-offs.</li>
+<li><strong>Feedback</strong>: fast, amplified feedback from right to left. Monitoring, tests, alerts, user data.</li>
+<li><strong>Continual learning</strong>: experiment, tolerate failure, practise recovery.</li>
+</ol>
+
+<h2>Measuring it: DORA metrics</h2>
+<p>The DevOps Research and Assessment programme (now part of Google Cloud) has surveyed tens of thousands of teams for a decade. It found four measures that correlate with both delivery speed <em>and</em> organisational performance, and, crucially, speed and stability are <em>not</em> a trade-off: high performers have both.</p>
+<table>
+<tr><th>Metric</th><th>Question</th><th>Kind</th></tr>
+<tr><td>Deployment frequency</td><td>How often do we ship to production?</td><td>Throughput</td></tr>
+<tr><td>Lead time for changes</td><td>Commit to running in production: how long?</td><td>Throughput</td></tr>
+<tr><td>Change failure rate</td><td>What percent of deploys cause a failure needing remediation?</td><td>Stability</td></tr>
+<tr><td>Failed deployment recovery time (formerly MTTR)</td><td>How fast do we restore service after a bad change?</td><td>Stability</td></tr>
+</table>
+<p>Recent reports also emphasise <em>reliability</em> and team well-being. Elite teams typically deploy on demand (many times per day), with lead times under a day, low failure rates and recovery within an hour.</p>
+<div class="callout warn"><strong>Metrics are a mirror, not a target</strong><p>Goodhart's law: when a measure becomes a target it ceases to be a good measure. Do not rank developers by deploy count. Use DORA to find bottlenecks in the <em>system</em>.</p></div>
+
+<h2>Why CI/CD adoption matters</h2>
+<ul>
+<li><strong>Small batches reduce risk.</strong> A deploy of 3 commits is easy to reason about and revert; a deploy of 3 months of work is not.</li>
+<li><strong>Feedback in minutes.</strong> A failing test found 5 minutes after the commit costs far less than a bug found by customers weeks later.</li>
+<li><strong>Repeatability.</strong> The pipeline does the same steps every time; no forgotten step at 6 p.m. on Friday.</li>
+<li><strong>Deploys become boring.</strong> The goal is that releasing is a non-event, so teams release more, learn faster, and recover faster.</li>
+<li><strong>Auditability.</strong> Every production change maps to a commit, a review and a pipeline run.</li>
+</ul>
+
+<h2>SRE: reliability as engineering</h2>
+<p>Site Reliability Engineering, born at Google, applies software engineering to operations. If DevOps is the philosophy, SRE is one concrete implementation ("class SRE implements DevOps"). Key ideas:</p>
+<ul>
+<li><strong>SLI</strong> (indicator): a measurement, e.g. fraction of requests under 300 ms and non-5xx.</li>
+<li><strong>SLO</strong> (objective): the target, e.g. 99.9% over 30 days.</li>
+<li><strong>Error budget</strong>: 100% minus SLO. At 99.9% you may "spend" ~43 minutes of badness a month. Budget left? Ship faster. Budget exhausted? Freeze features and fix reliability. This turns the dev vs ops argument into data.</li>
+<li><strong>Toil</strong>: manual, repetitive, automatable work. Cap it (Google suggests under 50%) and automate the rest.</li>
+<li><strong>Blameless postmortems</strong>: ask "how did the system allow this?" not "who did this?". People who fear blame hide information.</li>
+</ul>
+
+<h2>DevSecOps: security shifted left</h2>
+<p>Security reviews at the end of a project find problems when they are most expensive to fix. DevSecOps moves checks into the pipeline so every commit is scanned:</p>
+<table>
+<tr><th>Stage</th><th>Check</th></tr>
+<tr><td>Commit</td><td>Secret scanning (gitleaks), pre-commit hooks</td></tr>
+<tr><td>Build</td><td>Dependency scanning (Dependabot, <code>npm audit</code>), SAST (static analysis)</td></tr>
+<tr><td>Package</td><td>Container image scanning (Trivy), SBOM, signing</td></tr>
+<tr><td>Deploy</td><td>Policy-as-code, least-privilege credentials</td></tr>
+<tr><td>Run</td><td>Runtime monitoring, patching, DAST</td></tr>
+</table>
+
+<h2>Platform engineering: the current trend</h2>
+<p>As toolchains grew (Kubernetes, Terraform, observability), asking every product developer to master all of it caused cognitive overload. Platform teams build an <strong>internal developer platform</strong> with "golden paths": opinionated, self-service templates ("create a service", "get a database") so developers get safe defaults without becoming infrastructure experts. The product is the platform; the customers are your developers.</p>
+
+<h2>Common anti-patterns</h2>
+<ul>
+<li><strong>The DevOps team.</strong> Renaming the ops team "DevOps" and keeping the wall. DevOps is shared responsibility, not a job silo (platform/SRE teams are fine when they enable, not gatekeep).</li>
+<li><strong>Tool-first adoption.</strong> Buying Kubernetes before having automated tests.</li>
+<li><strong>Ticket-driven infrastructure.</strong> If developers wait days for a server, automate self-service.</li>
+<li><strong>Hero culture.</strong> One person who "just knows" how prod works. Write runbooks and automate.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Estimate your team's four DORA metrics from git history and deploy logs. Which is worst?</li>
+<li>Compute the monthly downtime allowed by 99%, 99.9% and 99.99% (hint: 30 days is 43,200 minutes).</li>
+<li>Write a five-line blameless summary of the last outage you remember: timeline, contributing factors (not people), one fix.</li>
+</ol></div>

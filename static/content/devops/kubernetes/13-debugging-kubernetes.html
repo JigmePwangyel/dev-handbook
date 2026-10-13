@@ -1,0 +1,123 @@
+<h1>Debugging Kubernetes</h1>
+<p class="lead">Things will go wrong: Pods that will not start, Services that return nothing, rollouts that hang. Debugging Kubernetes is a learnable skill built on a small toolkit and a consistent flow: read the status, read the events, read the logs, and narrow down.</p>
+
+<h2>The toolkit</h2>
+<pre><code>kubectl get pods -o wide                      # status, restarts, node, IP
+kubectl describe pod NAME                     # config + EVENTS at the bottom (read this first)
+kubectl logs NAME [-c container] [--previous] # --previous = logs of the last crashed instance
+kubectl logs -l app=shop --tail=50 --all-containers
+kubectl get events --sort-by=.lastTimestamp -n NS     # what the cluster has been doing
+kubectl exec -it NAME -- sh                   # shell inside
+kubectl port-forward pod/NAME 8080:8080       # reach it from your laptop
+kubectl debug -it NAME --image=busybox:1.36 --target=app   # ephemeral debug container
+kubectl debug node/NODE -it --image=ubuntu    # host-level debugging
+kubectl get pod NAME -o yaml                  # status section: conditions, lastState, exit codes
+kubectl top pod / kubectl top node            # resource usage</code></pre>
+<div class="callout key"><strong>Events are the cluster talking to you</strong><p>The <code>Events</code> section of <code>kubectl describe</code> says why the scheduler could not place a Pod, why an image failed to pull, why a probe failed. Events expire after about an hour, so check early.</p></div>
+
+<h2>Pod lifecycle statuses</h2>
+<p>The <code>STATUS</code> column tells you which stage failed:</p>
+<pre class="diagram">
+ Pending ─▶ ContainerCreating ─▶ Running ─▶ Succeeded / Failed
+    │              │                │
+    │              │                └─ CrashLoopBackOff, OOMKilled, Error
+    │              └─ ImagePullBackOff, volume/secret mount errors
+    └─ unschedulable (no node fits)
+</pre>
+
+<h2>Pending: it was never scheduled</h2>
+<p>Run <code>kubectl describe pod</code> and read the <code>FailedScheduling</code> event:</p>
+<table>
+<tr><th>Message</th><th>Meaning and fix</th></tr>
+<tr><td><code>Insufficient cpu / memory</code></td><td>No node has enough unreserved resources. Lower requests, add nodes, or check the autoscaler.</td></tr>
+<tr><td><code>node(s) had untolerated taint</code></td><td>Add a toleration or use different nodes.</td></tr>
+<tr><td><code>didn't match Pod's node affinity/selector</code></td><td>Label mismatch; check <code>nodeSelector</code> and <code>kubectl get nodes --show-labels</code>.</td></tr>
+<tr><td><code>unbound immediate PersistentVolumeClaims</code></td><td>PVC is Pending: no StorageClass, no capacity, wrong zone.</td></tr>
+<tr><td><code>exceeded quota</code> (on ReplicaSet events)</td><td>Namespace ResourceQuota full.</td></tr>
+</table>
+
+<h2>ImagePullBackOff / ErrImagePull</h2>
+<p>The kubelet cannot download the image. In <code>describe</code> events find the real reason:</p>
+<ul>
+<li><code>manifest unknown</code> / <code>not found</code>: typo in the image name or tag does not exist. Try <code>docker pull</code> with the exact string.</li>
+<li><code>unauthorized</code> / <code>pull access denied</code>: private registry needs <code>imagePullSecrets</code>:
+<pre><code>kubectl create secret docker-registry regcred \
+  --docker-server=ghcr.io --docker-username=USER --docker-password=TOKEN
+# then in the Pod spec:  imagePullSecrets: [{ name: regcred }]</code></pre></li>
+<li>Network or DNS issues from the node, registry rate limits (Docker Hub), architecture mismatch (arm64 image on amd64 nodes shows as <code>exec format error</code> instead).</li>
+<li>Local clusters: image built locally but not loaded (<code>kind load docker-image</code>) and <code>imagePullPolicy</code> forcing a pull.</li>
+</ul>
+
+<h2>CrashLoopBackOff</h2>
+<p>The container starts, exits, and Kubernetes restarts it with growing delay (10 s, 20 s, up to 5 minutes). The cause is almost always in the app, not Kubernetes.</p>
+<ol>
+<li><code>kubectl logs POD --previous</code>: the final output before the crash. Missing env var, cannot reach DB, bad config file, stack trace.</li>
+<li><code>kubectl describe pod</code>: look at <code>Last State: Terminated</code> and its <code>Reason</code> and <code>Exit Code</code>.</li>
+</ol>
+<table>
+<tr><th>Exit code / reason</th><th>Likely cause</th></tr>
+<tr><td>1</td><td>Application error: read logs</td></tr>
+<tr><td>0 in a Deployment</td><td>Process finished immediately (wrong command, daemonizes itself); a long-running container must stay in the foreground</td></tr>
+<tr><td>126 / 127</td><td>Command not executable / not found (wrong <code>command</code> or entrypoint)</td></tr>
+<tr><td>137, OOMKilled</td><td>Exceeded memory limit (or SIGKILL after grace period). Raise limit or fix the leak.</td></tr>
+<tr><td>139</td><td>Segmentation fault</td></tr>
+<tr><td>143</td><td>SIGTERM: terminated normally, often by a failing liveness probe or a rollout</td></tr>
+</table>
+<p>Liveness probe failures also look like crash loops: events show <code>Liveness probe failed</code>. Loosen thresholds or add a startupProbe. If the container dies too fast to inspect, override its command to sleep:
+<code>kubectl debug POD -it --copy-to=debug --container=app -- sh</code> gives you a copy to poke at.</p>
+
+<h2>Other common states</h2>
+<ul>
+<li><strong>ContainerCreating forever</strong>: volume attach/mount failure, missing ConfigMap/Secret (<code>MountVolume.SetUp failed</code>), CNI problems (<code>failed to create pod sandbox</code>).</li>
+<li><strong>CreateContainerConfigError</strong>: references a ConfigMap/Secret key that does not exist.</li>
+<li><strong>Terminating forever</strong>: stuck finalizer or an unreachable node. Last resort: <code>kubectl delete pod X --force --grace-period=0</code> (understand the risk for StatefulSets).</li>
+<li><strong>Evicted</strong>: node pressure (disk or memory). <code>kubectl describe node</code> shows conditions.</li>
+<li><strong>Running but 0/1 READY</strong>: readiness probe failing; check the probe path and port.</li>
+</ul>
+
+<h2>Service and network problems</h2>
+<p>"The Pod is Running but I cannot reach it." Work along the path:</p>
+<pre class="diagram">
+ client ─▶ Ingress/Gateway ─▶ Service ─▶ EndpointSlice ─▶ Pod:targetPort ─▶ app
+   1            2               3             4                5              6
+</pre>
+<ol>
+<li>Does the app work? <code>kubectl port-forward pod/NAME 8080:8080</code> and curl localhost:8080. If not, it is an app problem; also confirm it listens on <code>0.0.0.0</code>.</li>
+<li>Does the Service select the Pods? <code>kubectl get endpointslices -l kubernetes.io/service-name=NAME</code> or <code>kubectl get endpoints NAME</code>. Empty means a label selector mismatch or Pods not ready.</li>
+<li>Do ports match? Service <code>targetPort</code> must equal the container's listening port.</li>
+<li>Does DNS work? <code>kubectl run t --rm -it --image=busybox:1.36 -- nslookup NAME</code>. Check CoreDNS Pods in <code>kube-system</code>.</li>
+<li>Can a Pod reach the Service? From a debug Pod: <code>curl -v http://NAME.NS:PORT</code>. If it fails but Pod IP works, suspect kube-proxy; if the Pod IP also fails, suspect NetworkPolicy or CNI.</li>
+<li>Ingress: <code>kubectl describe ingress</code>, check class, host, backend; look at ingress controller logs. A 503 means no endpoints; a 404 means no rule matched; a 502/504 means the backend misbehaved.</li>
+</ol>
+
+<h2>Rollouts and the control plane</h2>
+<ul>
+<li>Deployment not progressing: <code>kubectl rollout status</code>, then inspect the new ReplicaSet's Pods (<code>kubectl get rs</code>), then Pods as above.</li>
+<li>Pods not being created at all: <code>kubectl describe rs</code> events show quota or admission webhook rejections or PodSecurity violations.</li>
+<li>Node <code>NotReady</code>: <code>kubectl describe node</code>, then kubelet logs (<code>journalctl -u kubelet</code>) via node access or <code>kubectl debug node</code>.</li>
+<li><code>kubectl get componentstatuses</code> is deprecated; use <code>kubectl get --raw='/readyz?verbose'</code>.</li>
+</ul>
+
+<h2>A troubleshooting flow</h2>
+<pre class="diagram">
+ kubectl get pods
+   │
+   ├─ Pending ───────────▶ describe pod ▶ FailedScheduling? resources / taints / PVC / quota
+   ├─ ImagePullBackOff ──▶ describe pod ▶ name/tag typo? registry auth? network?
+   ├─ ContainerCreating ─▶ describe pod ▶ missing Secret/ConfigMap? volume? CNI?
+   ├─ CrashLoopBackOff ──▶ logs --previous + exit code ▶ app error / OOMKilled / probe
+   ├─ Running 0/1 ───────▶ readiness probe failing ▶ describe, logs, check port/path
+   └─ Running 1/1 but unreachable ▶ port-forward ▶ endpoints ▶ ports ▶ DNS ▶ NetworkPolicy ▶ ingress
+</pre>
+
+<div class="callout tip"><strong>Habits that save hours</strong><ul><li>Always read the Events before guessing.</li><li>Change one thing at a time; reproduce with a minimal debug Pod.</li><li>Ship a debug image or use <code>kubectl debug</code>: distroless images have no shell.</li><li>Centralised logs and metrics (see the Observability section) make this far faster than live kubectl.</li><li>Tools: k9s (terminal UI), stern (multi-Pod logs), Lens, kubectl-neat.</li></ul></div>
+
+<div class="exercise"><h3>Try it</h3>
+<p>Break things on purpose, then fix each using only kubectl:</p>
+<ol>
+<li>Deploy <code>nginx:does-not-exist</code> (ImagePullBackOff).</li>
+<li>Request <code>cpu: 100</code> (Pending, Insufficient cpu).</li>
+<li>Run <code>busybox</code> with <code>command: ["sh","-c","exit 1"]</code> (CrashLoopBackOff).</li>
+<li>Create a Service whose selector has a typo and diagnose with endpoints.</li>
+<li>Reference a nonexistent Secret in <code>envFrom</code> (CreateContainerConfigError).</li>
+</ol></div>

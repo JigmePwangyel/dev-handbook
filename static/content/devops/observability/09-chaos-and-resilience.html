@@ -1,0 +1,166 @@
+<h1>Chaos Engineering and Resilience Patterns</h1>
+<p class="lead">In distributed systems, partial failure is the normal state. Networks drop packets, dependencies slow down, instances disappear. Resilient software expects this and degrades gracefully. Chaos engineering goes further: it breaks things on purpose, in a controlled way, to prove the resilience is real.</p>
+
+<h2>Failure is normal</h2>
+<p>If your request touches ten services each at 99.9% availability, the combined availability is about 99.0%: roughly 7 hours of downtime a month from "healthy" parts. You cannot make dependencies perfect, so your code must handle their failures. The Eight Fallacies of Distributed Computing start with: "the network is reliable", and "latency is zero". Neither holds.</p>
+<p>The most dangerous failure is not a clean crash (easy to detect and retry), but <strong>slowness</strong>: a dependency that responds in 30 seconds instead of 30 ms ties up your threads and connections until you fall over too. That is why timeouts come first.</p>
+
+<h2>Timeouts</h2>
+<p>Every network call must have a timeout. No exceptions. Default timeouts in many libraries are infinite or minutes long.</p>
+<ul>
+<li>Set <strong>connect</strong> and <strong>read/total</strong> timeouts separately. Base them on the dependency's normal latency (e.g. p99 x 2-3), not on hope.</li>
+<li>Use <strong>deadline propagation</strong>: if the user request has a 2-second budget and you already spent 1.2 s, the downstream call gets at most 0.8 s (gRPC deadlines, Go <code>context</code> deadlines).</li>
+<li>Timeouts down the chain must be shorter than upstream ones, or the caller gives up while the callee keeps working for nobody.</li>
+</ul>
+<pre><code>// Go
+ctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+defer cancel()
+resp, err := client.Do(req.WithContext(ctx))
+
+# Python requests: (connect, read)
+requests.get(url, timeout=(0.5, 2.0))
+
+// Node fetch
+const res = await fetch(url, { signal: AbortSignal.timeout(2000) });</code></pre>
+
+<h2>Retries with exponential backoff and jitter</h2>
+<p>Many failures are transient (a dropped connection, a brief overload, a failover in progress). Retrying often succeeds. But naive retries are dangerous: if 1,000 clients all retry immediately and repeatedly, they hammer a struggling service and keep it down: a <strong>retry storm</strong> (a self-inflicted DDoS).</p>
+<pre class="diagram">
+ Naive:        t=0 fail ─▶ t=0 retry ─▶ t=0 retry ... (instant hammering)
+ Backoff:      wait 100ms, 200ms, 400ms, 800ms ... (exponential: reduces pressure)
+ + Jitter:     wait random(0..delay) so clients do not retry in sync (thundering herd)
+</pre>
+<pre><code>import random, time
+
+def call_with_retries(fn, attempts=4, base=0.1, cap=2.0):
+    for i in range(attempts):
+        try:
+            return fn()
+        except TransientError:
+            if i == attempts - 1:
+                raise
+            delay = min(cap, base * (2 ** i))
+            time.sleep(random.uniform(0, delay))      # "full jitter"</code></pre>
+<p>Rules of retrying:</p>
+<ul>
+<li><strong>Retry only transient, safe errors</strong>: timeouts, 503, connection resets, 429 (respecting <code>Retry-After</code>). Never retry 400/401/404 or validation errors.</li>
+<li><strong>Only retry idempotent operations</strong>, or make them idempotent with an <strong>idempotency key</strong> (e.g. payments: send <code>Idempotency-Key: &lt;uuid&gt;</code> so a retry does not charge twice).</li>
+<li><strong>Cap attempts and total time</strong>, and use a <strong>retry budget</strong> (e.g. retries may add at most 10% extra load). Retries multiply across layers: three layers each retrying 3 times means 27 calls per failure. Retry at one layer only, usually the closest to the failure or the edge.</li>
+</ul>
+
+<h2>Circuit breakers</h2>
+<p>When a dependency is clearly failing, continuing to call it wastes resources and slows everyone. A circuit breaker watches failure rates and "trips", failing fast without calling the dependency, then probes occasionally to see if it recovered.</p>
+<pre class="diagram">
+          failures exceed threshold
+   ┌────────┐ ───────────────────────▶ ┌────────┐
+   │ CLOSED │                          │  OPEN  │  all calls fail fast (no network)
+   │ normal │ ◀─────────────────────── └───┬────┘
+   └────────┘   probe calls succeed        │ after cool-down (e.g. 30 s)
+        ▲                                  ▼
+        │                           ┌─────────────┐
+        └───────────────────────────│ HALF-OPEN   │ allow a few trial calls
+              success                └─────────────┘ (failure sends it back to OPEN)
+</pre>
+<pre><code>// Resilience4j (Java)
+CircuitBreakerConfig cfg = CircuitBreakerConfig.custom()
+    .failureRateThreshold(50)                     // open at 50% failures
+    .slidingWindowSize(20)
+    .waitDurationInOpenState(Duration.ofSeconds(30))
+    .permittedNumberOfCallsInHalfOpenState(3)
+    .build();
+
+// Node: opossum;  Python: pybreaker;  Go: sony/gobreaker;  .NET: Polly
+// Service meshes (Istio/Envoy) can do outlier detection without code changes</code></pre>
+<p>While open, return a <strong>fallback</strong>: cached data, a default, a degraded feature (hide recommendations), or a clear error. Failing fast keeps your own latency and thread pools healthy.</p>
+
+<h2>Other patterns</h2>
+<table>
+<tr><th>Pattern</th><th>Idea</th></tr>
+<tr><td><strong>Bulkheads</strong></td><td>Isolate resources (thread/connection pools) per dependency so one slow dependency cannot exhaust everything, like watertight compartments in a ship.</td></tr>
+<tr><td><strong>Load shedding / rate limiting</strong></td><td>When overloaded, reject excess work early (429/503) to keep serving the rest rather than collapsing. Prioritise critical traffic.</td></tr>
+<tr><td><strong>Graceful degradation</strong></td><td>Return partial results or a simpler experience when parts fail.</td></tr>
+<tr><td><strong>Queues / backpressure</strong></td><td>Decouple producers and consumers with a queue; bounded queues push back instead of growing without limit.</td></tr>
+<tr><td><strong>Idempotency</strong></td><td>Make repeated operations safe, so retries and duplicates are harmless.</td></tr>
+<tr><td><strong>Redundancy &amp; failover</strong></td><td>Multiple instances/AZs/regions, automatic replacement.</td></tr>
+<tr><td><strong>Caching stale data</strong></td><td>Serve stale-on-error (<code>stale-if-error</code>) when the origin is down.</td></tr>
+<tr><td><strong>Feature flags / kill switches</strong></td><td>Turn off a misbehaving feature instantly without redeploying.</td></tr>
+</table>
+<div class="callout key"><strong>How they compose</strong><p>A well-behaved call: <em>timeout</em> bounds each attempt; a few <em>retries with backoff and jitter</em> absorb transient errors; a <em>circuit breaker</em> stops calling a dead dependency; a <em>bulkhead</em> contains the blast radius; a <em>fallback</em> keeps the user experience acceptable; and <em>metrics</em> on all of them show when they are triggering.</p></div>
+
+<h2>Chaos engineering</h2>
+<p>Resilience features are code that rarely runs, so they are rarely tested, and untested failure handling usually fails when needed. <strong>Chaos engineering</strong>, pioneered by Netflix (Chaos Monkey), is the discipline of experimenting on a system to build confidence in its ability to withstand turbulent conditions in production.</p>
+<h3>The scientific method</h3>
+<ol>
+<li><strong>Define steady state</strong>: a measurable indicator of normal behaviour, ideally an SLI (orders per minute, p99 latency, error ratio).</li>
+<li><strong>Hypothesise</strong>: "If one app instance dies, the steady state is unchanged." "If the cache is unavailable, checkout latency rises under 2x but stays successful."</li>
+<li><strong>Inject a realistic fault</strong>, with the <strong>smallest blast radius</strong> that teaches you something.</li>
+<li><strong>Observe</strong> versus the steady state. Did the system behave as hypothesised?</li>
+<li><strong>Fix the weaknesses</strong> found, then rerun and automate.</li>
+</ol>
+<p>Preconditions: you need decent observability and a working abort button. Do not run chaos on a system you cannot observe, or one already unreliable. Start in staging, then move to production in small, announced experiments (a small percentage of traffic, one instance, off-peak) with automatic halting when the SLI degrades.</p>
+
+<h3>Fault types to try</h3>
+<table>
+<tr><th>Category</th><th>Experiment</th></tr>
+<tr><td>Instances</td><td>Kill a pod/instance/process; terminate a random node</td></tr>
+<tr><td>Zone/region</td><td>Drain an AZ; simulate region failure for a non-critical service</td></tr>
+<tr><td>Network</td><td>Add 300 ms latency; drop 5% packets; partition services; block DNS</td></tr>
+<tr><td>Dependencies</td><td>Make a downstream return 500s or hang; revoke a credential</td></tr>
+<tr><td>Resources</td><td>CPU hog, memory pressure, full disk, exhausted file descriptors</td></tr>
+<tr><td>Time/state</td><td>Clock skew; certificate expiry; failover the primary database</td></tr>
+<tr><td>Scale</td><td>Sudden 5x traffic; cold-cache restart</td></tr>
+</table>
+<h3>Tools</h3>
+<ul>
+<li><strong>Chaos Mesh</strong> and <strong>LitmusChaos</strong> (Kubernetes-native, CNCF projects).</li>
+<li><strong>Gremlin</strong> (commercial platform), <strong>Steadybit</strong>.</li>
+<li><strong>AWS Fault Injection Service (FIS)</strong>, <strong>Azure Chaos Studio</strong>.</li>
+<li><strong>Toxiproxy</strong> (inject latency/failure on TCP connections in tests), <strong>tc netem</strong>, <strong>stress-ng</strong>.</li>
+</ul>
+<pre><code># Chaos Mesh: add 200ms latency to checkout pods for 5 minutes
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata: { name: checkout-latency, namespace: shop }
+spec:
+  action: delay
+  mode: one
+  selector:
+    namespaces: [shop]
+    labelSelectors: { app: checkout }
+  delay: { latency: "200ms", jitter: "50ms" }
+  duration: "5m"
+
+# Simple: kill a random pod and watch recovery
+kubectl delete pod -n shop $(kubectl get pods -n shop -l app=checkout -o name | shuf -n1)</code></pre>
+
+<h2>Game days</h2>
+<p>A <strong>game day</strong> is a scheduled, collaborative exercise where the team deliberately simulates a failure and practises the response, testing systems, tooling, runbooks <em>and people</em>.</p>
+<ol>
+<li><strong>Plan</strong>: choose a scenario ("primary DB fails over", "payment provider is down", "AZ lost"). Write the hypothesis and expected behaviour. Define abort criteria and a rollback.</li>
+<li><strong>Brief</strong>: assign roles (facilitator, IC, observers/scribe). Tell stakeholders and support when it will run.</li>
+<li><strong>Run</strong>: inject the fault; the responders work from alerts and runbooks, as in a real incident (or the facilitator reveals the scenario). Observers note what was confusing, missing or slow.</li>
+<li><strong>Debrief</strong>: blameless review: did alerts fire? did dashboards help? were runbooks right? how long to detect and mitigate? What surprised us?</li>
+<li><strong>Follow up</strong>: track action items like postmortem items; repeat with harder scenarios.</li>
+</ol>
+<p>Variations: "Wheel of misfortune" tabletop (talk through an incident with no real fault), disaster recovery drills (restore from backup, fail over to another region), and security red-team exercises.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>No timeouts</strong>: the single most common cause of cascading failure.</li>
+<li><strong>Retries without backoff, jitter or limits</strong>, creating retry storms; retries at multiple layers.</li>
+<li><strong>Retrying non-idempotent operations</strong> (double charges, duplicate emails).</li>
+<li><strong>Circuit breakers never tuned or monitored</strong>: add metrics and alerts for state changes.</li>
+<li><strong>Fallbacks that were never exercised</strong> and themselves crash. Test them.</li>
+<li><strong>Chaos without a hypothesis or observability</strong>: random destruction teaches nothing.</li>
+<li><strong>Too large a blast radius</strong> too early, or experimenting during an existing incident or a peak event.</li>
+<li><strong>Finding issues and not fixing them</strong>: chaos creates a backlog; the value is in the follow-up.</li>
+<li><strong>Treating it as a one-off</strong>: systems change; run experiments continuously or on a schedule, ideally in CI/CD.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Audit one service's outbound calls: list each with its timeout, retry policy and fallback. How many have none?</li>
+<li>Run two containers (your app and a dependency) behind Toxiproxy. Add 3 seconds of latency to the dependency and watch your app. Add a timeout and a fallback, and repeat.</li>
+<li>Implement retry with exponential backoff and full jitter for a flaky HTTP call, then write a test that proves it retries on 503 but not on 400.</li>
+<li>Plan a 1-hour game day: pick the scenario "kill one of three app instances during peak-like load", state the hypothesis and steady-state metric, and run it in staging with Chaos Mesh or <code>kubectl delete pod</code>.</li>
+</ol></div>

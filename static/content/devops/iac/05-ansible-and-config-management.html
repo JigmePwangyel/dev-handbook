@@ -1,0 +1,220 @@
+<h1>Ansible and Configuration Management</h1>
+<p class="lead">Terraform creates the server; something must then install packages, write config files and start services. Configuration management tools do this declaratively and repeatably across many machines. Ansible is the most popular because it needs nothing installed on the targets except SSH and Python.</p>
+
+<h2>The problem it solves</h2>
+<p>You have ten web servers. Installing nginx by SSHing into each and typing commands creates drift, and adding an eleventh means remembering all the steps. A shell script helps, but running it twice may append duplicate lines, reinstall things, or fail on "already exists". Configuration management describes the <em>desired state of a machine</em> and brings each machine to it safely, any number of times.</p>
+
+<h2>Why Ansible</h2>
+<ul>
+<li><strong>Agentless</strong>: connects over SSH (WinRM for Windows). Nothing to install, no daemon, no central server required. Chef and Puppet traditionally need an agent on every node.</li>
+<li><strong>Push model</strong>: you run it from a laptop or CI; it connects out to the hosts.</li>
+<li><strong>YAML playbooks</strong>: readable by non-programmers.</li>
+<li><strong>Huge module library</strong>: packages, users, files, services, cloud, network devices, Kubernetes.</li>
+<li>Trade-off: SSH round-trips make it slower than agent pull models at very large scale; and while modules are declarative, playbooks are ordered procedures, so state tracking is weaker than Terraform's.</li>
+</ul>
+<pre class="diagram">
+  control node (your laptop / CI)
+  ansible + playbook + inventory
+        │  SSH (parallel, forks=5 default)
+   ┌────┼─────────────┬─────────────┐
+   ▼    ▼             ▼             ▼
+  web1  web2          web3          db1        managed nodes: only need SSH + Python
+</pre>
+
+<h2>Install and first command</h2>
+<pre><code>pipx install ansible-core     # or: brew install ansible
+ansible --version
+ansible all -i inventory.ini -m ping          # ad-hoc: "can I reach everyone?"
+ansible webservers -i inventory.ini -m apt -a "name=htop state=present" --become</code></pre>
+
+<h2>Inventory</h2>
+<p>A list of hosts, grouped, with variables.</p>
+<pre><code># inventory.ini
+[webservers]
+web1 ansible_host=203.0.113.10
+web2 ansible_host=203.0.113.11
+
+[dbservers]
+db1  ansible_host=203.0.113.20
+
+[all:vars]
+ansible_user=ubuntu
+ansible_ssh_private_key_file=~/.ssh/id_ed25519
+
+[webservers:vars]
+http_port=80</code></pre>
+<p>YAML inventories work too. For clouds use <strong>dynamic inventory</strong> plugins (<code>amazon.aws.aws_ec2</code>) that discover hosts by tag, so Terraform-created machines appear automatically. Per-host and per-group variables live in <code>host_vars/</code> and <code>group_vars/</code> directories.</p>
+
+<h2>Playbooks</h2>
+<p>A playbook is a list of <strong>plays</strong>; each play maps a host group to a list of <strong>tasks</strong>; each task calls a <strong>module</strong> with arguments.</p>
+<h3>Complete example: configure an nginx web server</h3>
+<pre><code># site.yml
+- name: Configure web servers
+  hosts: webservers
+  become: true                      # sudo
+  vars:
+    site_domain: example.com
+    web_root: /var/www/example
+
+  tasks:
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Create web root
+      ansible.builtin.file:
+        path: "{{ web_root }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+
+    - name: Deploy index page from template
+      ansible.builtin.template:
+        src: index.html.j2
+        dest: "{{ web_root }}/index.html"
+        owner: www-data
+        mode: "0644"
+
+    - name: Deploy nginx site config
+      ansible.builtin.template:
+        src: site.conf.j2
+        dest: /etc/nginx/sites-available/{{ site_domain }}
+        mode: "0644"
+      notify: Reload nginx            # only fires if the file CHANGED
+
+    - name: Enable the site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/{{ site_domain }}
+        dest: /etc/nginx/sites-enabled/{{ site_domain }}
+        state: link
+      notify: Reload nginx
+
+    - name: Remove default site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: Reload nginx
+
+    - name: Ensure nginx is enabled and running
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Allow HTTP through firewall
+      community.general.ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded</code></pre>
+<pre><code># templates/site.conf.j2
+server {
+    listen {{ http_port | default(80) }};
+    server_name {{ site_domain }};
+    root {{ web_root }};
+    index index.html;
+    location / { try_files $uri $uri/ =404; }
+}
+
+# templates/index.html.j2
+&lt;h1&gt;Hello from {{ inventory_hostname }}&lt;/h1&gt;</code></pre>
+<pre><code>ansible-playbook -i inventory.ini site.yml --check --diff   # dry run: show what WOULD change
+ansible-playbook -i inventory.ini site.yml                  # apply
+ansible-playbook -i inventory.ini site.yml --limit web1     # one host
+ansible-playbook -i inventory.ini site.yml --tags nginx -v</code></pre>
+<p>Output shows per-task <code>ok</code> (already correct), <code>changed</code> (it made a change) or <code>failed</code>. Run it twice: the second run should report <code>changed=0</code>.</p>
+
+<h2>Idempotency</h2>
+<p>Well-written modules describe state: <code>state: present</code>, <code>state: started</code>, <code>state: absent</code>. The module checks first and only acts if needed. Contrast:</p>
+<pre><code># NOT idempotent: appends a line every run, always reports "changed"
+- ansible.builtin.shell: echo "export FOO=1" &gt;&gt; /etc/profile
+
+# idempotent
+- ansible.builtin.lineinfile:
+    path: /etc/profile
+    line: export FOO=1</code></pre>
+<div class="callout key"><strong>Avoid shell and command when a module exists</strong><p>The <code>shell</code>/<code>command</code> modules are an escape hatch with no idea of state. If you must use them, add <code>creates:</code>, <code>removes:</code> or <code>changed_when:</code> to make them behave. Run <code>ansible-lint</code> to catch these.</p></div>
+
+<h2>Handlers, variables, conditionals, loops</h2>
+<pre><code>- name: Install tools
+  ansible.builtin.apt:
+    name: "{{ item }}"
+    state: present
+  loop: [git, curl, htop]
+  when: ansible_facts['os_family'] == "Debian"
+
+- name: Create app users
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    groups: "{{ item.groups }}"
+  loop:
+    - { name: alice, groups: sudo }
+    - { name: bob,   groups: docker }</code></pre>
+<p><strong>Facts</strong> are auto-gathered host details (<code>ansible_facts</code>): OS, IPs, memory. <strong>Handlers</strong> run once at the end of a play, only if notified by a changed task: perfect for "reload service after config change". Variable precedence is deep (about 22 levels); keep it simple: defaults in roles, overrides in <code>group_vars</code>.</p>
+
+<h2>Roles</h2>
+<p>A role packages tasks, templates, handlers and defaults into a reusable directory structure.</p>
+<pre class="diagram">
+ roles/nginx/
+ ├── tasks/main.yml         the tasks
+ ├── handlers/main.yml      reload nginx, etc.
+ ├── templates/             *.j2 files
+ ├── files/                 static files
+ ├── defaults/main.yml      overridable default variables (lowest precedence)
+ ├── vars/main.yml          internal constants
+ ├── meta/main.yml          dependencies
+ └── README.md
+</pre>
+<pre><code># site.yml, now tiny
+- hosts: webservers
+  become: true
+  roles:
+    - role: common          # users, ssh hardening, unattended-upgrades
+    - role: nginx
+      vars: { site_domain: example.com }
+
+- hosts: dbservers
+  become: true
+  roles: [common, postgresql]</code></pre>
+<p>Create a skeleton with <code>ansible-galaxy init roles/nginx</code>. Reuse community roles and collections from Ansible Galaxy (<code>ansible-galaxy collection install community.general</code>), pin versions in <code>requirements.yml</code>.</p>
+
+<h2>Secrets: Ansible Vault</h2>
+<pre><code>ansible-vault create group_vars/prod/vault.yml      # encrypted file with db_password etc.
+ansible-playbook site.yml --ask-vault-pass          # or --vault-password-file
+ansible-vault encrypt_string 's3cr3t' --name 'db_password'</code></pre>
+<p>Alternatively pull secrets from a manager at runtime (<code>community.hashi_vault</code>, AWS lookup plugins).</p>
+
+<h2>Where Ansible fits (and where it does not)</h2>
+<ul>
+<li><strong>Good</strong>: bootstrapping and configuring long-lived VMs, bare metal and network gear; one-off orchestration (rolling restarts, patching: use <code>serial: 1</code>); glue tasks.</li>
+<li><strong>Weaker</strong>: creating cloud resources (Terraform tracks state and does that better); keeping hundreds of machines continuously converged (agent-based or immutable approaches fit better).</li>
+<li><strong>Combined</strong>: Terraform provisions; Ansible (or cloud-init) configures; or Ansible runs inside Packer to bake an image (next lesson), which avoids configuring live servers at all.</li>
+</ul>
+
+<h2>Best practices</h2>
+<ul>
+<li>Keep playbooks in git; run via CI against staging first.</li>
+<li>Always test with <code>--check --diff</code>; use Molecule to test roles in containers.</li>
+<li>Use fully qualified module names (<code>ansible.builtin.apt</code>).</li>
+<li>Name every task clearly; the names are your run log.</li>
+<li>Use <code>serial</code> and <code>max_fail_percentage</code> for safe rolling changes.</li>
+<li>Pin Ansible and collection versions.</li>
+<li>Do not edit servers by hand afterwards; that is how drift returns.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Launch two cheap VMs (or two Docker containers with SSH, or a local Multipass/Vagrant VM) and write an inventory.</li>
+<li>Run the nginx playbook; confirm <code>curl</code> on each host. Run it again and check for <code>changed=0</code>.</li>
+<li>SSH to one server, edit the nginx config manually, re-run the playbook, and watch it repair the drift and fire the handler.</li>
+<li>Refactor the tasks into a <code>roles/nginx</code> role.</li>
+</ol></div>

@@ -1,0 +1,81 @@
+<h1>Why Container Orchestration?</h1>
+<p class="lead">Running one container on one server is easy. Running two hundred containers across thirty servers, keeping them healthy, updating them without downtime and scaling them with traffic is a different problem entirely. Orchestration is the software that solves it, and Kubernetes is the one that won.</p>
+
+<h2>Start with the problem</h2>
+<p>Imagine you have containerised your app (see the Docker lessons). On a single VPS you run <code>docker compose up -d</code> and you are done. Now the business grows. Here is what breaks, in the order it usually hurts.</p>
+
+<h3>1. Scheduling: where should this container run?</h3>
+<p>With ten servers and fifty containers, <em>someone</em> has to decide which container goes on which machine. A container needs 2 GB of RAM and half a CPU; server 3 has 1.5 GB free; server 7 has 6 GB free but is in a different availability zone from the database. Doing this in a spreadsheet works for a week. This is a bin-packing problem with constraints, and the component that solves it is called a <strong>scheduler</strong>.</p>
+
+<h3>2. Self-healing: things die, constantly</h3>
+<p>Processes crash, nodes lose power, disks fill, kernels panic. At small scale you get paged and restart things. At large scale, something is <em>always</em> broken somewhere. Without automation, every failure is a 3 a.m. phone call. With orchestration, the system notices that three replicas were requested but two exist, and starts a third on a healthy machine, with no human involved.</p>
+
+<h3>3. Scaling: capacity should follow demand</h3>
+<p>Traffic doubles at lunchtime. You can over-provision permanently (expensive) or add and remove instances automatically (needs a system that knows how to start new copies, register them with the load balancer and remove them again).</p>
+
+<h3>4. Rollouts: updating without an outage</h3>
+<p>Replacing version 1 with version 2 across twenty instances without dropping requests needs ordering: start a new one, wait until it is healthy, route traffic to it, stop an old one, repeat. If version 2 is broken, stop and go back. Hand-written deploy scripts get this wrong in new and creative ways.</p>
+
+<h3>5. Service discovery and load balancing</h3>
+<p>When containers move around and IP addresses change every restart, how does the <code>checkout</code> service find the <code>payments</code> service? You need stable names and a load balancer that automatically tracks which instances are alive.</p>
+
+<h3>6. Configuration, secrets and storage</h3>
+<p>The same image should run in dev, staging and production with different settings, and databases need disks that follow them when they move.</p>
+
+<h2>The key idea: declare desired state</h2>
+<p>Older tools were <em>imperative</em>: "start container X on server 3". Kubernetes is <em>declarative</em>: you write down what you want ("five copies of this image, each with 256 MB of memory, reachable at this name") and controllers continuously work to make reality match. You stop issuing commands and start describing outcomes.</p>
+
+<pre class="diagram">
+  You write:                    Kubernetes continuously does:
+  ┌──────────────────┐          ┌──────────────────────────────────┐
+  │ replicas: 5      │ ───────▶ │ observe: 4 running                │
+  │ image: shop:2.3  │          │ diff:    need 1 more              │
+  └──────────────────┘          │ act:     schedule a new Pod       │
+        desired state           │ repeat forever                    │
+                                └──────────────────────────────────┘
+</pre>
+
+<div class="callout key"><strong>Why this matters</strong><p>Declarative state turns operations into data. Your whole system is described by files you can review in a pull request, diff, roll back with git and re-apply to a brand new cluster. This is the foundation that makes GitOps (see the IaC section) possible.</p></div>
+
+<h2>What Kubernetes gives you</h2>
+<table>
+<tr><th>Problem</th><th>Kubernetes feature</th></tr>
+<tr><td>Where to run it?</td><td>Scheduler places Pods on nodes using resource requests, affinity, taints</td></tr>
+<tr><td>It crashed</td><td>kubelet restarts containers; controllers recreate Pods; nodes are replaced</td></tr>
+<tr><td>Scale with load</td><td>HorizontalPodAutoscaler, Cluster Autoscaler</td></tr>
+<tr><td>Zero-downtime updates</td><td>Deployments with rolling updates and rollback</td></tr>
+<tr><td>Finding services</td><td>Services and cluster DNS</td></tr>
+<tr><td>Config and secrets</td><td>ConfigMaps and Secrets</td></tr>
+<tr><td>Stateful data</td><td>PersistentVolumes, StatefulSets</td></tr>
+<tr><td>Extensibility</td><td>Custom Resource Definitions and operators</td></tr>
+</table>
+
+<h2>A brief history</h2>
+<p>Google ran an internal system called Borg for over a decade. In 2014 they open-sourced a redesign as Kubernetes (Greek for "helmsman", abbreviated k8s: k, 8 letters, s) and donated it to the Cloud Native Computing Foundation. Competitors such as Docker Swarm and Mesos existed, but Kubernetes' extensible API and vendor-neutral governance won. Every major cloud now offers a managed version, so it is the de facto common API for running containers.</p>
+
+<h2>When you do NOT need Kubernetes</h2>
+<p>This is the most valuable section for a new engineer. Kubernetes is powerful but carries real cost: a steep learning curve, many moving parts, YAML sprawl, and an operational surface (upgrades, networking, security) that someone must own.</p>
+<ul>
+<li><strong>One app, a few containers.</strong> A single VM with Docker Compose and a systemd unit, behind a reverse proxy, is simpler and often more reliable.</li>
+<li><strong>A small team with no platform experience.</strong> A managed PaaS (Render, Fly.io, Railway, Heroku, Cloud Run, App Runner) gives you 90 percent of the benefits with 5 percent of the complexity.</li>
+<li><strong>Mostly serverless workloads.</strong> If your logic is functions and queues, Lambda or Cloud Run may fit better.</li>
+<li><strong>Low traffic, no HA requirement.</strong> Downtime of a minute during a deploy may be perfectly acceptable.</li>
+</ul>
+<p>You start to genuinely benefit from Kubernetes when you have many services, multiple teams deploying independently, a need for consistent scaling and rollout behaviour, multi-cloud or on-prem portability requirements, or an ecosystem need (operators, service mesh, GPU scheduling).</p>
+
+<div class="callout warn"><strong>The resume-driven-development trap</strong><p>Many startups adopt Kubernetes at ten users and spend more engineering time on the cluster than on the product. Choose it because you have the problems above, not because it is fashionable. Learning it is still worth it: the concepts (declarative config, reconciliation, service discovery) show up everywhere.</p></div>
+
+<h2>Trade-offs summary</h2>
+<table>
+<tr><th>Option</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>VM + Compose</td><td>Simple, cheap, easy to debug</td><td>Single point of failure; manual scaling</td></tr>
+<tr><td>Managed PaaS</td><td>Zero ops</td><td>Less control, cost climbs at scale, vendor lock-in</td></tr>
+<tr><td>Kubernetes</td><td>Powerful, portable, huge ecosystem</td><td>Complex; needs expertise</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>List the services your team runs. For each, write down how it is scheduled, restarted on failure, scaled and updated today.</li>
+<li>Count how many of those answers are "a person does it by hand". Those are the places orchestration would help.</li>
+<li>Decide honestly: would a managed PaaS solve your actual pain with less effort?</li>
+</ol></div>

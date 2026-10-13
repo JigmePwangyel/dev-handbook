@@ -1,0 +1,174 @@
+<h1>Pods and Workload Controllers</h1>
+<p class="lead">The Pod is Kubernetes' smallest deployable unit, but you almost never create one directly. You create a controller (Deployment, StatefulSet, DaemonSet, Job) that manages Pods for you. Choosing the right controller is the core design decision for every workload.</p>
+
+<h2>Pods</h2>
+<p>A Pod is one or more containers that share a network namespace (one IP, they talk over <code>localhost</code>), can share volumes, and are always scheduled together on the same node. Why not just containers? Because some processes are tightly coupled: a web app plus a log shipper, or a proxy sidecar. The Pod is the unit of co-location.</p>
+<pre><code>apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  containers:
+    - name: app
+      image: ghcr.io/example/shop:2.3.1
+      ports:
+        - containerPort: 8080
+      env:
+        - name: LOG_LEVEL
+          value: "info"
+    - name: log-shipper            # sidecar sharing the Pod
+      image: fluent/fluent-bit:3.1
+  initContainers:                  # run to completion BEFORE app containers
+    - name: wait-for-db
+      image: busybox:1.36
+      command: ["sh","-c","until nc -z db 5432; do sleep 2; done"]
+  restartPolicy: Always</code></pre>
+<p>Pods are <strong>ephemeral</strong>: when one dies it is not repaired, it is replaced by a new Pod with a new name and IP. Never rely on a Pod's IP or local filesystem surviving.</p>
+<div class="callout warn"><strong>Do not run naked Pods</strong><p>A bare Pod is not rescheduled if its node dies. Always wrap Pods in a controller.</p></div>
+
+<h2>The controller family</h2>
+<pre class="diagram">
+  Deployment ──owns──▶ ReplicaSet ──owns──▶ Pod, Pod, Pod     (stateless apps)
+  StatefulSet ────────────────────────────▶ Pod-0, Pod-1      (stable identity + disks)
+  DaemonSet ──────────────────────────────▶ one Pod per node  (agents)
+  Job ────────────────────────────────────▶ Pods that finish  (batch)
+  CronJob ──creates──▶ Job ───────────────▶ on a schedule
+</pre>
+
+<h2>ReplicaSet</h2>
+<p>Ensures N identical Pods exist, using a label selector. If one dies it makes another. You rarely use it directly because a Deployment manages ReplicaSets for you, which enables rolling updates (a new ReplicaSet per version).</p>
+
+<h2>Deployment</h2>
+<p>The default choice for stateless apps (web servers, APIs, workers). It gives you replicas, rolling updates, rollbacks and scaling.</p>
+<pre><code>apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+spec:
+  replicas: 3
+  selector:
+    matchLabels:             # must match template labels; immutable after creation
+      app: shop
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:                  # the Pod template
+    metadata:
+      labels:
+        app: shop
+    spec:
+      containers:
+        - name: shop
+          image: ghcr.io/example/shop:2.3.1   # pin a tag or digest, never :latest
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }</code></pre>
+<p>Changing anything in <code>spec.template</code> (for example the image) triggers a rollout: a new ReplicaSet scales up while the old one scales down. Changing <code>replicas</code> does not.</p>
+
+<h2>StatefulSet</h2>
+<p>For workloads that need a <strong>stable identity</strong>: databases, Kafka, ZooKeeper, Elasticsearch. Differences from a Deployment:</p>
+<ul>
+<li>Pods are named <code>name-0</code>, <code>name-1</code>, ... and keep their name across restarts.</li>
+<li>Each Pod gets its own PersistentVolumeClaim via <code>volumeClaimTemplates</code>, which survives Pod deletion.</li>
+<li>Created and updated in order (0, then 1, ...) and deleted in reverse.</li>
+<li>Requires a <em>headless Service</em> (<code>clusterIP: None</code>) giving each Pod a DNS name like <code>db-0.db.default.svc</code>.</li>
+</ul>
+<pre><code>apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db            # headless Service name
+  replicas: 3
+  selector:
+    matchLabels: { app: db }
+  template:
+    metadata:
+      labels: { app: db }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 20Gi } }</code></pre>
+<div class="callout info"><strong>Honest advice</strong><p>A StatefulSet gives you identity and storage, <em>not</em> replication, backups or failover. For production databases, use a managed service (RDS, Cloud SQL) or a mature operator (CloudNativePG, Strimzi) rather than hand-rolling it.</p></div>
+
+<h2>DaemonSet</h2>
+<p>Runs exactly one Pod on every node (or a selected subset), including nodes added later. Typical uses: log collectors (Fluent Bit), node metrics exporters, CNI plugins, security agents.</p>
+<pre><code>apiVersion: apps/v1
+kind: DaemonSet
+metadata: { name: node-exporter }
+spec:
+  selector:
+    matchLabels: { app: node-exporter }
+  template:
+    metadata:
+      labels: { app: node-exporter }
+    spec:
+      tolerations:
+        - operator: Exists     # also run on tainted nodes
+      containers:
+        - name: exporter
+          image: quay.io/prometheus/node-exporter:v1.8.2
+          ports: [{ containerPort: 9100, hostPort: 9100 }]</code></pre>
+
+<h2>Job and CronJob</h2>
+<p>A Job runs Pods until a number of them complete successfully: database migrations, report generation. A CronJob creates Jobs on a cron schedule.</p>
+<pre><code>apiVersion: batch/v1
+kind: CronJob
+metadata: { name: nightly-report }
+spec:
+  schedule: "0 2 * * *"           # 02:00 daily (cluster time, UTC by default)
+  concurrencyPolicy: Forbid       # skip if previous still running
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3             # retries before marking failed
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: OnFailure   # Jobs must be OnFailure or Never
+          containers:
+            - name: report
+              image: ghcr.io/example/report:1.4
+              args: ["--since=24h"]</code></pre>
+<p>Make jobs <strong>idempotent</strong>: Kubernetes may run one twice on rare occasions.</p>
+
+<h2>Choosing</h2>
+<table>
+<tr><th>Need</th><th>Use</th></tr>
+<tr><td>Stateless service, scale and roll out</td><td>Deployment</td></tr>
+<tr><td>Stable network identity, per-Pod disk</td><td>StatefulSet</td></tr>
+<tr><td>One per node</td><td>DaemonSet</td></tr>
+<tr><td>Run once to completion</td><td>Job</td></tr>
+<tr><td>On a schedule</td><td>CronJob</td></tr>
+</table>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Selectors are immutable on Deployments; changing them means recreating.</li>
+<li>Without <code>resources.requests</code> the scheduler is blind and nodes get overcommitted.</li>
+<li>Pods are killed with SIGTERM and a 30 s grace period (<code>terminationGracePeriodSeconds</code>). Handle SIGTERM and finish in-flight requests.</li>
+<li>Using <code>:latest</code> makes rollbacks meaningless since you cannot tell what version is running.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Apply the Deployment above (use <code>nginx:1.27</code> if you lack the image). Delete a Pod and watch the ReplicaSet replace it.</li>
+<li>Run <code>kubectl get rs</code>, change the image tag, apply again, and compare ReplicaSets before and after.</li>
+<li>Create a Job that runs <code>echo hello</code> and read its logs.</li>
+</ol></div>

@@ -1,0 +1,155 @@
+<h1>Alerting</h1>
+<p class="lead">An alert is a machine tapping a human on the shoulder: "come look at this now". Every alert spends a scarce resource, human attention, and often sleep. Good alerting wakes people only for problems that matter and that they can act on. Bad alerting trains them to ignore the pager.</p>
+
+<h2>What alerts are for</h2>
+<p>Dashboards are for exploring. Alerts exist for the narrow case where <strong>a human must act soon</strong>. If nothing needs doing, it should not page. If it can wait until morning, it should be a ticket or an email, not a page.</p>
+<table>
+<tr><th>Severity</th><th>Meaning</th><th>Channel</th></tr>
+<tr><td><strong>Page</strong> (critical)</td><td>User-visible impact now or imminent; needs immediate action</td><td>Phone call/push via PagerDuty or Opsgenie, 24/7</td></tr>
+<tr><td><strong>Ticket</strong> (warning)</td><td>Will cause trouble within days; needs action in business hours</td><td>Ticket queue / Slack channel</td></tr>
+<tr><td><strong>Info</strong></td><td>Context, trends</td><td>Dashboard, weekly review. Not an alert at all.</td></tr>
+</table>
+
+<h2>Alert on symptoms, not causes</h2>
+<div class="callout key"><strong>The most important rule</strong><p>Page on what <em>users experience</em> (errors, slowness, unavailability), not on internal causes (CPU, memory, one pod restarting). Causes are many and often harmless; symptoms are few and always matter. Use cause-based signals for dashboards and diagnosis.</p></div>
+<table>
+<tr><th>Cause-based (noisy)</th><th>Symptom-based (actionable)</th></tr>
+<tr><td>CPU &gt; 80% on web-3</td><td>p99 checkout latency &gt; 2 s for 10 min</td></tr>
+<tr><td>A pod restarted</td><td>5xx error ratio &gt; 2% for 5 min</td></tr>
+<tr><td>Disk 85% full</td><td>Disk predicted full in 4 hours (<code>predict_linear</code>) , because it needs action before it affects users</td></tr>
+<tr><td>Queue length &gt; 1000</td><td>Oldest message age &gt; 10 min (jobs are delayed)</td></tr>
+<tr><td>DB replica lag &gt; 1 s</td><td>Read-after-write errors reported / SLO burn</td></tr>
+</table>
+<p>Some cause-based alerts are still right: things that will become user-visible with no further warning (certificate expiring in 14 days, disk filling, backup job not run in 25 hours).</p>
+<p>Best of all, alert on <strong>SLO burn rate</strong>: how fast you are consuming your error budget (see the SLO lesson). It ties paging directly to user impact and handles severity automatically.</p>
+
+<h2>Prometheus alert rules</h2>
+<pre><code># alerts.yml
+groups:
+- name: checkout
+  rules:
+  - alert: HighErrorRatio
+    expr: |
+      sum(rate(http_requests_total{service="checkout",status=~"5.."}[5m]))
+        /
+      sum(rate(http_requests_total{service="checkout"}[5m])) &gt; 0.02
+    for: 5m                         # must hold for 5 minutes: filters blips
+    labels:
+      severity: page
+      team: payments
+    annotations:
+      summary: "Checkout 5xx ratio is {{ $value | humanizePercentage }}"
+      description: "More than 2% of checkout requests fail (5 min window)."
+      dashboard: "https://grafana.example.com/d/checkout"
+      runbook_url: "https://wiki.example.com/runbooks/checkout-high-errors"
+
+  - alert: DiskWillFillIn4Hours
+    expr: predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[6h], 4*3600) &lt; 0
+    for: 30m
+    labels: { severity: ticket }
+    annotations:
+      summary: "{{ $labels.instance }} root disk predicted full within 4h"
+
+  - alert: TargetDown
+    expr: up == 0
+    for: 3m
+    labels: { severity: page }</code></pre>
+<p>The <code>for:</code> clause is your noise filter: the condition must be continuously true that long before firing. Always include a <code>runbook_url</code> and a dashboard link.</p>
+
+<h2>Alertmanager</h2>
+<p>Prometheus evaluates rules and sends firing alerts to <strong>Alertmanager</strong>, which does what a raw rule cannot: <strong>deduplicate</strong>, <strong>group</strong> related alerts into one notification, <strong>route</strong> by labels to the right team and channel, <strong>silence</strong> during maintenance, and <strong>inhibit</strong> downstream alerts when a root-cause alert is firing.</p>
+<pre class="diagram">
+ Prometheus ──fires──▶ Alertmanager ─ group, dedupe, inhibit, silence ─▶ route by labels
+                                                              ├─ severity=page  ─▶ PagerDuty (phone)
+                                                              ├─ team=payments  ─▶ #payments-alerts (Slack)
+                                                              └─ severity=ticket ─▶ Jira / email
+</pre>
+<pre><code># alertmanager.yml
+route:
+  receiver: slack-default
+  group_by: [alertname, service]
+  group_wait: 30s          # wait to batch the first alerts of a group
+  group_interval: 5m       # then batch further changes
+  repeat_interval: 4h      # re-notify if still firing
+  routes:
+    - matchers: [ severity="page" ]
+      receiver: pagerduty-oncall
+    - matchers: [ severity="ticket" ]
+      receiver: jira
+
+inhibit_rules:
+  - source_matchers: [ alertname="ClusterDown" ]
+    target_matchers: [ severity=~"page|ticket" ]
+    equal: [ cluster ]      # if the cluster is down, mute everything inside it
+
+receivers:
+  - name: pagerduty-oncall
+    pagerduty_configs: [{ routing_key: "&lt;secret&gt;", send_resolved: true }]
+  - name: slack-default
+    slack_configs:
+      - channel: "#alerts"
+        send_resolved: true
+        title: "{{ .CommonAnnotations.summary }}"
+  - name: jira
+    webhook_configs: [{ url: "http://jira-bridge/alert" }]</code></pre>
+
+<h2>Paging and on-call</h2>
+<ul>
+<li>A <strong>rotation</strong> (weekly, "follow the sun" for global teams) with a primary and a secondary. Tools: PagerDuty, Opsgenie, Grafana OnCall, incident.io.</li>
+<li><strong>Escalation policy</strong>: if the primary does not acknowledge in 5-10 minutes, page the secondary, then the manager.</li>
+<li>Pages must be reachable: phone call/push that overrides Do Not Disturb, not just email.</li>
+<li><strong>Compensate and protect on-call</strong>: time off after rough nights, fair rotation, handover notes. Sustainable on-call is a reliability feature.</li>
+<li>Test the whole path: send a test page monthly. Add a <strong>dead man's switch</strong> alert (an always-firing alert that pages when it stops arriving) to detect a broken monitoring pipeline.</li>
+</ul>
+
+<h2>Runbooks</h2>
+<p>An alert without a runbook forces the on-caller to reinvent investigation at 3 a.m. Each page should link to a short document:</p>
+<pre><code># Runbook: HighErrorRatio (checkout)
+## What this means
+More than 2% of /checkout requests return 5xx for 5+ minutes.
+## Impact
+Customers cannot pay. Revenue loss ~ $X/min.
+## First steps (5 min)
+1. Open the dashboard (link). Is it one route, one region, one version?
+2. Check recent deploys / feature flags: `kubectl rollout history deploy/checkout`
+3. Check dependencies panel: payment provider, DB connections.
+## Mitigation
+- Bad deploy?  `kubectl rollout undo deploy/checkout`
+- DB saturated? Scale read replicas / enable the `degraded_mode` flag.
+- Provider outage? Switch to backup provider with flag `pay_fallback`.
+## Escalate
+If not mitigated in 15 min, page #payments-lead; open an incident (/incident).
+## Related
+Past incidents: INC-482, INC-517</code></pre>
+<p>Better still, automate the safe steps (self-healing, rollbacks) so a human is only needed when automation fails.</p>
+
+<h2>Avoiding alert fatigue</h2>
+<p>When people get paged constantly for non-issues, they mute, ignore, or burn out, and then miss the real one. Treat alert quality as engineering work.</p>
+<ul>
+<li><strong>Every page must be actionable and urgent.</strong> If the response is "ignore it" or "wait", delete or downgrade the alert.</li>
+<li><strong>Track metrics about alerts</strong>: pages per on-call shift (target: 0-2/day max, ideally far fewer), percent actionable, time-to-ack, repeated alerts. Review in a weekly on-call handoff.</li>
+<li><strong>Use <code>for:</code> durations</strong> and multi-window logic to ignore blips.</li>
+<li><strong>Group and inhibit</strong> so one outage is one page, not 40.</li>
+<li><strong>Fix the root cause</strong> of flappy alerts instead of tuning thresholds forever.</li>
+<li><strong>Prune</strong>: after each incident ask "which alerts were useless? what was missing?"</li>
+<li><strong>Prefer fewer, broader alerts</strong> on symptoms over many narrow ones.</li>
+<li><strong>Owner per alert</strong>: label with team; alerts route to the people who can fix them.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Static thresholds on traffic-dependent metrics (error <em>counts</em> instead of ratios).</li>
+<li>No alert for "no data": a dead service emits no errors. Alert on <code>absent()</code> or <code>up == 0</code>.</li>
+<li>Alerting on averages; use percentiles.</li>
+<li>Paging for things in non-prod.</li>
+<li>Silences that never expire.</li>
+<li>Alerts that fire but have no link to a dashboard or runbook.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Take your noisiest alert list (or invent one) and classify each as page / ticket / delete using "must a human act now?".</li>
+<li>Write a Prometheus rule for error ratio above 2% for 5 minutes. Trigger it with a test app that returns 500s and watch Alertmanager route it to a Slack webhook.</li>
+<li>Write a runbook for it following the template above.</li>
+<li>Add an inhibit rule so a <code>NodeDown</code> alert suppresses all alerts from that node.</li>
+</ol></div>

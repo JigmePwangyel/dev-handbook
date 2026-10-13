@@ -1,0 +1,113 @@
+<h1>Backups and Disaster Recovery</h1>
+<p class="lead">Nobody wants a backup; everybody wants a restore. A backup you have never restored is a hope, not a backup. This lesson covers what to protect, how often, how to store it safely, and how to choose a disaster recovery strategy that matches your budget and tolerance for downtime.</p>
+
+<h2>What can go wrong</h2>
+<ul>
+<li><strong>Human error</strong>: <code>DROP TABLE</code> on the wrong terminal, a bad migration, <code>terraform destroy</code> in the wrong workspace. The most common cause.</li>
+<li><strong>Software bugs</strong> corrupting data silently over days.</li>
+<li><strong>Hardware/provider failure</strong>: disk, host, availability zone or entire region.</li>
+<li><strong>Malicious</strong>: ransomware, or an attacker with your credentials deleting data <em>and</em> backups.</li>
+</ul>
+<p>Note that replication is <em>not</em> a backup. A replica faithfully copies your accidental <code>DELETE</code> within milliseconds.</p>
+
+<h2>RPO and RTO</h2>
+<pre class="diagram">
+ last good backup          DISASTER               service restored
+        │◀────── RPO ──────▶│◀──────── RTO ────────▶│
+        data you can lose            time you can be down
+</pre>
+<table>
+<tr><th>Term</th><th>Question it answers</th><th>Drives</th></tr>
+<tr><td><strong>RPO</strong> (Recovery Point Objective)</td><td>How much data loss is tolerable, measured in time?</td><td>Backup frequency, replication, WAL archiving</td></tr>
+<tr><td><strong>RTO</strong> (Recovery Time Objective)</td><td>How long can we be down?</td><td>DR architecture, automation, rehearsals</td></tr>
+</table>
+<p>Ask the business, not engineering, for the numbers, and show the price of each. "Zero data loss, zero downtime" costs an order of magnitude more than "up to 1 hour of data loss, 4 hours down".</p>
+
+<h2>The 3-2-1 rule (and the modern 3-2-1-1-0)</h2>
+<ul>
+<li><strong>3</strong> copies of your data (production plus two backups),</li>
+<li><strong>2</strong> different storage media/systems,</li>
+<li><strong>1</strong> copy off-site (another region or provider),</li>
+<li><strong>1</strong> copy immutable or offline (object lock / WORM, so ransomware or a compromised admin cannot delete it),</li>
+<li><strong>0</strong> errors after verification (restore tests).</li>
+</ul>
+<div class="callout warn"><strong>Separate the blast radius</strong><p>Backups in the same account, with credentials the production system can use to delete them, are one compromise away from gone. Use a separate account/project, write-only credentials for the backup job and S3 Object Lock in compliance mode.</p></div>
+
+<h2>What to back up</h2>
+<table>
+<tr><th>Asset</th><th>Method</th></tr>
+<tr><td>Databases</td><td>Logical dumps and/or physical base backups plus WAL archive for point-in-time recovery</td></tr>
+<tr><td>Uploaded files</td><td>Object storage versioning + cross-region replication</td></tr>
+<tr><td>Config, IaC, code</td><td>Git (it is your backup if everything is in it)</td></tr>
+<tr><td>Secrets and keys</td><td>Secret manager export procedure; encryption keys especially, since encrypted backups are useless without them</td></tr>
+<tr><td>Server state</td><td>Do not back up servers; rebuild them from IaC. Back up data only.</td></tr>
+</table>
+
+<h2>Postgres backup examples</h2>
+<pre><code># Logical dump: simple, portable, fine for small DBs. Restores are slow for big ones.
+pg_dump --format=custom --file=app-$(date +%F).dump "$DATABASE_URL"
+pg_restore --clean --if-exists --no-owner -d restore_test app-2026-10-05.dump
+
+# Encrypt and ship off-site
+pg_dump -Fc "$DATABASE_URL" \
+  | age -r age1ql3z...cmac8p \
+  | aws s3 cp - s3://acme-backups-eu/app/$(date +%F).dump.age
+
+# cron: nightly at 02:30
+30 2 * * * /opt/scripts/backup.sh >> /var/log/backup.log 2>&amp;1</code></pre>
+<p>For larger or stricter systems use <strong>physical backups with WAL archiving</strong> (pgBackRest, WAL-G, Barman). Base backup plus continuous WAL shipping gives <strong>point-in-time recovery (PITR)</strong>: restore to 14:31:59, one second before the bad deploy. Managed databases (RDS, Cloud SQL) provide this with a retention setting; check that it is on and long enough.</p>
+
+<h3>Schedules and retention</h3>
+<p>A typical grandfather-father-son policy: daily for 14 days, weekly for 8 weeks, monthly for 12 months. Retention should cover how long it might take you to <em>notice</em> corruption. Delete on schedule too: old backups are also a data-protection liability (GDPR erasure requests).</p>
+
+<h2>Restore testing: the part everyone skips</h2>
+<ol>
+<li>Automate a restore into a scratch environment weekly or monthly.</li>
+<li>Run sanity queries (row counts, latest timestamps, checksums) and fail loudly if they do not match expectations.</li>
+<li>Record how long it took. That number is your <em>real</em> RTO, and it usually surprises people.</li>
+<li>Do a full game day at least twice a year: pretend the database is gone, follow the runbook, with someone who did not write it.</li>
+<li>Alert on backup <em>absence</em>, not only failure (a dead cron job sends no errors). Use a dead-man's-switch such as a healthchecks.io ping at the end of the job.</li>
+</ol>
+<pre><code>#!/usr/bin/env bash
+set -euo pipefail
+./backup.sh
+curl -fsS -m 10 --retry 3 https://hc-ping.com/YOUR-UUID    # only reached on success</code></pre>
+
+<h2>Disaster recovery strategies</h2>
+<p>AWS's classification is a handy spectrum: pay more to recover faster.</p>
+<pre class="diagram">
+ Cost / complexity  ──────────────────────────────────────────────────────▶
+ Backup &amp; restore   Pilot light        Warm standby        Multi-site active-active
+ RTO: hours-days    RTO: tens of min    RTO: minutes        RTO: ~zero
+ RPO: hours         RPO: minutes        RPO: seconds        RPO: ~zero
+</pre>
+<table>
+<tr><th>Strategy</th><th>What runs in the DR region</th><th>Recovery</th><th>Use when</th></tr>
+<tr><td>Backup and restore</td><td>Nothing; only backups copied there</td><td>Provision infra from IaC, restore data</td><td>Internal tools, tolerant business, tight budget</td></tr>
+<tr><td>Pilot light</td><td>Core data layer replicating (DB replica); app servers defined but off</td><td>Scale up compute, promote DB, switch DNS</td><td>Moderate RTO needs</td></tr>
+<tr><td>Warm standby</td><td>Full but scaled-down copy, always running and tested</td><td>Scale up, switch traffic</td><td>Revenue-critical services</td></tr>
+<tr><td>Active-active</td><td>Full capacity in 2+ regions serving users</td><td>Traffic shifts automatically</td><td>Highest availability; accept data-consistency complexity and 2x cost</td></tr>
+</table>
+<p>Active-active is hard because of the database: you need multi-writer conflict handling (DynamoDB global tables, Spanner, CockroachDB) or careful regional partitioning. Many teams find that a well-rehearsed warm standby is the sweet spot.</p>
+
+<h3>Availability zones versus regions</h3>
+<p>Multi-AZ inside a region protects against a data centre failure and is cheap and mostly automatic: do this first. Multi-region protects against regional outages and is a bigger investment. Match to need; most outages are caused by bad deploys and config, which neither fixes.</p>
+
+<h2>Disaster recovery runbook essentials</h2>
+<ul>
+<li>Who declares a disaster, and how are people reached if Slack is down?</li>
+<li>Step-by-step restore commands, tested, stored somewhere that survives the disaster (printed or in a different provider).</li>
+<li>DNS TTLs low enough (60-300s) for failover to be quick.</li>
+<li>Dependencies: third-party APIs, email, auth provider. Does DR work if they do too?</li>
+<li>Credentials to reach DR resources that do not depend on the failed system (break-glass accounts).</li>
+<li>Failback plan: moving back is its own migration.</li>
+</ul>
+
+<div class="callout key"><strong>Remember</strong><p>The unit of success is a <em>timed, successful restore performed by someone other than the author</em>. Everything else (cron jobs, green dashboards, S3 buckets full of files) is a proxy.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write a script that dumps a local Postgres DB, encrypts it with <code>age</code> and restores it into a fresh container, then asserts a row count. Time it.</li>
+<li>Write down RPO and RTO targets for a service you run. Does your current setup meet them? What is the cheapest change that would?</li>
+<li>Enable S3 versioning plus Object Lock on a test bucket and try (and fail) to delete a locked object.</li>
+</ol></div>

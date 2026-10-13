@@ -1,0 +1,119 @@
+<h1>Production Readiness Checklist</h1>
+<p class="lead">"Are we ready to go live?" is answered best with a checklist, not a feeling. Airline pilots use them because memory fails under pressure; so do mature engineering teams. Use this as a launch review: every row should be a tick, a conscious "not needed, because...", or a tracked ticket with an owner.</p>
+
+<h2>How to use this page</h2>
+<ul>
+<li>Run it as a review meeting 1-2 weeks before launch, not the night before.</li>
+<li>Be honest about "partial". The goal is visible risk, not a perfect score.</li>
+<li>Adapt by criticality: an internal tool needs a lighter pass than a payment service.</li>
+<li>Re-run it after major architectural changes. Keep it in the repo and evolve it after each incident ("what would have caught this?").</li>
+</ul>
+
+<h2>1. Architecture and design</h2>
+<table>
+<tr><th>Check</th><th>Why it matters</th><th>Done when</th></tr>
+<tr><td>Application is stateless (12-factor)</td><td>Enables scaling and safe restarts</td><td>No local-disk state, sessions in a shared store</td></tr>
+<tr><td>Single points of failure identified</td><td>One failure should not be an outage</td><td>Diagram reviewed; accepted SPOFs documented</td></tr>
+<tr><td>Timeouts, retries with backoff and circuit breakers on all outbound calls</td><td>Prevents cascading failure</td><td>Reviewed in code and tested with a failing dependency</td></tr>
+<tr><td>Graceful shutdown (SIGTERM) and fast startup</td><td>Deploys without dropped requests</td><td>Verified by a rolling restart under load</td></tr>
+<tr><td>Health endpoints: liveness and readiness</td><td>Orchestrators route only to healthy instances</td><td>Readiness checks dependencies; liveness does not</td></tr>
+<tr><td>Capacity estimated and load tested</td><td>Know your limits</td><td>Test at 2x expected peak passes SLO</td></tr>
+</table>
+
+<h2>2. Deployment and release</h2>
+<table>
+<tr><th>Check</th><th>Why</th><th>Done when</th></tr>
+<tr><td>CI builds, tests and scans every commit</td><td>Fast feedback</td><td>Required status check on main</td></tr>
+<tr><td>Immutable, versioned artifact (image tag = commit SHA)</td><td>Reproducibility and rollback</td><td>No <code>latest</code> in production manifests</td></tr>
+<tr><td>Automated deploy, no manual SSH edits</td><td>Repeatable and auditable</td><td>Pipeline is the only path to prod</td></tr>
+<tr><td>Zero-downtime strategy (rolling, blue-green or canary)</td><td>Users do not notice releases</td><td>Tested under load</td></tr>
+<tr><td>Rollback is documented and rehearsed</td><td>Mean time to recovery</td><td>Someone rolled back in staging within 5 minutes</td></tr>
+<tr><td>Database migrations are backward compatible</td><td>Old and new code overlap during deploys</td><td>Expand/contract used; no long locks</td></tr>
+<tr><td>Feature flags for risky features</td><td>Decouple deploy from release</td><td>Kill switch exists</td></tr>
+<tr><td>Staging mirrors production</td><td>Realistic verification</td><td>Same config shape, similar data scale</td></tr>
+</table>
+
+<h2>3. Infrastructure</h2>
+<table>
+<tr><th>Check</th><th>Why</th><th>Done when</th></tr>
+<tr><td>All infrastructure defined as code</td><td>Rebuildable, reviewable</td><td>Can recreate environment from repo</td></tr>
+<tr><td>Multi-AZ / redundancy for critical tiers</td><td>Survive a host or zone failure</td><td>Killed an instance; service kept serving</td></tr>
+<tr><td>Autoscaling (or planned headroom) with sane min/max</td><td>Absorb spikes, cap cost</td><td>Tested with a spike run</td></tr>
+<tr><td>DNS TTLs and domain/cert expiry owned and monitored</td><td>Expired certs are embarrassing outages</td><td>Auto-renewal + expiry alert at 14 days</td></tr>
+<tr><td>Resource limits set (CPU/memory/file descriptors)</td><td>Noisy neighbours, OOM chaos</td><td>Limits defined; OOM behaviour known</td></tr>
+<tr><td>Cloud quotas and service limits checked</td><td>Hitting a quota during launch</td><td>Headroom confirmed</td></tr>
+<tr><td>Cost alerts and budgets</td><td>Surprise bills</td><td>Budget alarm configured</td></tr>
+</table>
+
+<h2>4. Security</h2>
+<table>
+<tr><th>Check</th><th>Why</th><th>Done when</th></tr>
+<tr><td>TLS everywhere, HSTS, modern ciphers</td><td>Confidentiality and integrity</td><td>SSL Labs grade A</td></tr>
+<tr><td>Secrets in a manager, none in git or images</td><td>Credential leaks</td><td>Secret scan clean; rotation tested</td></tr>
+<tr><td>Least privilege IAM, DB users, service accounts</td><td>Limit blast radius</td><td>No wildcard admin roles for workloads</td></tr>
+<tr><td>Only necessary ports open; DB and cache private</td><td>Reduce attack surface</td><td>External port scan matches intent</td></tr>
+<tr><td>SSH key-only, no root login, MFA on cloud and Git accounts</td><td>Account takeover is the top threat</td><td>Enforced org-wide</td></tr>
+<tr><td>Dependency and image scanning in CI</td><td>Known CVEs</td><td>Critical findings block merge</td></tr>
+<tr><td>Security headers and rate limiting on public endpoints</td><td>Abuse and common web attacks</td><td>Verified with header scan and test loop</td></tr>
+<tr><td>Auth/authorization tests for access control</td><td>Broken access control is #1 risk</td><td>Automated tests for cross-tenant access</td></tr>
+<tr><td>Audit logging enabled (cloud + app)</td><td>Investigations</td><td>Logs retained off-box</td></tr>
+<tr><td>Patch process defined</td><td>Unpatched hosts</td><td>Unattended upgrades or scheduled image rebuilds</td></tr>
+</table>
+
+<h2>5. Observability</h2>
+<table>
+<tr><th>Check</th><th>Why</th><th>Done when</th></tr>
+<tr><td>Structured logs to a central place</td><td>Debug without SSH</td><td>Can search by request/trace ID</td></tr>
+<tr><td>Metrics: latency, traffic, errors, saturation</td><td>See health at a glance</td><td>Dashboard per service</td></tr>
+<tr><td>Distributed tracing (where multiple services)</td><td>Find slow hops</td><td>Trace propagates through all services</td></tr>
+<tr><td>External uptime check from outside your network</td><td>Catches "everything green but site down"</td><td>Probe on user-facing URL</td></tr>
+<tr><td>SLOs defined for key user journeys</td><td>Objective definition of "healthy"</td><td>Error budget tracked</td></tr>
+<tr><td>Alerts are actionable, symptom-based and routed to on-call</td><td>Avoid alert fatigue and silence</td><td>Every alert has a runbook link; tested page delivery</td></tr>
+<tr><td>Error tracking (Sentry or similar)</td><td>Application exceptions with context</td><td>Releases tagged; source maps uploaded</td></tr>
+</table>
+
+<h2>6. Data and recovery</h2>
+<table>
+<tr><th>Check</th><th>Why</th><th>Done when</th></tr>
+<tr><td>Automated backups, off-site, immutable copy</td><td>3-2-1 rule</td><td>Backup job monitored with dead-man's switch</td></tr>
+<tr><td>Restore tested and timed</td><td>Backups are unproven until restored</td><td>Restore drill documented with real RTO</td></tr>
+<tr><td>RPO/RTO agreed with the business</td><td>Sets expectations and budget</td><td>Written targets, architecture matches</td></tr>
+<tr><td>Point-in-time recovery enabled for DB</td><td>Recover from bad deploys</td><td>PITR retention covers detection time</td></tr>
+<tr><td>Connection pooling and limits configured</td><td>Avoid connection exhaustion</td><td>Total pool size less than DB max</td></tr>
+<tr><td>Disk-space alerts on DB and logs</td><td>Full disk = outage</td><td>Alert at 70-80%</td></tr>
+<tr><td>Data retention and privacy compliance (GDPR etc.)</td><td>Legal exposure</td><td>Deletion process and data map exist</td></tr>
+</table>
+
+<h2>7. Operations and people</h2>
+<table>
+<tr><th>Check</th><th>Why</th><th>Done when</th></tr>
+<tr><td>On-call rota and escalation path</td><td>Someone answers at 3 a.m.</td><td>Schedule published; paging tested</td></tr>
+<tr><td>Runbooks for top failure modes</td><td>Faster, calmer incident response</td><td>Linked from alerts, reviewed by a newcomer</td></tr>
+<tr><td>Incident process and comms template</td><td>Roles and status updates</td><td>Incident commander role defined; status page ready</td></tr>
+<tr><td>Blameless postmortem practice</td><td>Learn instead of blame</td><td>Template and review cadence agreed</td></tr>
+<tr><td>Architecture diagram and service ownership documented</td><td>Know who to call</td><td>Catalog entry with owner and repo</td></tr>
+<tr><td>Launch plan: timing, staged rollout, comms, rollback owner</td><td>Controlled go-live</td><td>Avoid Friday-evening launches; war-room scheduled</td></tr>
+<tr><td>Dependencies' SLAs and support contacts known</td><td>Third parties fail too</td><td>Fallback behaviour defined</td></tr>
+</table>
+
+<h2>8. Final go-live gate</h2>
+<ol>
+<li>Dry run of the full deploy in staging, including rollback.</li>
+<li>Load test passed on production-like environment.</li>
+<li>Restore drill completed this quarter.</li>
+<li>No open critical security findings; no known data-loss bugs.</li>
+<li>Dashboards and alerts live <em>before</em> traffic, not after.</li>
+<li>Rollback owner and decision criteria named ("if error rate &gt; 2% for 5 min we roll back").</li>
+<li>Staged traffic: internal users, then 1%, 10%, 50%, 100%, watching metrics at each step.</li>
+</ol>
+
+<div class="callout tip"><strong>After launch</strong><p>Hypercare for the first days: watch dashboards, hold a short daily review, and capture surprises as checklist improvements. Production readiness is not a one-time gate but a habit.</p></div>
+
+<div class="callout key"><strong>Scale the checklist to the stakes</strong><p>A hobby project may take only the bold basics: HTTPS, backups with a restore test, an uptime check, secrets out of git, and a rollback path. Add rows as the consequences of failure grow.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Copy this checklist into a spreadsheet and score a real service you run: 0 = absent, 1 = partial, 2 = done. Sort by lowest score times business impact.</li>
+<li>Pick the top three gaps and write tickets with owners and dates.</li>
+<li>Run a 30-minute game day: kill one instance and break one dependency in staging. Did alerts fire? Did the runbook work?</li>
+</ol></div>

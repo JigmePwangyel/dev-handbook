@@ -1,0 +1,142 @@
+<h1>Testing and Quality Gates</h1>
+<p class="lead">A pipeline is only as trustworthy as the checks in it. A quality gate is an automated decision: "this change may proceed, or it may not". This lesson covers which checks to run, what each is good for, and how to turn them into gates that protect production without strangling developers.</p>
+
+<h2>Why gates?</h2>
+<p>Without automatic gates, quality depends on individual diligence: reviewers noticing a missing test, someone remembering to run the security scan, a manager eyeballing coverage. Humans are inconsistent, especially at 6 p.m. on release day. Gates move the minimum bar from "people usually remember" to "the merge button is disabled until it is met". That is what lets you deploy often without gambling.</p>
+
+<h2>The layers of checking</h2>
+<pre class="diagram">
+ cheap/fast ─────────────────────────────────────────────────────▶ expensive/slow
+ format  lint  types  unit   integration  contract  e2e   perf  DAST  manual/exploratory
+ │       │     │      │      │            │         │     │     │
+ └───────┴─────┴──────┴──────┴─ every push ─────────┘     └ nightly / pre-release ┘
+ security (parallel): secrets scan · dependency scan · SAST · container/IaC scan · SBOM
+</pre>
+
+<h2>Functional testing</h2>
+<table>
+<tr><th>Type</th><th>Scope</th><th>Runs against</th><th>Example</th></tr>
+<tr><td>Unit</td><td>One function/class, dependencies faked</td><td>Nothing external</td><td>Price calculator returns correct total with discount</td></tr>
+<tr><td>Integration</td><td>Component plus real collaborator (DB, queue, HTTP)</td><td>Containers started in CI (Testcontainers, service containers)</td><td>Repository saves and loads an order from real Postgres</td></tr>
+<tr><td>Contract</td><td>Agreement between services</td><td>Pact / OpenAPI schema checks</td><td>Consumer's expected response shape still matches provider</td></tr>
+<tr><td>End-to-end (E2E)</td><td>Whole system through the UI/API</td><td>Deployed staging or preview env</td><td>Playwright logs in, adds to cart, pays with test card</td></tr>
+<tr><td>Smoke</td><td>Tiny set of "is it alive" checks</td><td>Right after every deploy</td><td><code>GET /healthz</code> returns 200; login page loads</td></tr>
+<tr><td>Performance / load</td><td>Latency and throughput under load</td><td>Staging, scheduled</td><td>k6: p95 &lt; 300 ms at 200 rps</td></tr>
+</table>
+<p>Keep the pyramid shape: many unit, some integration, a handful of E2E for critical journeys (sign-up, checkout). Use <strong>Testcontainers</strong> or CI service containers so integration tests run against real databases rather than mocks that lie about SQL behavior.</p>
+
+<h3>Test quality beats test quantity</h3>
+<ul>
+<li>Deterministic: no sleeping for arbitrary times, no dependence on test order, the current date, or random data without a seed.</li>
+<li>Isolated: each test creates and cleans its own data.</li>
+<li>Meaningful: assert on behavior, not implementation details.</li>
+<li>Fast: slow tests are tests nobody runs.</li>
+</ul>
+
+<h2>Code quality: lint, format, types</h2>
+<ul>
+<li><strong>Formatters</strong> (Prettier, Black, gofmt): remove style debates; run in "check" mode in CI (<code>prettier --check .</code>).</li>
+<li><strong>Linters</strong> (ESLint, ruff, golangci-lint, Checkstyle): catch bug patterns, unused code, bad practices.</li>
+<li><strong>Type checkers</strong> (TypeScript <code>tsc --noEmit</code>, mypy, pyright): eliminate whole bug classes before runtime.</li>
+<li><strong>Other linters:</strong> <code>hadolint</code> (Dockerfile), <code>actionlint</code> (workflows), <code>shellcheck</code> (bash), <code>yamllint</code>, <code>tflint</code> (Terraform), <code>commitlint</code>.</li>
+</ul>
+<p>These are the cheapest gate: run them first, fail in seconds.</p>
+
+<h2>Coverage</h2>
+<p>Code coverage measures which lines/branches the tests execute. It is useful as a <em>negative</em> signal (untested code is definitely unprotected) and weak as a <em>positive</em> one (executing a line is not the same as asserting it works).</p>
+<ul>
+<li>Set a <strong>floor</strong> (e.g. fail if overall coverage drops below 70%) and, more usefully, a <strong>patch/diff coverage</strong> requirement (new code must be at least 80% covered) via Codecov, Coveralls or SonarQube. This prevents decline without demanding the legacy code be fixed at once.</li>
+<li>Do not chase 100%. Past a point it incentivises meaningless tests (Goodhart's law: when a measure becomes a target it ceases to be a good measure).</li>
+<li><strong>Mutation testing</strong> (Stryker, PIT, mutmut) tells you whether tests would actually notice injected bugs; run it periodically on critical modules.</li>
+</ul>
+<pre><code># Jest: fail the build below thresholds (package.json)
+"jest": {
+  "coverageThreshold": {
+    "global": {"branches": 70, "functions": 75, "lines": 80, "statements": 80}
+  }
+}</code></pre>
+
+<h2>Security scanning ("shift left")</h2>
+<p>Finding a vulnerability in a PR costs minutes; finding it in production costs an incident. Layer these automated scanners:</p>
+<table>
+<tr><th>Kind</th><th>What it checks</th><th>When</th><th>Tools</th></tr>
+<tr><td>Secret scanning</td><td>Credentials in code and history</td><td>Pre-commit, every PR</td><td>gitleaks, trufflehog, GitHub push protection</td></tr>
+<tr><td>SCA / dependency scanning</td><td>Known CVEs in libraries</td><td>Every PR + daily schedule (new CVEs appear after merge)</td><td>Dependabot, Renovate, <code>npm audit</code>, OSV-Scanner, Snyk, Trivy</td></tr>
+<tr><td>SAST (static)</td><td>Insecure patterns in your own code (injection, weak crypto)</td><td>Every PR</td><td>CodeQL, Semgrep, SonarQube</td></tr>
+<tr><td>Container / image scanning</td><td>OS packages and libs in the image</td><td>After build, before publish; plus registry rescans</td><td>Trivy, Grype, ECR/Artifact Registry scanning</td></tr>
+<tr><td>IaC scanning</td><td>Misconfigurations (open S3, 0.0.0.0/0 SG)</td><td>Every PR touching infra</td><td>Checkov, tfsec/Trivy, kube-linter</td></tr>
+<tr><td>DAST (dynamic)</td><td>Attacks a running app (XSS, auth flaws)</td><td>Against staging, nightly or pre-release</td><td>OWASP ZAP, Burp</td></tr>
+<tr><td>License compliance</td><td>Incompatible OSS licenses</td><td>Every PR</td><td>FOSSA, <code>license-checker</code>, Trivy</td></tr>
+</table>
+<h3>SAST vs DAST</h3>
+<p><strong>SAST</strong> reads source without running it: early, precise about location, but prone to false positives and blind to runtime/config issues. <strong>DAST</strong> probes the running app from outside like an attacker: finds real exploitable behavior, but slower, needs a deployed environment, and gives less precise code locations. They are complementary.</p>
+<pre><code># Trivy: fail the pipeline on HIGH/CRITICAL fixable vulnerabilities in the image
+trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 ghcr.io/acme/shop:${SHA}
+
+# GitHub: CodeQL (SAST) workflow step
+- uses: github/codeql-action/init@v3
+  with: {languages: javascript-typescript}
+- uses: github/codeql-action/analyze@v3</code></pre>
+<div class="callout tip"><strong>Make security findings actionable</strong><p>A gate that blocks on 400 legacy findings gets disabled within a week. Start by blocking only on <em>new</em> findings and Critical/High severity with a fix available, keep a baseline for the rest, and burn it down on a schedule. Allow time-boxed, documented exceptions (a <code>.trivyignore</code> entry with an expiry and owner).</p></div>
+
+<h2>SBOM and provenance</h2>
+<p>A <strong>Software Bill of Materials</strong> is a machine-readable inventory of every component in your artifact (formats: SPDX, CycloneDX). Why: when the next Log4Shell lands, you can answer "which of our 300 services contain this library?" in seconds rather than days. Regulations and customers (US executive order 14028, EU Cyber Resilience Act) increasingly require them.</p>
+<pre><code># generate an SBOM for an image and attach it as an attestation
+syft ghcr.io/acme/shop:${SHA} -o spdx-json=sbom.spdx.json
+cosign attest --yes --predicate sbom.spdx.json --type spdxjson ghcr.io/acme/shop@${DIGEST}
+
+# keyless signing in CI (uses OIDC identity)
+cosign sign --yes ghcr.io/acme/shop@${DIGEST}</code></pre>
+<p>Pair the SBOM with <strong>signatures and provenance</strong> (SLSA, GitHub artifact attestations). Then a Kubernetes admission policy (Kyverno, Sigstore policy-controller) can refuse to run images that were not built and signed by your pipeline.</p>
+
+<h2>Gates in practice</h2>
+<h3>1. Required status checks (branch protection)</h3>
+<p>The enforcement point. In GitHub rulesets or branch protection, mark the jobs <code>lint</code>, <code>test</code>, <code>build</code>, <code>codeql</code> as required. The merge button stays disabled until they pass. Remember that a <em>skipped</em> job can count as passing; use a single final "gate" job that <code>needs</code> all others and is the only required check:</p>
+<pre><code>  ci-gate:
+    if: always()
+    needs: [lint, test, build, codeql]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job failed or was cancelled
+        run: |
+          echo '${{ toJSON(needs) }}' | jq -e 'all(.[]; .result == "success")'</code></pre>
+<h3>2. Review gates</h3>
+<p>Required approvals, CODEOWNERS, "dismiss stale approvals", and resolving all conversations.</p>
+<h3>3. Deployment gates</h3>
+<ul>
+<li>Environment protection rules (reviewers, wait timers, allowed branches).</li>
+<li>Smoke tests that must pass before traffic shifts; canary analysis comparing error rate and latency with the baseline (Argo Rollouts, Flagger).</li>
+<li>SLO/error-budget checks: block risky deploys if the budget is exhausted.</li>
+<li>Change-freeze calendars for holidays or peak events.</li>
+</ul>
+<h3>4. Quality platforms</h3>
+<p>SonarQube/SonarCloud, Codacy or CodeClimate combine coverage, duplication, complexity, code smells and security hotspots into a single "quality gate" with pass/fail conditions on new code ("clean as you code").</p>
+
+<h2>Designing a good gate</h2>
+<ul>
+<li><strong>Fast.</strong> A gate that takes 40 minutes is skipped or worked around.</li>
+<li><strong>Reliable.</strong> False failures train people to hit "re-run". Gate on stable checks; quarantine flaky ones.</li>
+<li><strong>Clear.</strong> Error messages say what to fix and how.</li>
+<li><strong>Proportionate.</strong> Block on what is truly dangerous; warn on the rest.</li>
+<li><strong>Incremental.</strong> Apply thresholds to new code, ratchet them up over time.</li>
+<li><strong>Owned.</strong> Someone maintains rules and exceptions.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Coverage worship:</strong> tests without assertions that exist to satisfy the percentage.</li>
+<li><strong>Scanner noise:</strong> unfiltered findings lead to alert fatigue and ignored results.</li>
+<li><strong>Gates on the wrong branch:</strong> checks that only run after merge cannot protect main.</li>
+<li><strong>Admin bypass</strong> of required checks becoming routine.</li>
+<li><strong>Only scanning at merge:</strong> new CVEs are published daily; schedule rescans of what you already shipped.</li>
+<li><strong>Mocked-everything tests</strong> that pass while the real integration is broken.</li>
+<li><strong>E2E suites on every PR</strong> that take 40 minutes and flake. Keep a small smoke subset on PRs; full suites after merge.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Add <code>npm audit --audit-level=high</code> (or <code>pip-audit</code>) and <code>gitleaks</code> as parallel jobs in your CI.</li>
+<li>Run <code>trivy image</code> on a public image such as <code>node:22</code> and compare with <code>node:22-alpine</code>. What do you learn about base image choice?</li>
+<li>Generate an SBOM with <code>syft</code> for one of your images and search it for a package name (<code>jq</code>).</li>
+<li>Configure branch protection to require your CI gate job, then open a PR that breaks lint and confirm you cannot merge.</li>
+</ol></div>

@@ -1,0 +1,136 @@
+<h1>Continuous Integration</h1>
+<p class="lead">Continuous Integration (CI) is the practice of merging every developer's work into a shared mainline frequently, and verifying each merge with an automated build and test run. It is a <em>behavior</em> first and a tool second.</p>
+
+<h2>The problem CI solves</h2>
+<p>Software is built by many people changing the same codebase. Two changes that each work alone can fail together. The longer they stay apart, the more expensive and mysterious the failure. Before CI, teams scheduled a painful "integration phase" near the end of a project. CI (coined by Grady Booch, made a core practice of Extreme Programming, and popularised by Martin Fowler's 2000 article) inverts this: integrate so often that integration is boring.</p>
+<p>Without CI, you learn that the build is broken from a teammate, from QA, or from a customer. With CI, you learn within minutes, from a bot, on your own pull request.</p>
+
+<h2>What CI actually is: the practices</h2>
+<p>Fowler's list, still the best definition, with modern commentary:</p>
+<ol>
+<li><strong>Maintain a single source repository.</strong> Everything needed to build lives in version control: code, tests, build scripts, DB migrations, pipeline definitions.</li>
+<li><strong>Automate the build.</strong> One command (<code>make build</code>, <code>npm ci &amp;&amp; npm run build</code>) produces the artifact from a clean checkout. If it takes tribal knowledge, CI cannot run it.</li>
+<li><strong>Make the build self-testing.</strong> Tests run as part of the build, and a failing test fails the build.</li>
+<li><strong>Everyone commits to the mainline every day.</strong> This is the "continuous" in CI. Branches that live for weeks mean you are not doing CI, even if a server builds them.</li>
+<li><strong>Every commit builds on an integration machine.</strong> A clean environment, not a developer laptop.</li>
+<li><strong>Keep the build fast.</strong> The classic target is under 10 minutes. Beyond that, developers stop waiting, batch their changes, and the feedback loop breaks.</li>
+<li><strong>Fix broken builds immediately.</strong> A red main is a stop-the-line event. Revert first, investigate second.</li>
+<li><strong>Test in a clone of production.</strong> Same OS, same runtime version, ideally the same container image.</li>
+<li><strong>Make it easy to get the latest artifact.</strong> Anyone, including QA and product, can fetch what the latest build produced.</li>
+<li><strong>Everyone can see what is happening.</strong> Status on the PR, in chat, on a dashboard.</li>
+</ol>
+
+<h2>The CI loop</h2>
+<pre class="diagram">
+ developer           Git host                CI runner (clean, ephemeral)
+ ┌───────┐  push/PR  ┌──────────┐  webhook  ┌───────────────────────────────┐
+ │ commit│──────────▶│ branch/PR│──────────▶│ 1 checkout   2 install deps    │
+ └───▲───┘           └────┬─────┘           │ 3 lint       4 unit tests      │
+     │                    │ status check    │ 5 build      6 integration test│
+     │  fix, push again   ▼                 └───────────────┬───────────────┘
+     └──────── red ◀── PR shows pass/fail ◀─────────────────┘
+                            │ green + review
+                            ▼
+                      merge to main ──▶ pipeline again ──▶ artifact (CD takes over)
+</pre>
+<p>The pipeline runs in two modes: on the PR (verifying the proposed change, often merged with the target branch) and on main after merge (producing the release artifact). Some teams use a <strong>merge queue</strong> (GitHub merge queue, GitLab merge trains) that tests each PR on top of the other queued changes, preventing "green PR, red main" races.</p>
+
+<h2>Fast feedback is the whole point</h2>
+<p>Think of CI as a latency problem. What matters is the time from <code>git push</code> to a trustworthy answer.</p>
+<table>
+<tr><th>Feedback time</th><th>Developer behavior</th></tr>
+<tr><td>&lt; 5 min</td><td>Waits, stays in flow, fixes immediately</td></tr>
+<tr><td>5-15 min</td><td>Starts something small, returns</td></tr>
+<tr><td>15-45 min</td><td>Context switches; PRs batch up; fixes cost more</td></tr>
+<tr><td>Hours</td><td>"Run CI" becomes a chore; people merge without waiting; trust erodes</td></tr>
+</table>
+<p>Techniques to stay fast: run cheap checks first (fail fast), parallelise independent jobs, cache dependencies, run only affected tests in large repos, split slow suites into shards, and move slow end-to-end tests to after-merge or nightly runs.</p>
+
+<h2>The test pyramid in a pipeline</h2>
+<pre class="diagram">
+              /\
+             /e2e\            few, slow, brittle   (minutes)  - critical user journeys
+            /──────\
+           /integr. \         some, medium         (seconds-min) - DB, queues, HTTP APIs
+          /──────────\
+         /   unit      \      many, fast, isolated (ms)  - pure logic
+        /────────────────\
+</pre>
+<p>Mike Cohn's pyramid says: write many fast unit tests, fewer integration tests, and very few end-to-end tests. In pipeline terms this maps onto ordering and cost:</p>
+<table>
+<tr><th>Layer</th><th>Runs</th><th>Speed</th><th>Catches</th><th>Flakiness risk</th></tr>
+<tr><td>Static analysis (lint, type check)</td><td>Every push, first</td><td>Seconds</td><td>Style, type errors, obvious bugs</td><td>Very low</td></tr>
+<tr><td>Unit</td><td>Every push</td><td>Seconds-1 min</td><td>Logic errors</td><td>Low</td></tr>
+<tr><td>Integration</td><td>Every PR</td><td>1-5 min</td><td>Wiring, SQL, serialization, contracts</td><td>Medium</td></tr>
+<tr><td>End-to-end / UI</td><td>After merge, on staging; a small smoke subset on PR</td><td>5-30 min</td><td>Whole-system regressions</td><td>High</td></tr>
+</table>
+<p>The anti-pattern is the <strong>ice cream cone</strong>: few unit tests, a mountain of slow UI tests, and a manual QA layer on top. It is slow, flaky and expensive. Invert it.</p>
+
+<h2>Build once, run everywhere</h2>
+<p>A pillar of both CI and CD: <strong>build the artifact once</strong>, then test and deploy that exact artifact in every environment. Do not rebuild for staging and again for production. A rebuild can pick up different dependency versions or a different base image, so "what we tested" is no longer "what we shipped".</p>
+<ul>
+<li>Make the artifact immutable and uniquely identified (Docker image tagged with the commit SHA, or a package with a version and checksum).</li>
+<li>Keep environment differences in <em>configuration</em> injected at deploy time (env vars, config maps, secrets), never in the build.</li>
+<li>Pin dependencies with lockfiles (<code>package-lock.json</code>, <code>poetry.lock</code>, <code>go.sum</code>) and use the strict install command (<code>npm ci</code>, not <code>npm install</code>).</li>
+</ul>
+
+<h2>A minimal CI job, explained</h2>
+<pre><code>name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest          # fresh VM for each run
+    timeout-minutes: 15             # never let a stuck job burn money
+    steps:
+      - uses: actions/checkout@v4   # get the code
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc # same Node as everyone else
+          cache: npm                # restore ~/.npm keyed on the lockfile
+      - run: npm ci                 # exact, reproducible install
+      - run: npm run lint
+      - run: npm test -- --coverage
+</code></pre>
+<p>Notice what this guarantees: a clean machine, pinned runtime, locked dependencies, and a result attached to the PR. The next lessons build this up properly.</p>
+
+<h2>Practices around the pipeline</h2>
+<ul>
+<li><strong>Run the same commands locally.</strong> Put steps in <code>npm</code> scripts or a <code>Makefile</code>/<code>justfile</code>; the pipeline calls them. Debugging a pipeline you can only run by pushing is miserable.</li>
+<li><strong>Pre-commit hooks</strong> (husky, lefthook, <code>pre-commit</code>) catch trivial failures before pushing. They complement CI; they never replace it because they can be skipped.</li>
+<li><strong>Treat the build as a team alarm.</strong> Whoever broke it fixes or reverts it; notify via chat.</li>
+<li><strong>Keep branches short</strong> and rebase/merge main frequently.</li>
+<li><strong>Test the database migrations</strong> in CI against a real database (service containers) so schema changes are validated every time.</li>
+<li><strong>Use ephemeral environments.</strong> Spin up a disposable preview deployment per PR for reviewers.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Nightly builds mistaken for CI.</strong> Feedback must be per-change.</li>
+<li><strong>Ignoring red builds</strong> or retrying until green. That hides flakiness and teaches the team that failures mean nothing.</li>
+<li><strong>Tests that depend on order, shared state, wall-clock time or the network.</strong> They pass locally and fail randomly in CI.</li>
+<li><strong>CI that differs from local and prod</strong> (different Node/Java version, missing system library).</li>
+<li><strong>Everything in one giant job.</strong> You cannot parallelise or tell what failed.</li>
+<li><strong>Too little coverage of what matters.</strong> A green build is only as meaningful as the tests behind it.</li>
+</ul>
+
+<div class="callout key"><strong>Definition of done</strong><p>A good rule: a change is not "done" when it works on your machine, or even when it is merged, but when it has passed CI on main and is available as a deployable artifact. CI turns "done" from an opinion into a fact.</p></div>
+
+<h2>Trade-offs</h2>
+<table>
+<tr><th>Choice</th><th>Benefit</th><th>Cost</th></tr>
+<tr><td>Hosted runners</td><td>Zero maintenance, clean VM each run</td><td>Per-minute cost, limited hardware, data leaves your network</td></tr>
+<tr><td>Self-hosted runners</td><td>Cheap at scale, custom hardware, private network access</td><td>You patch and secure them; risk of state leaking between jobs</td></tr>
+<tr><td>Test everything on every PR</td><td>Maximum safety</td><td>Slower, costlier</td></tr>
+<tr><td>Test only affected parts</td><td>Fast in monorepos</td><td>Needs dependency-graph tooling (Nx, Bazel, Turborepo)</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Take any small project and write down the exact commands to go from a clean clone to "tests pass". If you need more than three, script them.</li>
+<li>Add the minimal workflow above (adjusted to your language) and open a PR that deliberately breaks a test. Watch the check fail on the PR.</li>
+<li>Time your pipeline. List the three slowest steps and one way to speed up each.</li>
+</ol></div>

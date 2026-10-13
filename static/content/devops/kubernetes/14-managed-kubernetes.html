@@ -1,0 +1,94 @@
+<h1>Managed Kubernetes and Alternatives</h1>
+<p class="lead">Running the Kubernetes control plane yourself (etcd backups, certificate rotation, upgrades) is a job. Almost everyone should let a cloud provider do it. This lesson compares EKS, GKE and AKS, covers lightweight distributions, explains where the money goes, and lists genuine alternatives.</p>
+
+<h2>Why managed</h2>
+<p>With self-managed Kubernetes (kubeadm, kops, Talos, etc.) you own the control plane: HA etcd, API server certificates, version upgrades every few months (Kubernetes ships roughly three minor versions a year and supports each for about 14 months), security patches. Managed services run and patch the control plane for you, integrate with cloud IAM, load balancers and disks, and offer one-click upgrades. You still own your nodes' configuration, workloads, networking policy, add-ons and cost.</p>
+
+<h2>The big three</h2>
+<table>
+<tr><th></th><th>EKS (AWS)</th><th>GKE (Google)</th><th>AKS (Azure)</th></tr>
+<tr><td>Control plane cost</td><td>About $0.10/hour per cluster (about $73/month); extended-support versions cost more</td><td>Free tier credit covers one zonal or Autopilot cluster; otherwise about $0.10/hour</td><td>Free tier (no SLA); Standard tier about $0.10/hour with SLA</td></tr>
+<tr><td>Node options</td><td>Managed node groups, Fargate, Karpenter, EKS Auto Mode</td><td>Standard (you manage node pools) or Autopilot (Google manages nodes, billed per Pod)</td><td>Node pools, virtual nodes, Automatic mode</td></tr>
+<tr><td>Identity</td><td>IAM Roles for Service Accounts / Pod Identity</td><td>Workload Identity</td><td>Entra Workload Identity</td></tr>
+<tr><td>Networking</td><td>VPC CNI (Pods get VPC IPs)</td><td>VPC-native; Dataplane V2 (Cilium)</td><td>Azure CNI / overlay, Cilium option</td></tr>
+<tr><td>Reputation</td><td>Most flexible, most assembly required</td><td>Most polished, Kubernetes' birthplace, fast upgrades</td><td>Good if you live in Azure/Entra</td></tr>
+</table>
+<p>Prices change; always check the current pricing pages. The pragmatic choice is usually <strong>the cloud your company already uses</strong>, because the integration with IAM, networking, databases and billing outweighs small feature differences.</p>
+
+<h3>Example: create a cluster</h3>
+<pre><code># EKS with eksctl
+eksctl create cluster --name demo --region eu-west-1 \
+  --nodegroup-name std --node-type t3.medium --nodes 3
+
+# GKE
+gcloud container clusters create-auto demo --region europe-west1
+
+# AKS
+az aks create -g rg-demo -n demo --node-count 3 --enable-managed-identity
+
+# Fetch credentials into kubeconfig
+aws eks update-kubeconfig --name demo
+gcloud container clusters get-credentials demo --region europe-west1
+az aks get-credentials -g rg-demo -n demo</code></pre>
+<p>In real projects create clusters with Terraform (see the IaC section) so they are reviewable and reproducible.</p>
+
+<h2>Where the money goes</h2>
+<pre class="diagram">
+ Monthly bill
+ ├── Worker nodes (compute)        usually 60-80 percent. Over-provisioned requests = waste
+ ├── Control plane fee             small, fixed per cluster
+ ├── Load balancers                one per Service type=LoadBalancer; consolidate with Ingress/Gateway
+ ├── NAT gateways and egress       cross-AZ and internet traffic can be a nasty surprise
+ ├── Persistent disks and snapshots
+ └── Observability                 logs and metrics volume (often large)
+</pre>
+<p>Cost levers:</p>
+<ul>
+<li><strong>Right-size requests</strong> (VPA recommendations, tools like Kubecost or OpenCost): nodes are billed for what is reserved, not what is used.</li>
+<li><strong>Spot / preemptible instances</strong> for stateless and batch workloads; 60-90 percent cheaper, can be reclaimed with short notice. Use PDBs and multiple instance types.</li>
+<li><strong>Autoscaling</strong> (HPA + Karpenter or Cluster Autoscaler) so you do not pay for idle nodes at night.</li>
+<li><strong>Fewer clusters</strong>: each carries a fixed fee and overhead (monitoring, ingress). But too few risks blast radius. Many teams use one per environment or per region, not per app.</li>
+<li><strong>Reserved capacity / savings plans</strong> for the stable baseline.</li>
+<li>Keep traffic within an availability zone where sensible (topology-aware routing).</li>
+</ul>
+
+<div class="callout warn"><strong>Managed does not mean hands-off</strong><p>You must still upgrade clusters (providers force it eventually, and unsupported versions cost extra), patch node images, manage add-ons (CNI, CoreDNS, CSI drivers), restrict API server access, and secure workloads. Plan an upgrade routine, for example quarterly, tested on staging first.</p></div>
+
+<h2>Lightweight and edge distributions</h2>
+<ul>
+<li><strong>k3s</strong> (Rancher/SUSE): a single binary under 100 MB, SQLite or embedded etcd, includes Traefik, a service load balancer and local storage. Runs on a Raspberry Pi or a 1 GB VPS. Excellent for edge, homelabs, CI and small production setups.</li>
+<li><strong>k0s, MicroK8s, Talos Linux</strong>: other minimal options; Talos is an immutable, API-managed OS built only for Kubernetes.</li>
+<li><strong>OpenShift</strong>: Red Hat's enterprise distribution with a built-in developer platform and stricter defaults.</li>
+<li><strong>Rancher / Cluster API</strong>: manage many clusters uniformly.</li>
+</ul>
+<pre><code># k3s in one line on a fresh Linux VPS
+curl -sfL https://get.k3s.io | sh -
+sudo k3s kubectl get nodes</code></pre>
+
+<h2>Alternatives to Kubernetes</h2>
+<table>
+<tr><th>Option</th><th>What it is</th><th>Choose it when</th></tr>
+<tr><td><strong>AWS ECS (+ Fargate)</strong></td><td>AWS-native container orchestrator; task definitions and services; no control plane to manage</td><td>You are all-in on AWS and want simplicity. Not portable.</td></tr>
+<tr><td><strong>Google Cloud Run</strong></td><td>Serverless containers: give it an image, get an HTTPS URL, scales to zero, pay per request</td><td>HTTP services and jobs without cluster management. Great default for small teams.</td></tr>
+<tr><td><strong>AWS App Runner, Azure Container Apps</strong></td><td>Similar "run my container" platforms (Container Apps is built on Kubernetes + KEDA)</td><td>Same reasoning</td></tr>
+<tr><td><strong>HashiCorp Nomad</strong></td><td>Single-binary scheduler for containers, VMs and binaries; simple to run</td><td>Mixed workloads, small ops team, already using Consul/Vault. Smaller ecosystem.</td></tr>
+<tr><td><strong>Docker Swarm</strong></td><td>Built into Docker</td><td>Legacy; in maintenance mode, avoid for new projects.</td></tr>
+<tr><td><strong>PaaS</strong> (Fly.io, Render, Railway, Heroku)</td><td>Push code or image, get a running app</td><td>Product-focused teams; accept less control and higher unit cost at scale.</td></tr>
+<tr><td><strong>VM + Compose</strong></td><td>One or a few servers</td><td>Still perfectly valid for modest scale.</td></tr>
+</table>
+
+<h2>Decision guide</h2>
+<ul>
+<li>Fewer than about five services, small team: Cloud Run / ECS Fargate / PaaS.</li>
+<li>Many services, multiple teams, need for portability, operators and a vast ecosystem: managed Kubernetes.</li>
+<li>Edge, on-prem or tight budget: k3s.</li>
+<li>Strong need to avoid vendor lock-in: Kubernetes (but data gravity and managed databases lock you in anyway).</li>
+</ul>
+<div class="callout key"><strong>Pick the least complexity that meets the requirement</strong><p>You can always move to Kubernetes later because containers are portable; going the other way is rarer. The skills in this section remain valuable either way: declarative config, health checks, requests and limits, and rolling updates apply to every platform.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Install k3s (or k3d) and run the Deployment, Service and Ingress from earlier lessons. Traefik is already there.</li>
+<li>Deploy the same container to Cloud Run (<code>gcloud run deploy --image ... --allow-unauthenticated</code>) or ECS Fargate and compare the effort and what you gave up.</li>
+<li>Estimate the monthly cost of a 3-node cluster plus one load balancer on your cloud's pricing calculator.</li>
+</ol></div>

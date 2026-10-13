@@ -1,0 +1,48 @@
+<h1>The Big Picture: How Software Reaches Users</h1>
+<p class="lead">You wrote code on your laptop and it works. Between that and a stranger using it at 3 a.m. there is a long chain: build, package, ship, run, expose, monitor. DevOps is the discipline of making that chain fast, repeatable and safe.</p>
+
+<h2>The journey of a code change</h2>
+<pre class="diagram">
+ Developer laptop        Git host            CI server              Registry/Storage
+ ┌────────────┐  push  ┌─────────┐ trigger ┌────────────┐ publish ┌───────────────┐
+ │ write code │───────▶│ GitHub  │────────▶│ test+build │────────▶│ image/artifact│
+ └────────────┘        └─────────┘         └────────────┘         └───────┬───────┘
+                                                                          │ deploy (CD)
+ Users ──▶ DNS ──▶ Load balancer ──▶ Reverse proxy ──▶ App servers ◀──────┘
+                                                          │
+                                                   Database / cache
+                                     Logs + metrics ──▶ Monitoring ──▶ Alerts to humans
+</pre>
+<p>Every box is a topic in this handbook. You'll learn them bottom-up: servers first, then automation on top.</p>
+
+<h2>What "deployment" actually means</h2>
+<p>Deploying is taking a <strong>version</strong> of your software and making it the thing that real users hit. Concretely that means:</p>
+<ol>
+<li>Get the code/artifact onto a machine (physical, virtual, or a container host) that is reachable from the internet.</li>
+<li>Install its runtime and dependencies (Node, JVM, Python, libraries).</li>
+<li>Supply configuration and secrets (DB URL, API keys) <em>without</em> baking them into code.</li>
+<li>Start the process and keep it running (restart on crash, on reboot).</li>
+<li>Route traffic to it (DNS, TLS certificate, reverse proxy).</li>
+<li>Verify it works, and be able to undo it if it doesn't.</li>
+</ol>
+
+<div class="callout key"><strong>The core insight</strong><p>"It works on my machine" is the root problem DevOps solves. Your laptop and the server differ in OS, versions, config and data. Everything in this handbook — CI/CD, containers, IaC — exists to make environments <em>identical, automated and reproducible</em>.</p></div>
+
+<h2>The eras of deploying</h2>
+<table>
+<tr><th>Era</th><th>How</th><th>Pain</th></tr>
+<tr><td>Manual</td><td>SSH in, <code>git pull</code>, restart</td><td>Human error, no history, "snowflake" servers</td></tr>
+<tr><td>Scripted</td><td>Bash / Capistrano scripts</td><td>Scripts drift; works on one server only</td></tr>
+<tr><td>CI/CD</td><td>Pipeline builds, tests, deploys on every push</td><td>Pipelines must be maintained</td></tr>
+<tr><td>Containers</td><td>Ship the app <em>plus</em> its environment</td><td>Need orchestration at scale</td></tr>
+<tr><td>Orchestration + IaC + GitOps</td><td>Declare desired state; the system converges to it</td><td>Complexity; steep learning curve</td></tr>
+</table>
+
+<h2>Roles and vocabulary</h2>
+<ul>
+<li><strong>Dev</strong> writes features; <strong>Ops</strong> keeps systems running. Historically they were separate teams with opposing incentives (change vs. stability). DevOps merges the responsibilities.</li>
+<li><strong>SRE</strong> (Site Reliability Engineering): Google's take — treat operations as a software problem with measurable reliability targets.</li>
+<li><strong>Platform engineering</strong>: build internal tooling so product developers can deploy themselves.</li>
+</ul>
+
+<div class="callout tip"><strong>How to read this handbook</strong><p>Follow the sidebar in order if you are new. Each lesson ends with things to try. Spin up a cheap VPS or use Docker locally — you learn deployment by deploying.</p></div>

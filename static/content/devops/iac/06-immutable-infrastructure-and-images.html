@@ -1,0 +1,187 @@
+<h1>Immutable Infrastructure and Golden Images</h1>
+<p class="lead">Instead of logging into servers to patch and tweak them, build a fresh, fully configured image, deploy it, and throw the old servers away. Immutable infrastructure eliminates drift by never modifying a running machine. Packer is the tool that builds the images.</p>
+
+<h2>Pets vs cattle</h2>
+<p>A famous analogy (Bill Baker, popularised by Randy Bias):</p>
+<table>
+<tr><th></th><th>Pets (mutable)</th><th>Cattle (immutable)</th></tr>
+<tr><td>Naming</td><td><code>zeus</code>, <code>db-prod-main</code>: unique names</td><td><code>web-7f3a9</code>: numbered, interchangeable</td></tr>
+<tr><td>When sick</td><td>Nursed back to health by hand</td><td>Replaced with a fresh one</td></tr>
+<tr><td>Changes</td><td>SSH in, patch, tweak in place</td><td>Build a new image, roll it out</td></tr>
+<tr><td>Rebuilding</td><td>Scary, undocumented</td><td>Routine, automated</td></tr>
+<tr><td>Over time</td><td>Drift, snowflakes</td><td>Always matches the image</td></tr>
+</table>
+<div class="callout key"><strong>The rule</strong><p>Never fix a server; fix the image (or code) and replace the server. If you can not destroy a server without fear, it is a pet.</p></div>
+
+<h2>Mutable vs immutable deployment</h2>
+<pre class="diagram">
+ MUTABLE                                   IMMUTABLE
+ server v1 ─ ssh, apt upgrade, edit ─▶ server v1'   image v1 ─▶ [server][server][server]
+ server v1' ─ more tweaks ─▶ server v1''            build image v2 (new, tested, versioned)
+ (state unknowable after a year)                    launch [v2][v2][v2], shift traffic, destroy v1
+                                                    rollback = start the old image again
+</pre>
+<p>Benefits: identical servers everywhere, painless rollback (the previous image still exists), fast scale-out because the machine boots already configured (no 10-minute install script during autoscaling), security (no SSH needed; compromised hosts are replaced; patching is a rebuild) and testability (test the exact artifact you ship).</p>
+<p>Containers are the most common immutable unit today: a Docker image is an immutable artifact and Kubernetes replaces Pods rather than modifying them. The same philosophy applies to VMs and to the nodes beneath your containers.</p>
+
+<h2>Golden images</h2>
+<p>A <strong>golden image</strong> is a pre-built machine image (AWS AMI, GCP image, Azure image, VMware template) containing the OS, patches, agents (monitoring, logging, security), your runtime and often the application itself. Typical layering:</p>
+<ol>
+<li><strong>Base image</strong>: hardened OS plus common agents; rebuilt weekly/monthly for patches by a platform team.</li>
+<li><strong>Application image</strong>: built on the base for each release; contains the app. Built by CI.</li>
+</ol>
+<p>Runtime differences (database URL, secrets) are injected at boot through instance metadata, user-data, environment or a secret manager, not baked in. Per-environment images defeat the purpose: build once, promote the same image through staging to prod.</p>
+
+<h2>Packer</h2>
+<p>HashiCorp Packer automates image creation: launch a temporary VM from a source image, run provisioners to configure it, snapshot it as a new image, and clean up. It is itself declarative HCL and works across clouds (AWS, GCP, Azure, VMware, QEMU, Docker).</p>
+<h3>Example: an AMI with nginx and the app baked in</h3>
+<pre><code>packer {
+  required_plugins {
+    amazon = {
+      source  = "github.com/hashicorp/amazon"
+      version = "~&gt; 1.3"
+    }
+  }
+}
+
+variable "app_version" {
+  type = string
+}
+
+locals {
+  timestamp = formatdate("YYYYMMDD-hhmm", timestamp())
+}
+
+source "amazon-ebs" "web" {
+  region        = "eu-west-1"
+  instance_type = "t3.small"
+  ssh_username  = "ubuntu"
+  ami_name      = "shop-web-${var.app_version}-${local.timestamp}"
+
+  source_ami_filter {
+    filters = {
+      name                = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+      root-device-type    = "ebs"
+      virtualization-type = "hvm"
+    }
+    owners      = ["099720109477"]
+    most_recent = true
+  }
+
+  tags = {
+    App     = "shop"
+    Version = var.app_version
+    Base    = "ubuntu-24.04"
+  }
+}
+
+build {
+  sources = ["source.amazon-ebs.web"]
+
+  provisioner "shell" {
+    inline = [
+      "cloud-init status --wait",
+      "sudo apt-get update -y",
+      "sudo apt-get upgrade -y",
+      "sudo apt-get install -y nginx"
+    ]
+  }
+
+  provisioner "ansible" {                 # reuse the roles from the previous lesson
+    playbook_file = "./ansible/site.yml"
+    extra_arguments = ["--extra-vars", "app_version=${var.app_version}"]
+  }
+
+  provisioner "file" {
+    source      = "dist/shop.tar.gz"
+    destination = "/tmp/shop.tar.gz"
+  }
+
+  provisioner "shell" {
+    inline = [
+      "sudo tar -xzf /tmp/shop.tar.gz -C /opt",
+      "sudo systemctl enable shop",
+      "sudo rm -rf /tmp/* /home/ubuntu/.ssh/authorized_keys"   # leave no build residue
+    ]
+  }
+
+  post-processor "manifest" {
+    output = "manifest.json"             # records the resulting AMI ID for downstream steps
+  }
+}</code></pre>
+<pre><code>packer init .
+packer validate -var app_version=2.3.1 .
+packer build -var app_version=2.3.1 .</code></pre>
+
+<h2>Using the image</h2>
+<p>Terraform looks up the newest matching image and launches instances from it. Changing the image changes the launch template, which triggers a rolling replacement (an AWS Auto Scaling Group instance refresh).</p>
+<pre><code>data "aws_ami" "shop" {
+  most_recent = true
+  owners      = ["self"]
+  filter {
+    name   = "name"
+    values = ["shop-web-2.3.1-*"]
+  }
+}
+
+resource "aws_launch_template" "web" {
+  name_prefix   = "shop-web-"
+  image_id      = data.aws_ami.shop.id
+  instance_type = "t3.small"
+}
+
+resource "aws_autoscaling_group" "web" {
+  min_size            = 3
+  max_size            = 10
+  vpc_zone_identifier = var.private_subnet_ids
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = "$Latest"
+  }
+  instance_refresh {
+    strategy = "Rolling"
+    preferences { min_healthy_percentage = 66 }
+  }
+}</code></pre>
+<pre class="diagram">
+ git push ─▶ CI builds app ─▶ Packer bakes AMI ─▶ test the image (boot, smoke test)
+        ─▶ Terraform updates launch template ─▶ ASG rolling instance refresh ─▶ old instances terminated
+</pre>
+
+<h2>Practicalities</h2>
+<ul>
+<li><strong>Rebuild regularly</strong> (at least weekly) even without app changes to pick up OS security patches. Old images rot.</li>
+<li><strong>Version and tag</strong> every image; keep the last few for rollback; garbage-collect the rest (storage costs).</li>
+<li><strong>Test images</strong>: boot one in CI and run smoke tests or InSpec/Goss checks.</li>
+<li><strong>Harden</strong>: CIS benchmarks, disable password SSH, minimal packages, run vulnerability scans (Trivy, Inspector).</li>
+<li><strong>Share</strong> images across accounts/regions with copy/share settings in the builder.</li>
+<li><strong>Logs and data</strong> must live off the instance (central logging, managed databases, attached volumes) because instances are disposable.</li>
+</ul>
+
+<h2>Trade-offs and pitfalls</h2>
+<ul>
+<li><strong>Slower change cycle</strong> than editing a server: a full bake takes minutes. Mitigate with layered images and caching. For a typo fix, pets are faster; for fleet consistency, cattle win.</li>
+<li><strong>Stateful systems</strong> (databases) resist the model. Keep data on separate volumes or managed services; replace the compute, keep the disk.</li>
+<li><strong>Debugging</strong> with no SSH is harder: invest in logs, metrics, and a break-glass access path (SSM Session Manager) that is audited.</li>
+<li><strong>Secrets baked into images</strong> leak to everyone who can launch the image. Inject at runtime.</li>
+<li><strong>Image sprawl</strong>: without lifecycle policies you accumulate hundreds of AMIs.</li>
+<li>Many modern teams skip VM images for apps entirely: containers on Kubernetes or ECS, with immutable node images (Bottlerocket, Talos, Flatcar, Amazon Linux managed AMIs) beneath. The principle is the same.</li>
+</ul>
+
+<h2>Config management vs immutable</h2>
+<table>
+<tr><th></th><th>Configure live servers (Ansible alone)</th><th>Bake images (Packer, Docker)</th></tr>
+<tr><td>Change speed</td><td>Fast, in place</td><td>Slower: rebuild + redeploy</td></tr>
+<tr><td>Drift risk</td><td>Present</td><td>Eliminated by design</td></tr>
+<tr><td>Rollback</td><td>Reverse the change (hard)</td><td>Launch previous image</td></tr>
+<tr><td>Scale-out start time</td><td>Slow (configure at boot)</td><td>Fast (pre-baked)</td></tr>
+</table>
+<p>They are complementary: use Ansible as a Packer provisioner to describe image contents.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Use Packer's <code>docker</code> builder (no cloud account needed) to build an image with nginx installed, using a shell provisioner, then run it.</li>
+<li>Or build an AMI with the example above in a sandbox account; launch an instance from it and verify nginx runs without any user-data.</li>
+<li>Bump a version variable, rebuild, and practise "rolling back" by launching from the previous image.</li>
+<li>Identify one pet in your own environment and write down what it would take to make it cattle.</li>
+</ol></div>

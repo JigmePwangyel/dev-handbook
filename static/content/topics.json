@@ -1,0 +1,8 @@
+[
+  {
+    "id": "devops",
+    "title": "DevOps & Deployment",
+    "icon": "⚙️",
+    "blurb": "How software is built, shipped and kept alive: servers, CI/CD, containers, Kubernetes, cloud, IaC and observability."
+  }
+]

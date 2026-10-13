@@ -1,0 +1,141 @@
+<h1>Images and Layers</h1>
+<p class="lead">An image is not one big file. It is an ordered stack of immutable, content-addressed layers plus a small piece of JSON metadata. Understanding layers explains why builds are sometimes instant and sometimes slow, why pulls reuse downloads, why deleting a file in a later step does not shrink your image, and why tags are not the same as versions.</p>
+
+<h2>What is inside an image</h2>
+<p>An OCI image consists of three things:</p>
+<ul>
+<li><strong>Layers</strong>: compressed tar archives, each holding the filesystem changes from one build step (files added, modified or deleted).</li>
+<li><strong>Config</strong>: JSON with the default command, environment variables, exposed ports, working directory, user, architecture and the ordered list of layer hashes.</li>
+<li><strong>Manifest</strong>: JSON that lists the config and layers by digest. A registry stores and serves these.</li>
+</ul>
+<pre class="diagram">
+ Image  myapp:1.4
+ ┌────────────────────────────────────────┐
+ │ Layer 5  COPY . .             (app code)│  ← changes most often
+ ├────────────────────────────────────────┤
+ │ Layer 4  RUN npm ci           (node_mod)│
+ ├────────────────────────────────────────┤
+ │ Layer 3  COPY package*.json            │
+ ├────────────────────────────────────────┤
+ │ Layer 2  node:22-slim runtime layers   │
+ ├────────────────────────────────────────┤
+ │ Layer 1  Debian base filesystem        │  ← changes least often
+ └────────────────────────────────────────┘
+        all READ-ONLY, shared by many images
+ ┌────────────────────────────────────────┐
+ │ Container writable layer (copy-on-write)│  ← per running container
+ └────────────────────────────────────────┘
+</pre>
+
+<h2>Content-addressable storage</h2>
+<p>Every layer, config and manifest is named by the SHA-256 hash of its content, written <code>sha256:ab12...</code>. This one design choice gives you a lot:</p>
+<ul>
+<li><strong>Deduplication.</strong> If ten images share the same Debian base layer, it is stored once on disk and downloaded once.</li>
+<li><strong>Integrity.</strong> A pulled layer is verified against its hash. Tampering or corruption is detected.</li>
+<li><strong>Immutability.</strong> You cannot change a layer; changing content changes the hash, making it a different layer.</li>
+<li><strong>Cheap pushes.</strong> The registry says "I already have that digest" and the push skips it.</li>
+</ul>
+<pre><code>docker pull python:3.13-slim
+# 3.13-slim: Pulling from library/python
+# a2318d6c47ec: Pull complete
+# ...
+docker pull python:3.12-slim      # shared layers say "Already exists"</code></pre>
+
+<h2>Copy-on-write at runtime</h2>
+<p>When a container starts, the runtime stacks the read-only layers with an overlay filesystem and adds an empty writable layer. If the container modifies a file from a lower layer, the file is first <em>copied up</em> into the writable layer and changed there. Lower layers are never touched. Deleting a file adds a "whiteout" marker in the upper layer that hides it.</p>
+<div class="callout warn"><strong>Deleting in a later layer does not shrink the image</strong><p>If layer 3 downloads a 500 MB archive and layer 4 runs <code>rm</code> on it, the image still contains the 500 MB in layer 3. The deletion is only a whiteout on top. Combine download, use and cleanup in the <em>same</em> <code>RUN</code> instruction, or use multi-stage builds. This also means a secret you <code>COPY</code> and then delete is still extractable from the image.</p></div>
+
+<h2>Tags vs. digests</h2>
+<p>A full image reference looks like this:</p>
+<pre class="diagram">
+ registry.example.com / team / myapp : 1.4.2 @ sha256:9f86d0…
+ └──── registry ────┘  └repo┘ └name┘  └tag┘   └────digest────┘
+</pre>
+<table>
+<tr><th></th><th>Tag</th><th>Digest</th></tr>
+<tr><td>What it is</td><td>A human-friendly, <strong>mutable</strong> pointer</td><td>The hash of the manifest, <strong>immutable</strong></td></tr>
+<tr><td>Example</td><td><code>nginx:1.27</code></td><td><code>nginx@sha256:…</code></td></tr>
+<tr><td>Can change meaning?</td><td>Yes: the publisher can re-push <code>1.27</code> with a security patch, or <code>latest</code> with anything</td><td>Never</td></tr>
+<tr><td>Use for</td><td>Readability, development</td><td>Reproducible, auditable production deploys</td></tr>
+</table>
+<p>If you omit a tag, Docker assumes <code>:latest</code>. That is not "the newest", it is merely the default tag name, and publishers may not even maintain it. Always specify tags explicitly.</p>
+<pre><code>docker images --digests nginx
+docker inspect --format '{{index .RepoDigests 0}}' nginx:1.27
+# In a Dockerfile, pin tag AND digest (tag is for humans, digest is enforced)
+FROM nginx:1.27@sha256:&lt;digest-here&gt;</code></pre>
+<p>Multi-architecture images have a top-level "index" (manifest list) whose digest points to per-platform manifests. Pulling by tag on an ARM Mac and an x86 server resolves to different manifests under the same tag.</p>
+
+<h2>Inspecting layers</h2>
+<pre><code>docker history myapp:1.4
+# IMAGE         CREATED        CREATED BY                                      SIZE
+# 3f1c...       2 minutes ago  CMD ["node" "server.js"]                         0B
+# 8a2b...       2 minutes ago  COPY . . # buildkit                              1.2MB
+# c7d9...       3 minutes ago  RUN npm ci --omit=dev                            85MB
+# e01a...       3 minutes ago  COPY package*.json ./                            4kB
+# ...           2 weeks ago    /bin/sh -c #(nop)  CMD ["node"]                  0B
+
+docker history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' myapp:1.4
+docker image inspect myapp:1.4 | less      # full config, layer digests, env
+docker save myapp:1.4 | tar -tv | head     # raw layer tarballs
+docker system df -v                        # image sizes and shared sizes</code></pre>
+<p>For a more visual exploration use the open-source tool <code>dive</code>, which shows each layer's file changes and flags wasted space.</p>
+
+<h2>The build cache</h2>
+<p>When you run <code>docker build</code>, each Dockerfile instruction produces a layer. Docker reuses a cached layer if:</p>
+<ol>
+<li>The instruction text is identical, and</li>
+<li>The parent layer is the same cached layer, and</li>
+<li>For <code>COPY</code>/<code>ADD</code>, the content checksums of the copied files are unchanged.</li>
+</ol>
+<p>Crucially, <strong>the moment one layer is invalidated, every layer after it is rebuilt</strong>. That makes instruction order the single biggest build-speed lever:</p>
+<pre><code># SLOW: any source edit invalidates npm install
+COPY . .
+RUN npm ci
+
+# FAST: dependencies reinstall only when package files change
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .</code></pre>
+<p><code>RUN</code> instructions are cached by their text, not their effect. <code>RUN apt-get update</code> can stay cached for months and then install stale package lists. That is why you chain <code>apt-get update &amp;&amp; apt-get install</code> in one <code>RUN</code>, and why CI builds sometimes use <code>--no-cache</code> or <code>--pull</code> on a schedule to pick up security patches.</p>
+
+<h2>Image size matters</h2>
+<table>
+<tr><th>Why it matters</th><th>Effect</th></tr>
+<tr><td>Pull time</td><td>Slow deploys and slow autoscaling when a node must download 1.2 GB</td></tr>
+<tr><td>Registry and bandwidth cost</td><td>Egress and storage are billed</td></tr>
+<tr><td>Attack surface</td><td>Every extra package is a potential CVE (compilers, shells, curl)</td></tr>
+<tr><td>Cache churn</td><td>Fat layers rebuild and re-upload slowly</td></tr>
+</table>
+<p>Rough sizes of common base images:</p>
+<table>
+<tr><th>Base</th><th>Approx. size</th></tr>
+<tr><td><code>ubuntu:24.04</code></td><td>~80 MB</td></tr>
+<tr><td><code>node:22</code> (full Debian)</td><td>~1.1 GB</td></tr>
+<tr><td><code>node:22-slim</code></td><td>~220 MB</td></tr>
+<tr><td><code>node:22-alpine</code></td><td>~160 MB</td></tr>
+<tr><td><code>python:3.13-slim</code></td><td>~125 MB</td></tr>
+<tr><td><code>alpine:3.20</code></td><td>~8 MB</td></tr>
+<tr><td><code>gcr.io/distroless/static</code></td><td>~2 MB</td></tr>
+<tr><td><code>scratch</code></td><td>0 (empty)</td></tr>
+</table>
+<p>Techniques to shrink images (full treatment in the multi-stage lesson): pick a slim base, multi-stage builds, clean package caches in the same layer, install only production dependencies, and use <code>.dockerignore</code>.</p>
+
+<h2>Working with images</h2>
+<pre><code>docker tag myapp:1.4 myapp:latest         # add another tag to the same image ID
+docker tag myapp:1.4 ghcr.io/acme/myapp:1.4
+docker rmi myapp:latest                   # removes the tag; layers stay while another tag uses them
+docker image prune                        # remove dangling (untagged) images
+docker image prune -a --filter "until=168h"   # unused images older than a week
+docker save -o myapp.tar myapp:1.4        # export to a file (air-gapped transfer)
+docker load -i myapp.tar</code></pre>
+<p>"Dangling" images are untagged leftovers, often the previous build of a tag you just rebuilt.</p>
+
+<div class="callout tip"><strong>Mental model</strong><p>Think of an image like a Git repository: layers are commits (immutable, hashed, shared), tags are branches (movable pointers), and the digest is the commit SHA. Production should deploy SHAs; humans read branches.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Pull <code>node:22</code>, <code>node:22-slim</code> and <code>node:22-alpine</code>. Compare with <code>docker images node</code>.</li>
+<li>Run <code>docker history node:22-alpine</code>. Which layer is biggest?</li>
+<li>Build two tiny Dockerfiles: one with <code>RUN dd if=/dev/zero of=big bs=1M count=100</code> followed by <code>RUN rm big</code>, one with both in a single <code>RUN</code>. Compare sizes and explain the difference.</li>
+<li>Run <code>docker inspect --format '{{index .RepoDigests 0}}' alpine:3.20</code> and then pull by that digest.</li>
+</ol></div>

@@ -1,0 +1,159 @@
+<h1>Debugging Containers</h1>
+<p class="lead">Containers fail in a small number of recurring ways: the process exits, gets killed, cannot reach something, or runs but behaves differently than on your laptop. A systematic routine, check the state, read the logs, inspect the config, get inside, compare environments, resolves most problems in minutes.</p>
+
+<h2>The debugging routine</h2>
+<pre class="diagram">
+  1. docker ps -a            Is it running? Exited? Restarting? What exit code?
+        │
+  2. docker logs             What did the process say before it died?
+        │
+  3. docker inspect          What config did Docker really apply? (env, mounts, ports, health)
+        │
+  4. docker exec / run       Get inside; test DNS, ports, files, permissions
+        │
+  5. docker events / stats   Resource pressure? OOM? Daemon-level problems?
+</pre>
+
+<h2>Step 1: state and exit codes</h2>
+<pre><code>docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+# NAMES  STATUS                      PORTS
+# api    Restarting (1) 5 seconds ago
+# db     Up 2 hours (healthy)        5432/tcp
+# job    Exited (137) 3 minutes ago
+
+docker inspect api --format '{{.State.ExitCode}} oom={{.State.OOMKilled}} err={{.State.Error}}'
+docker inspect api --format '{{json .State.Health}}' | jq</code></pre>
+<table>
+<tr><th>Exit code</th><th>Meaning</th><th>Typical cause</th></tr>
+<tr><td><code>0</code></td><td>Clean exit</td><td>The command finished. Expected for batch jobs; for a server it means the main process returned (e.g. daemonized itself, or <code>CMD</code> is a short script)</td></tr>
+<tr><td><code>1</code></td><td>Application error</td><td>Uncaught exception, bad config, failed DB connection. Read the logs</td></tr>
+<tr><td><code>2</code></td><td>Shell misuse / bad usage</td><td>Wrong command-line arguments</td></tr>
+<tr><td><code>125</code></td><td>Docker daemon error</td><td>Invalid <code>docker run</code> flags, port already allocated</td></tr>
+<tr><td><code>126</code></td><td>Command found but not executable</td><td>Missing <code>chmod +x</code> on entrypoint script, wrong architecture binary</td></tr>
+<tr><td><code>127</code></td><td>Command not found</td><td>Typo, binary missing in slim/distroless image, CRLF line endings in script (<code>#!/bin/sh^M</code>)</td></tr>
+<tr><td><code>130</code></td><td>SIGINT (128+2)</td><td>Ctrl+C</td></tr>
+<tr><td><code>137</code></td><td>SIGKILL (128+9)</td><td>OOM kill, or <code>docker stop</code> timeout then forced kill, or <code>docker kill</code></td></tr>
+<tr><td><code>139</code></td><td>SIGSEGV (128+11)</td><td>Segfault: native library crash, musl/glibc mismatch, wrong CPU architecture</td></tr>
+<tr><td><code>143</code></td><td>SIGTERM (128+15)</td><td>Graceful stop requested; normal when an app terminates on <code>docker stop</code> without custom handling</td></tr>
+</table>
+<p>The rule: exit codes above 128 mean "killed by signal (code minus 128)".</p>
+
+<h2>Step 2: logs</h2>
+<pre><code>docker logs api                         # everything since start
+docker logs -f --tail 200 api           # follow, last 200 lines
+docker logs --since 10m --timestamps api
+docker compose logs -f --tail 50 api db # several services interleaved
+docker logs api 2&gt;&amp;1 | grep -i error     # stderr is a separate stream</code></pre>
+<ul>
+<li><strong>Empty logs?</strong> The app may write to a file instead of stdout/stderr, or output is buffered (set <code>PYTHONUNBUFFERED=1</code>). Link log files to <code>/dev/stdout</code> (nginx images do) or reconfigure the logger.</li>
+<li><strong>Logs vanish on <code>docker rm</code>.</strong> The default <code>json-file</code> driver stores them per container. In production ship logs elsewhere (Loki, CloudWatch, ELK).</li>
+<li><strong>Logs eating the disk?</strong> Default json-file has no rotation. Set <code>max-size</code> and <code>max-file</code> in <code>daemon.json</code> or Compose <code>logging.options</code>.</li>
+</ul>
+
+<h2>Step 3: inspect</h2>
+<pre><code>docker inspect api | less
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' api     # effective env vars
+docker inspect -f '{{json .Mounts}}' api | jq                          # actual mounts
+docker inspect -f '{{json .NetworkSettings.Networks}}' api | jq        # IPs, networks
+docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.RestartPolicy.Name}}' api
+docker port api                                                         # published ports
+docker compose config                                                   # resolved Compose file</code></pre>
+<p>Much "it works locally" turns out to be a different environment variable, a missing mount or a wrong network, visible instantly here.</p>
+
+<h2>Step 4: get inside</h2>
+<pre><code>docker exec -it api sh                  # shell in a running container (try bash if sh is minimal)
+docker exec api env                     # environment
+docker exec api ls -la /app             # are the files there? permissions?
+docker exec api cat /etc/resolv.conf
+docker exec -u 0 -it api sh             # as root (to install debugging tools temporarily)</code></pre>
+<h3>When it crashes immediately (so you cannot exec)</h3>
+<pre><code># Override entrypoint to keep it alive and look around
+docker run --rm -it --entrypoint sh myapp:1.4.2
+docker run --rm -it --entrypoint sh --env-file .env myapp:1.4.2   # same env as the real thing
+# Then run the real command manually and watch it fail:
+/ # node server.js
+
+# Inspect the filesystem of an exited container
+docker commit api debug-snapshot &amp;&amp; docker run --rm -it --entrypoint sh debug-snapshot
+docker cp api:/app/error.log .          # works on stopped containers too</code></pre>
+
+<h3>Shell-less and distroless images</h3>
+<p>There is no <code>sh</code> to exec into. Options: use the <code>:debug</code> tag of distroless (it includes BusyBox), or attach a sidecar that shares the target's namespaces:</p>
+<pre><code>docker run --rm -it --pid=container:api --network=container:api nicolaka/netshoot
+# Now you see api's processes and network, and have curl, dig, tcpdump, ss, etc.
+docker debug api                         # Docker Desktop/Subscription: injects a toolbox shell
+kubectl debug -it pod/api --image=busybox --target=api     # Kubernetes ephemeral containers</code></pre>
+
+<h2>Common failures and fixes</h2>
+<h3>Exit 137 and OOM</h3>
+<pre><code>docker inspect api --format '{{.State.OOMKilled}}'      # true => out of memory
+docker stats                                             # live CPU / mem / net / IO per container
+dmesg -T | grep -i -E 'killed process|out of memory'    # kernel's view (on the host)</code></pre>
+<p>If <code>OOMKilled</code> is true, the process exceeded its cgroup memory limit (or the host ran out). Fix by finding the leak or raising the limit; configure the runtime (e.g. Node <code>--max-old-space-size</code> below the limit, JVM <code>-XX:MaxRAMPercentage=75</code>). If <code>OOMKilled</code> is false, the 137 came from a stop timeout: the app ignored SIGTERM, so check exec-form <code>CMD</code> and signal handlers.</p>
+
+<h3>Crash loops (Restarting...)</h3>
+<p>With <code>restart: always</code> a failing container flaps forever, and Docker backs off exponentially between tries. Read <code>docker logs</code> for the last attempt, check the exit code, and temporarily disable the restart policy (<code>docker update --restart=no api</code>) to make it stay failed for investigation. Typical causes: missing env var, DB not ready, wrong file permissions after switching to a non-root user, a port already in use, or migration failures.</p>
+
+<h3>Permission denied</h3>
+<p>Non-root user cannot write to a volume or bind mount (owned by root or a host UID). Fix ownership at build (<code>COPY --chown</code>, <code>chown</code> in the Dockerfile before <code>USER</code>), run with a matching <code>--user</code>, or use <code>chown</code> in an init step. On SELinux hosts add <code>:z</code> to mounts.</p>
+
+<h3>Cannot reach something</h3>
+<table>
+<tr><th>Symptom</th><th>Check</th></tr>
+<tr><td>Cannot reach container from host</td><td><code>docker port</code>; was <code>-p</code> given? Does the app bind <code>0.0.0.0</code> not 127.0.0.1? Is the host port free (<code>lsof -i :8080</code>)? Firewall?</td></tr>
+<tr><td>Container cannot reach another container</td><td>Same user-defined network? Using the service name and the <em>internal</em> port, not <code>localhost</code> or the published port?</td></tr>
+<tr><td>Name resolution fails</td><td><code>docker exec api getent hosts db</code>; default bridge has no DNS; check <code>/etc/resolv.conf</code>; VPN/corporate DNS interference</td></tr>
+<tr><td>"Connection refused"</td><td>Target not listening yet (startup race): add healthcheck + <code>depends_on: condition: service_healthy</code> and client retries</td></tr>
+<tr><td>Cannot reach internet</td><td><code>docker exec api wget -qO- https://example.com</code>; check DNS, proxy env vars, host IP forwarding, overlapping subnets with VPN</td></tr>
+<tr><td>Reach host service from container</td><td><code>host.docker.internal</code> (add <code>--add-host=host.docker.internal:host-gateway</code> on Linux); the host service must listen on non-loopback</td></tr>
+</table>
+<pre><code>docker exec api sh -c 'nc -zv db 5432'          # TCP reachability
+docker exec api wget -qO- http://other:3000/health
+docker exec api nslookup db                     # DNS
+docker network inspect appnet | jq '.[0].Containers'</code></pre>
+
+<h3>"exec format error"</h3>
+<p>The image architecture does not match the host (arm64 image on amd64 or vice versa), or the entrypoint script has no shebang. Check <code>docker image inspect --format '{{.Architecture}}' img</code>, rebuild for the right platform with <code>--platform</code>.</p>
+
+<h3>Works on my machine, not in the container</h3>
+<ul>
+<li>File missing: <code>.dockerignore</code> excluded it, or <code>COPY</code> path is wrong. <code>docker run --rm img ls -R /app</code>.</li>
+<li>Case-sensitive paths: macOS is case-insensitive, Linux containers are not.</li>
+<li>Different env: compare <code>docker exec api env</code> with your local environment.</li>
+<li>Dev dependencies omitted (<code>npm ci --omit=dev</code>) but code needs them at runtime.</li>
+<li>Time zone, locale, missing CA certificates (slim/scratch) for outbound HTTPS.</li>
+<li>Stale image: you changed code but ran an old build. Rebuild, check <code>docker images</code> timestamps, or use <code>--no-cache</code>.</li>
+</ul>
+
+<h3>Build failures</h3>
+<pre><code>docker build --progress=plain --no-cache .          # full unfolded output
+docker build --target build -t dbg . &amp;&amp; docker run --rm -it dbg sh   # stop at a stage and poke around
+docker builder prune                                # clear a corrupted/huge build cache</code></pre>
+
+<h3>Disk space</h3>
+<pre><code>docker system df -v          # who is using space
+docker system prune -a       # unused images/containers/networks (careful)
+docker volume ls -f dangling=true</code></pre>
+
+<h2>Daemon-level tools</h2>
+<pre><code>docker events                       # live stream: create, start, die, oom, health_status
+docker stats --no-stream            # snapshot of resource use
+docker top api                      # processes in the container, from the host
+sudo journalctl -u docker -f        # daemon logs (Linux systemd)
+docker info                         # storage driver, cgroup version, warnings</code></pre>
+
+<div class="callout tip"><strong>Habits that make debugging easy</strong><ul>
+<li>Log to stdout/stderr in structured form, include a version and request ID.</li>
+<li>Add a <code>/health</code> endpoint and HEALTHCHECK; Docker then reports <code>(healthy)</code> or <code>(unhealthy)</code> in <code>docker ps</code>.</li>
+<li>Keep a <code>debug</code> build target or tag with a shell and tools; ship the minimal one.</li>
+<li>Do not "fix" a running container by hand. If you change it by exec, you lose that change on the next deploy. Reproduce, fix the Dockerfile or config, rebuild.</li>
+</ul></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>docker run -d --name oom --memory=20m python:3.13-slim python -c "x=bytearray(200*1024*1024)"</code>. Find the exit code and confirm <code>OOMKilled=true</code> with inspect.</li>
+<li>Run <code>docker run --name bad alpine nonexistent-cmd</code> and read exit code 127 (or 126 for a non-executable file).</li>
+<li>Start a container that logs to a file only (e.g. <code>sh -c 'echo hi &gt; /tmp/x.log; sleep 100'</code>) and observe empty <code>docker logs</code>. Then redirect to stdout.</li>
+<li>Put two containers on the default bridge, show that name lookup fails, then fix it with a user-defined network. Use <code>nicolaka/netshoot</code> to diagnose.</li>
+<li>Make a crash-looping Compose service (<code>command: ["sh","-c","exit 1"]</code>, <code>restart: always</code>), and practice the routine: ps, logs, inspect, stop the loop.</li>
+</ol></div>

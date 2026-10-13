@@ -1,0 +1,122 @@
+<h1>The Twelve-Factor App</h1>
+<p class="lead">The twelve-factor methodology (written by Heroku engineers around 2011) is still the best short checklist for building applications that are easy to deploy, scale and operate. Almost every modern platform, from Docker to Kubernetes, assumes your app follows it.</p>
+
+<h2>Why it matters</h2>
+<p>An app that is painful to deploy is usually painful for a reason: config baked into the build, state stored on local disk, logs written to files nobody reads, or a startup procedure that only one person understands. The twelve factors are a set of constraints that remove those reasons. If you follow them, the same artifact runs on your laptop, in CI, in staging and in production, and you can run 1 or 50 copies of it.</p>
+
+<pre class="diagram">
+        one codebase ──▶ build once ──▶ release = build + config ──▶ run N stateless processes
+                                              ▲                              │
+                                    env vars (per environment)               ├──▶ backing services (DB, cache, queue) via URL
+                                                                             └──▶ logs to stdout ──▶ platform collects them
+</pre>
+
+<h2>The twelve factors</h2>
+
+<h3>I. Codebase: one codebase tracked in version control, many deploys</h3>
+<p>One app = one repo. Staging and production are different <em>deploys</em> of the same commit lineage, not different repos or long-lived forks. If two apps share code, extract a library and depend on it. Anti-pattern: a <code>prod</code> branch that diverges from <code>main</code> with hand edits.</p>
+
+<h3>II. Dependencies: explicitly declare and isolate</h3>
+<p>Never rely on a system-wide package happening to be installed. Declare everything in a manifest and lock exact versions.</p>
+<pre><code># Node: package.json + package-lock.json, install reproducibly
+npm ci
+
+# Python: pin hashes
+pip install --require-hashes -r requirements.txt
+
+# Container: the image itself is the isolation boundary
+FROM node:22-alpine
+COPY package*.json ./
+RUN npm ci --omit=dev</code></pre>
+<p>Commit the lockfile. <code>npm install</code> may change versions; <code>npm ci</code> will not.</p>
+
+<h3>III. Config: store config in the environment</h3>
+<p>Config is anything that varies between deploys: database URLs, API keys, feature flags, hostnames. It must not live in the code. The litmus test: could you open-source the repo right now without leaking credentials?</p>
+<pre><code>// config.js - read once, validate, fail fast
+const required = ['DATABASE_URL', 'SESSION_SECRET'];
+for (const k of required) {
+  if (!process.env[k]) throw new Error(`Missing env var ${k}`);
+}
+export const config = {
+  port: Number(process.env.PORT ?? 3000),
+  databaseUrl: process.env.DATABASE_URL,
+  logLevel: process.env.LOG_LEVEL ?? 'info',
+};</code></pre>
+<div class="callout warn"><strong>Avoid "config files per environment"</strong><p>Files like <code>config.production.json</code> checked into git grow combinatorially and tempt people to commit secrets. Env vars are language-agnostic and easy to change per deploy without a rebuild.</p></div>
+
+<h3>IV. Backing services: treat them as attached resources</h3>
+<p>Postgres, Redis, S3, an SMTP provider: all are reached through a URL and credentials in config. Swapping a local Postgres for a managed RDS instance should require changing <code>DATABASE_URL</code> and nothing else. Code that hardcodes <code>localhost:5432</code> violates this factor.</p>
+
+<h3>V. Build, release, run: strictly separate stages</h3>
+<table>
+<tr><th>Stage</th><th>What happens</th><th>Output</th></tr>
+<tr><td>Build</td><td>Compile code, fetch dependencies</td><td>Immutable artifact (image tagged with commit SHA)</td></tr>
+<tr><td>Release</td><td>Combine build with environment config</td><td>Numbered release you can roll back to</td></tr>
+<tr><td>Run</td><td>Start processes from a release</td><td>Running app</td></tr>
+</table>
+<p>Never edit code on a running server. Rollback becomes "run the previous release", not "hope you remember what you changed".</p>
+
+<h3>VI. Processes: execute the app as one or more stateless processes</h3>
+<p>Any data that must outlive a request goes in a backing service, never in process memory or local disk. "Sticky sessions" (the load balancer pins a user to one server because the session lives in RAM) are a smell; store sessions in Redis or use signed tokens. A stateless process can be killed, restarted or duplicated freely, and that property underpins autoscaling and rolling deploys.</p>
+<p>In-memory caches are fine as an optimisation, as long as losing them is harmless.</p>
+
+<h3>VII. Port binding: export services via port binding</h3>
+<p>The app is self-contained: it embeds an HTTP server and listens on <code>$PORT</code>. It does not depend on being injected into Apache or Tomcat at runtime. A reverse proxy or load balancer then routes to that port.</p>
+
+<h3>VIII. Concurrency: scale out via the process model</h3>
+<p>Scale by running more processes, and by running different process <em>types</em> for different workloads: <code>web</code>, <code>worker</code>, <code>scheduler</code>. Horizontal scaling beats making one process enormous.</p>
+<pre><code># Procfile style - same image, different command
+web:    node dist/server.js
+worker: node dist/worker.js
+cron:   node dist/scheduler.js</code></pre>
+
+<h3>IX. Disposability: fast startup and graceful shutdown</h3>
+<p>Processes get killed constantly (deploys, autoscaling, node failures). Start in seconds, and on <code>SIGTERM</code> stop accepting new work, finish in-flight requests, then exit.</p>
+<pre><code>process.on('SIGTERM', () =&gt; {
+  console.log('SIGTERM received, draining');
+  server.close(async () =&gt; {   // stops new connections, waits for in-flight
+    await db.end();
+    process.exit(0);
+  });
+  setTimeout(() =&gt; process.exit(1), 25_000).unref(); // hard stop before the platform's SIGKILL
+});</code></pre>
+<p>Workers must make jobs idempotent or re-queueable, because a killed worker means a job is retried.</p>
+
+<h3>X. Dev/prod parity: keep environments as similar as possible</h3>
+<p>Historically there were three gaps: time (code took weeks to ship), people (devs write, ops deploy) and tools (SQLite locally, Postgres in prod). Close them: deploy often, own what you ship, and run the same Postgres major version locally via Docker Compose.</p>
+
+<h3>XI. Logs: treat logs as event streams</h3>
+<p>The app writes unbuffered events to <code>stdout</code>, one per line, ideally as JSON. It does not manage log files, rotation or shipping. The platform (Docker, systemd, Kubernetes) captures the stream and forwards it to Loki, CloudWatch or Elasticsearch.</p>
+<pre><code>{"ts":"2026-10-05T10:21:07Z","level":"error","msg":"payment failed","order_id":9123,"trace_id":"a1b2c3"}</code></pre>
+
+<h3>XII. Admin processes: run one-off tasks as one-off processes</h3>
+<p>Migrations, data fixes and REPL sessions run from the same codebase, release and config as the app, in a throwaway process: <code>docker compose run --rm app node dist/migrate.js</code> or a Kubernetes Job. Do not SSH in and run ad-hoc scripts against production from your laptop copy of the code.</p>
+
+<h2>Beyond the original twelve</h2>
+<p>Modern authors (see Kevin Hoffman's "Beyond the Twelve-Factor App") add three more, which matter in 2026:</p>
+<ul>
+<li><strong>API first</strong>: define contracts (OpenAPI) before implementation.</li>
+<li><strong>Telemetry</strong>: expose metrics, traces and health endpoints (<code>/healthz</code>, <code>/metrics</code>), not only logs.</li>
+<li><strong>Authentication and authorization</strong>: build security in from the start, not as an afterthought.</li>
+</ul>
+
+<h2>Quick audit table</h2>
+<table>
+<tr><th>Smell</th><th>Violates</th><th>Fix</th></tr>
+<tr><td><code>if (NODE_ENV==='prod')</code> sprinkled through code</td><td>III, X</td><td>Drive behaviour by explicit config values</td></tr>
+<tr><td>Uploads saved to <code>./uploads</code></td><td>VI</td><td>Object storage (S3)</td></tr>
+<tr><td>App writes <code>/var/log/app.log</code> and rotates it</td><td>XI</td><td>Log to stdout</td></tr>
+<tr><td>Deploy = SSH + <code>git pull</code></td><td>V</td><td>Build an image in CI</td></tr>
+<tr><td>Cron inside the web process</td><td>VIII, VI</td><td>Separate scheduler process or Kubernetes CronJob</td></tr>
+<tr><td>Takes 90s to boot</td><td>IX</td><td>Lazy init, smaller image, defer warmups</td></tr>
+</table>
+
+<h2>Trade-offs and honesty</h2>
+<p>Not every factor is absolute. Some apps legitimately hold state (databases, game servers, WebSocket hubs). The point is to be deliberate: isolate the stateful part, and keep everything else disposable. Env vars also have limits: they are visible to child processes and sometimes leak through crash dumps, so for high-value secrets prefer mounted files or a secret manager (next lesson).</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Pick one of your own apps and score it 0 or 1 against each factor. Which three failures would hurt most in production?</li>
+<li>Remove every hardcoded URL or key from it and read them from env vars with fail-fast validation.</li>
+<li>Add a <code>SIGTERM</code> handler, run it in Docker and confirm <code>docker stop</code> returns in under a second instead of waiting 10 seconds for SIGKILL.</li>
+</ol></div>

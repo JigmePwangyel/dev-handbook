@@ -1,0 +1,99 @@
+<h1>Rolling Updates and Rollbacks</h1>
+<p class="lead">Shipping a new version should not mean downtime. Kubernetes Deployments replace Pods gradually, only advancing when the new ones are healthy, and keep history so you can undo a bad release with one command.</p>
+
+<h2>What happens without it</h2>
+<p>The naive deploy is "stop v1, start v2". Between those two steps users see errors. If v2 crashes on boot, you are down until you manually fix or revert. A rolling update trades speed for safety: at every moment enough healthy Pods exist to serve traffic.</p>
+
+<h2>How a rolling update works</h2>
+<p>A Deployment owns ReplicaSets, one per Pod template version. On a change to <code>spec.template</code>, the Deployment controller creates a new ReplicaSet and shifts replicas from old to new in steps.</p>
+<pre class="diagram">
+ replicas: 4, maxSurge: 1, maxUnavailable: 0
+
+ start      RS-v1 [■ ■ ■ ■]            RS-v2 [ ]
+ step 1     RS-v1 [■ ■ ■ ■]            RS-v2 [□]     surge: 5 Pods total, new not ready yet
+ step 2     RS-v1 [■ ■ ■ ■]            RS-v2 [■]     new is Ready
+ step 3     RS-v1 [■ ■ ■  ]            RS-v2 [■ □]   old terminated, next new started
+ ...
+ end        RS-v1 [        ]  (kept, 0 replicas, for rollback)   RS-v2 [■ ■ ■ ■]
+</pre>
+
+<h2>Strategy settings</h2>
+<pre><code>spec:
+  replicas: 4
+  revisionHistoryLimit: 10        # old ReplicaSets kept for rollback
+  progressDeadlineSeconds: 600    # mark rollout "failed" if no progress
+  minReadySeconds: 10             # new Pod must stay Ready this long to count
+  strategy:
+    type: RollingUpdate           # the default (alternative: Recreate)
+    rollingUpdate:
+      maxSurge: 25%               # extra Pods above desired during update
+      maxUnavailable: 0           # how many may be below desired</code></pre>
+<table>
+<tr><th>Setting</th><th>Effect</th></tr>
+<tr><td><code>maxSurge</code></td><td>Higher means a faster rollout but needs spare capacity. Number or percentage.</td></tr>
+<tr><td><code>maxUnavailable</code></td><td><code>0</code> keeps full capacity throughout (needs surge &gt; 0). Default is 25% for both.</td></tr>
+<tr><td><code>minReadySeconds</code></td><td>Catches Pods that pass readiness then crash a few seconds later.</td></tr>
+<tr><td><code>progressDeadlineSeconds</code></td><td>Controller sets condition <code>Progressing=False</code>; CI can fail on it.</td></tr>
+</table>
+<p><strong>Recreate</strong> kills all old Pods first, then starts new ones. Accept the downtime when two versions can not coexist (for example a schema-incompatible singleton or RWO volume that cannot attach twice).</p>
+
+<div class="callout key"><strong>Rolling updates depend on readiness probes</strong><p>Without a readiness probe Kubernetes considers a Pod ready as soon as the process starts, so it may send traffic and tear down old Pods before the new app can answer. A correct readiness probe is what makes a rollout zero-downtime. Also remember that during a rollout v1 and v2 run <em>simultaneously</em>: your APIs and database schemas must be backward compatible (expand and contract migrations).</p></div>
+
+<h2>kubectl rollout in practice</h2>
+<pre><code>kubectl set image deploy/shop shop=ghcr.io/example/shop:2.4.0   # or edit YAML and apply
+kubectl rollout status deploy/shop            # blocks until done; exit code != 0 on failure
+kubectl rollout history deploy/shop           # list revisions
+kubectl rollout history deploy/shop --revision=3
+kubectl rollout undo deploy/shop              # back to previous revision
+kubectl rollout undo deploy/shop --to-revision=2
+kubectl rollout pause deploy/shop             # batch several edits, then...
+kubectl rollout resume deploy/shop
+kubectl rollout restart deploy/shop           # fresh Pods, same template (pick up new config)</code></pre>
+<p>Record why a change happened with an annotation (<code>kubernetes.io/change-cause</code>) so history is readable. In a CI pipeline, the deploy step usually runs <code>kubectl rollout status --timeout=5m</code> and runs <code>rollout undo</code> if it fails.</p>
+<div class="callout tip"><strong>GitOps rollback</strong><p>If git is the source of truth, rollback means <code>git revert</code> and letting Argo CD or Flux apply it, rather than <code>kubectl rollout undo</code>, which creates drift from git.</p></div>
+
+<h2>Graceful shutdown</h2>
+<p>When a Pod is terminated, two things happen concurrently: it is removed from Service endpoints, and SIGTERM is sent. Endpoint removal takes a moment to propagate through kube-proxy and ingress controllers, so requests can still arrive after SIGTERM. Mitigate:</p>
+<pre><code>spec:
+  terminationGracePeriodSeconds: 45
+  containers:
+    - name: shop
+      lifecycle:
+        preStop:
+          exec: { command: ["sleep", "10"] }   # let endpoints drain first</code></pre>
+<p>And make the app, on SIGTERM, stop accepting new connections, finish in-flight requests and exit. Many frameworks need explicit shutdown hooks.</p>
+
+<h2>PodDisruptionBudgets</h2>
+<p>Rolling updates are <em>voluntary disruptions you control</em>. But cluster operations also evict Pods: node drains for upgrades, autoscaler scale-down. A PodDisruptionBudget limits how many Pods of an app may be down at once during such voluntary evictions.</p>
+<pre><code>apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: shop }
+spec:
+  minAvailable: 2          # or: maxUnavailable: 1
+  selector:
+    matchLabels: { app: shop }</code></pre>
+<p><code>kubectl drain node-1</code> then evicts Pods one by one while respecting the budget, waiting if necessary. PDBs do not protect against crashes or node failure. Beware <code>minAvailable</code> equal to replicas: nothing can ever be evicted and upgrades hang forever.</p>
+
+<h2>Beyond built-in rolling updates</h2>
+<table>
+<tr><th>Strategy</th><th>How</th><th>Tool</th></tr>
+<tr><td>Blue-green</td><td>Run both versions fully, flip Service selector or route</td><td>Plain Services; Argo Rollouts</td></tr>
+<tr><td>Canary</td><td>Send 5 percent, 25 percent, ... of traffic to v2 while watching metrics, auto-abort on errors</td><td>Argo Rollouts, Flagger, Gateway API weights</td></tr>
+<tr><td>Feature flags</td><td>Deploy dark, enable per user</td><td>App level</td></tr>
+</table>
+<p>Native Deployments shift Pod counts, not traffic percentages; for fine-grained canaries use a progressive delivery controller.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>A rollout stuck at "Waiting for rollout to finish": new Pods fail readiness, are Pending (no capacity for surge), or image is wrong. Old Pods keep serving, which is the point. Inspect with <code>kubectl describe</code>.</li>
+<li><code>:latest</code> image tags: re-applying identical YAML changes nothing, and rollback cannot restore a specific version.</li>
+<li><code>revisionHistoryLimit: 0</code> disables rollback.</li>
+<li>Database migrations that break the old version during the rollout window.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Deploy 4 replicas of nginx:1.26 with a readiness probe. Update to <code>nginx:1.27</code> while running <code>kubectl get pods -w</code> in another terminal.</li>
+<li>Update to a nonexistent tag <code>nginx:nope</code>, watch the rollout stall with ImagePullBackOff while old Pods keep serving, then <code>kubectl rollout undo</code>.</li>
+<li>Add a PDB with minAvailable 3 and run <code>kubectl drain</code> on a worker to see it respected.</li>
+</ol></div>

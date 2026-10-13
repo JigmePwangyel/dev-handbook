@@ -1,0 +1,106 @@
+<h1>The Six-Month DevOps Learning Roadmap</h1>
+<p class="lead">DevOps is wide, and the most common mistake is learning tools in random order. This roadmap sequences topics so each month builds on the last, pairs every month with a concrete project and names the milestone that tells you you are done. It assumes roughly 8-10 hours a week and a working knowledge of programming.</p>
+
+<h2>Principles</h2>
+<ul>
+<li><strong>Fundamentals before tools.</strong> Linux, networking and HTTP outlast every tool fashion. Kubernetes without them is cargo cult.</li>
+<li><strong>Build, do not just watch.</strong> For every hour of video, spend two hands-on. Break things deliberately.</li>
+<li><strong>One project that grows</strong> (the capstone) beats ten toy tutorials.</li>
+<li><strong>Depth over breadth early.</strong> Get good at one cloud (AWS is the most common), one CI system, one IaC tool.</li>
+<li><strong>Write it down.</strong> A blog or README per project is both learning and portfolio.</li>
+</ul>
+
+<h2>Overview</h2>
+<pre class="diagram">
+ M1 Linux+Git+Net ─▶ M2 Docker+CI/CD ─▶ M3 Cloud (AWS)+IaC ─▶ M4 Kubernetes ─▶ M5 Observability+Security ─▶ M6 Capstone polish+Cert+Jobs
+</pre>
+
+<h2>Month 1: Foundations (Linux, Git, networking, scripting)</h2>
+<ul>
+<li><strong>Learn:</strong> shell navigation, permissions, processes, systemd, journalctl, SSH keys, package managers, cron; bash scripting basics (<code>set -euo pipefail</code>, functions, loops); Git branching/rebasing/PR workflow; IPs, subnets, DNS, HTTP, TLS, ports, firewalls.</li>
+<li><strong>Project:</strong> rent a small VPS, harden it, deploy a simple app by hand with systemd and nginx, add HTTPS with Let's Encrypt.</li>
+<li><strong>Milestone:</strong> you can explain what happens from typing a URL to seeing a page, and you can diagnose "site is down" with <code>ss</code>, <code>curl -v</code>, <code>dig</code>, <code>journalctl</code>.</li>
+<li><strong>Resources:</strong> "The Linux Command Line" (William Shotts, free), OverTheWire Bandit wargame, Pro Git book (free), "Computer Networking: A Top-Down Approach" chapters 1-2, Julia Evans' zines.</li>
+</ul>
+
+<h2>Month 2: Containers and CI/CD</h2>
+<ul>
+<li><strong>Learn:</strong> images, layers, Dockerfile best practices, volumes, networks, Compose; a registry; GitHub Actions (workflows, secrets, caching, matrix, environments); basic testing strategy; semantic versioning and trunk-based development.</li>
+<li><strong>Project:</strong> capstone stages 1-3: containerize an API + Postgres, CI pipeline that tests and pushes to GHCR, auto-deploy over SSH.</li>
+<li><strong>Milestone:</strong> a push to main reaches production automatically in under 10 minutes, with a one-command rollback.</li>
+<li><strong>Resources:</strong> Docker official docs "Get started", "Docker Deep Dive" (Nigel Poulton), GitHub Actions docs, Kelsey Hightower's talks, "Accelerate" by Forsgren/Humble/Kim (DORA metrics).</li>
+</ul>
+
+<h2>Month 3: Cloud (AWS) and Infrastructure as Code</h2>
+<ul>
+<li><strong>Learn:</strong> IAM (users, roles, policies, least privilege), VPC (subnets, route tables, NAT, security groups), EC2, S3, RDS, ALB, Route 53, CloudWatch, Auto Scaling; Terraform (providers, state, modules, workspaces, remote backends); intro to Ansible for configuration.</li>
+<li><strong>Project:</strong> rebuild your capstone on AWS with Terraform: VPC, ALB, EC2/ECS Fargate, RDS in private subnets, DNS and TLS via ACM. Set a billing alarm first and destroy when finished.</li>
+<li><strong>Milestone:</strong> <code>terraform apply</code> creates the whole environment from scratch; you can draw its network diagram from memory.</li>
+<li><strong>Certification target:</strong> <strong>AWS Certified Solutions Architect - Associate (SAA-C03)</strong>, or <strong>AWS Cloud Practitioner</strong> first if you want an easier warm-up.</li>
+<li><strong>Resources:</strong> AWS Skill Builder (free tier of courses), Adrian Cantrill's or Stephane Maarek's SAA courses, Tutorials Dojo practice exams, "Terraform: Up and Running" (Yevgeniy Brikman), HashiCorp tutorials.</li>
+</ul>
+
+<h2>Month 4: Kubernetes</h2>
+<ul>
+<li><strong>Learn:</strong> architecture (control plane, kubelet, etcd), Pods, Deployments, Services, Ingress/Gateway API, ConfigMaps, Secrets, probes, resource requests/limits, HPA, PersistentVolumes, RBAC, namespaces, Helm, Kustomize, debugging (<code>describe</code>, <code>logs</code>, <code>events</code>, <code>exec</code>); GitOps with Argo CD or Flux.</li>
+<li><strong>Project:</strong> run the capstone on a local cluster (kind/minikube/k3d), then on k3s on a VPS or managed EKS/GKE with Helm and Argo CD; practise rolling updates, rollbacks and autoscaling.</li>
+<li><strong>Milestone:</strong> you can debug a CrashLoopBackOff, a Pending pod and a 503 from the ingress without guessing; you can explain why you would or would not use Kubernetes for a given workload.</li>
+<li><strong>Certification target:</strong> <strong>CKA (Certified Kubernetes Administrator)</strong>, a hands-on, terminal-based exam: practise with killer.sh (included with the exam purchase) and Mumshad's KodeKloud labs. <strong>CKAD</strong> is the developer-focused alternative.</li>
+<li><strong>Resources:</strong> kubernetes.io tasks, "Kubernetes Up &amp; Running", KodeKloud, "Kubernetes the Hard Way" (once).</li>
+</ul>
+
+<h2>Month 5: Observability, reliability and security</h2>
+<ul>
+<li><strong>Learn:</strong> Prometheus + Grafana + Alertmanager, structured logging with Loki/ELK, OpenTelemetry tracing, SLIs/SLOs/error budgets, on-call, incident response and blameless postmortems; secrets management (Vault/SOPS), image scanning, SBOMs, signing, OWASP basics, backups and restore drills, load testing with k6.</li>
+<li><strong>Project:</strong> capstone stage 5 plus: dashboards and symptom-based alerts, an SLO for the API, a game day where a friend breaks something, a documented restore, Trivy and cosign in the pipeline.</li>
+<li><strong>Milestone:</strong> you have a written postmortem and a restore you timed.</li>
+<li><strong>Resources:</strong> Google SRE Book and SRE Workbook (free online), "Observability Engineering" (Majors et al.), Prometheus docs, Grafana University, OWASP Top 10.</li>
+</ul>
+
+<h2>Month 6: Polish, certify, get hired</h2>
+<ul>
+<li><strong>Learn/practice:</strong> fill gaps found along the way; cost optimisation (FinOps basics); a second cloud's vocabulary; platform engineering ideas; Python or Go for tooling.</li>
+<li><strong>Project:</strong> publish the capstone repo with an excellent README, architecture diagram, runbook and a short write-up of what went wrong and what you learned. Optionally contribute to an open-source infra project.</li>
+<li><strong>Certification target:</strong> <strong>HashiCorp Terraform Associate (003)</strong> (inexpensive, achievable in 2-3 weeks after Month 3 work), plus the CKA or SAA if not already done.</li>
+<li><strong>Milestone:</strong> you can walk an interviewer through your project end to end, and answer the questions in the interview lesson.</li>
+</ul>
+
+<h2>Certifications at a glance</h2>
+<table>
+<tr><th>Certification</th><th>Format</th><th>Best for</th><th>Difficulty</th><th>When</th></tr>
+<tr><td>AWS Cloud Practitioner</td><td>MCQ</td><td>Absolute cloud beginners</td><td>Easy</td><td>Optional warm-up</td></tr>
+<tr><td>AWS Solutions Architect Associate</td><td>MCQ, 130 min</td><td>Broad AWS credibility; most recognised</td><td>Medium</td><td>End of month 3</td></tr>
+<tr><td>HashiCorp Terraform Associate</td><td>MCQ, 60 min</td><td>IaC proof</td><td>Easy-medium</td><td>Month 3 or 6</td></tr>
+<tr><td>CKA</td><td>Hands-on, 2 h</td><td>Real Kubernetes ability</td><td>Hard (practical)</td><td>End of month 4-5</td></tr>
+<tr><td>CKAD</td><td>Hands-on</td><td>App-developer Kubernetes</td><td>Medium</td><td>Alternative to CKA</td></tr>
+<tr><td>CKS</td><td>Hands-on</td><td>Kubernetes security (requires CKA)</td><td>Hard</td><td>Later</td></tr>
+<tr><td>AWS DevOps Engineer Professional</td><td>MCQ</td><td>Deep AWS CI/CD and operations</td><td>Hard</td><td>Year 2</td></tr>
+<tr><td>Azure AZ-400 / Google Professional Cloud DevOps Engineer</td><td>MCQ</td><td>If your employer uses those clouds</td><td>Medium-hard</td><td>As needed</td></tr>
+</table>
+<div class="callout tip"><strong>Certs are not the goal</strong><p>They are a structured syllabus and a way past resume filters. Employers value demonstrable projects and clear reasoning more. Pick one or two that match the jobs you want; do not collect them.</p></div>
+
+<h2>Study habits that work</h2>
+<ul>
+<li>Time-box: one weekday evening of theory, one of hands-on lab, one long weekend session on the project.</li>
+<li>Keep a "things I broke" log; it is gold for interviews.</li>
+<li>Use free tiers and budget alarms; always <code>destroy</code> cloud labs. A forgotten NAT gateway or load balancer costs real money.</li>
+<li>Join a community (r/devops, CNCF and Kubernetes Slack, local meetups); explaining answers cements knowledge.</li>
+<li>Read postmortems (the "post-mortems" GitHub list by danluu, Cloudflare and GitHub blogs): the best education in how systems fail.</li>
+</ul>
+
+<h2>Beyond month six</h2>
+<table>
+<tr><th>Direction</th><th>Learn next</th></tr>
+<tr><td>Platform engineering</td><td>Backstage, Crossplane, internal developer platforms, golden paths</td></tr>
+<tr><td>SRE</td><td>Capacity planning, chaos engineering, distributed systems, advanced observability</td></tr>
+<tr><td>DevSecOps</td><td>Policy as code (OPA/Kyverno), runtime security (Falco), threat modelling, CKS</td></tr>
+<tr><td>Cloud architecture</td><td>Multi-account design, networking at scale, cost engineering, Pro-level certs</td></tr>
+<tr><td>Data/ML platforms</td><td>Workflow orchestration, GPU scheduling, feature stores, model serving</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write your own version of this roadmap with real calendar dates and the 3 hours you can protect each week.</li>
+<li>Choose your first certification and book the exam date now; a deadline changes behaviour.</li>
+<li>Create a public repo called <code>devops-journal</code> and commit a short note each week on what you built and what broke.</li>
+</ol></div>

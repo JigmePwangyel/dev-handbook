@@ -1,0 +1,108 @@
+<h1>Glossary A to Z</h1>
+<p class="lead">Terms you will meet across this handbook, in plain language. Skim it now, return when a word trips you up.</p>
+
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><strong>A record</strong></td><td>DNS record mapping a hostname to an IPv4 address (AAAA for IPv6).</td></tr>
+<tr><td><strong>Ansible</strong></td><td>Agentless configuration-management tool that applies YAML "playbooks" over SSH.</td></tr>
+<tr><td><strong>API gateway</strong></td><td>Single entry point that routes, authenticates and rate-limits calls to backend services.</td></tr>
+<tr><td><strong>Artifact</strong></td><td>The build output you deploy: a binary, JAR, zip, or container image.</td></tr>
+<tr><td><strong>Autoscaling</strong></td><td>Automatically adding or removing instances based on load.</td></tr>
+<tr><td><strong>Availability zone (AZ)</strong></td><td>An isolated data centre (or group) within a cloud region; spread across AZs for resilience.</td></tr>
+<tr><td><strong>Backup</strong></td><td>A copy of data that lets you restore after loss. Untested backups are hopes, not backups.</td></tr>
+<tr><td><strong>Bastion host</strong></td><td>Hardened server used as the single SSH entry point into a private network.</td></tr>
+<tr><td><strong>Blue-green deployment</strong></td><td>Run old (blue) and new (green) versions side by side, then switch traffic at once.</td></tr>
+<tr><td><strong>Branch</strong></td><td>Independent line of development in Git.</td></tr>
+<tr><td><strong>Build</strong></td><td>Compiling/bundling source into a deployable artifact.</td></tr>
+<tr><td><strong>Cache</strong></td><td>Fast storage of previously computed results (Redis, CDN, browser).</td></tr>
+<tr><td><strong>Canary release</strong></td><td>Send a small share of traffic to the new version first, watch, then expand.</td></tr>
+<tr><td><strong>CDN</strong></td><td>Content Delivery Network: edge servers caching content near users.</td></tr>
+<tr><td><strong>CI (continuous integration)</strong></td><td>Merging often and automatically building and testing every change.</td></tr>
+<tr><td><strong>CD (delivery / deployment)</strong></td><td>Delivery: every change is releasable. Deployment: every passing change is released automatically.</td></tr>
+<tr><td><strong>CIDR</strong></td><td>Notation for IP ranges, e.g. <code>10.0.0.0/16</code>.</td></tr>
+<tr><td><strong>Cluster</strong></td><td>A group of machines managed together (e.g. a Kubernetes cluster).</td></tr>
+<tr><td><strong>CNAME</strong></td><td>DNS alias pointing one name to another name.</td></tr>
+<tr><td><strong>Config management</strong></td><td>Keeping servers in a declared state (Ansible, Puppet, Chef).</td></tr>
+<tr><td><strong>Container</strong></td><td>Isolated process with its own filesystem view, sharing the host kernel.</td></tr>
+<tr><td><strong>Cron</strong></td><td>Unix scheduler that runs commands at set times.</td></tr>
+<tr><td><strong>Daemon</strong></td><td>Background process, usually a service.</td></tr>
+<tr><td><strong>Deployment</strong></td><td>Releasing a version to an environment; also a Kubernetes object managing replicas.</td></tr>
+<tr><td><strong>DevSecOps</strong></td><td>Integrating security checks throughout the pipeline.</td></tr>
+<tr><td><strong>Disaster recovery (DR)</strong></td><td>Plan and capability to restore service after a major failure.</td></tr>
+<tr><td><strong>DNS</strong></td><td>Domain Name System: translates names to IP addresses.</td></tr>
+<tr><td><strong>Docker</strong></td><td>Tooling for building and running containers.</td></tr>
+<tr><td><strong>Dockerfile</strong></td><td>Recipe describing how to build a container image.</td></tr>
+<tr><td><strong>DORA metrics</strong></td><td>Four delivery metrics: deploy frequency, lead time, change failure rate, recovery time.</td></tr>
+<tr><td><strong>Egress / ingress</strong></td><td>Traffic leaving / entering a network. In Kubernetes, Ingress routes external HTTP to services.</td></tr>
+<tr><td><strong>Environment</strong></td><td>An isolated deployment of the system (dev, staging, production).</td></tr>
+<tr><td><strong>Environment variable</strong></td><td>Named value passed to a process, used for configuration.</td></tr>
+<tr><td><strong>Error budget</strong></td><td>Allowed unreliability implied by an SLO (100% minus SLO).</td></tr>
+<tr><td><strong>Firewall</strong></td><td>Rules that allow or block network traffic (ufw, security groups).</td></tr>
+<tr><td><strong>Feature flag</strong></td><td>Runtime switch that enables code paths without redeploying.</td></tr>
+<tr><td><strong>GitOps</strong></td><td>Git is the source of truth for desired state; an agent applies it (Argo CD, Flux).</td></tr>
+<tr><td><strong>Health check</strong></td><td>Endpoint or probe that tells a load balancer or orchestrator whether an instance is OK.</td></tr>
+<tr><td><strong>Helm</strong></td><td>Package manager for Kubernetes manifests (charts).</td></tr>
+<tr><td><strong>Horizontal scaling</strong></td><td>Adding more instances (vs vertical: a bigger instance).</td></tr>
+<tr><td><strong>HTTP / HTTPS</strong></td><td>Web protocol; HTTPS adds TLS encryption.</td></tr>
+<tr><td><strong>IaaS / PaaS / SaaS</strong></td><td>Rent infrastructure / a platform to run apps / finished software.</td></tr>
+<tr><td><strong>IaC</strong></td><td>Infrastructure as Code: defining infrastructure in version-controlled files.</td></tr>
+<tr><td><strong>IAM</strong></td><td>Identity and Access Management: who can do what in a cloud account.</td></tr>
+<tr><td><strong>Idempotent</strong></td><td>Running an operation many times yields the same result as once. Essential for automation.</td></tr>
+<tr><td><strong>Image</strong></td><td>Immutable template from which containers (or VMs) are started.</td></tr>
+<tr><td><strong>Immutable infrastructure</strong></td><td>Replace servers with new versions instead of modifying them in place.</td></tr>
+<tr><td><strong>Incident</strong></td><td>An event degrading service that needs response.</td></tr>
+<tr><td><strong>Ingress controller</strong></td><td>Component implementing Kubernetes Ingress rules (nginx, Traefik).</td></tr>
+<tr><td><strong>JWT</strong></td><td>JSON Web Token: signed token carrying identity claims.</td></tr>
+<tr><td><strong>Kubernetes (K8s)</strong></td><td>Orchestrator that schedules and heals containers across machines.</td></tr>
+<tr><td><strong>Latency</strong></td><td>Time for a request to complete.</td></tr>
+<tr><td><strong>Load balancer</strong></td><td>Distributes traffic across backends.</td></tr>
+<tr><td><strong>Log</strong></td><td>Timestamped record of events emitted by software.</td></tr>
+<tr><td><strong>Metric</strong></td><td>Numeric measurement over time (CPU, requests/sec).</td></tr>
+<tr><td><strong>Microservices</strong></td><td>Architecture of small, independently deployable services.</td></tr>
+<tr><td><strong>Migration (database)</strong></td><td>Versioned change to a database schema.</td></tr>
+<tr><td><strong>Monitoring / observability</strong></td><td>Collecting signals (logs, metrics, traces) to understand system behaviour.</td></tr>
+<tr><td><strong>Namespace</strong></td><td>Logical partition (Kubernetes namespaces; Linux kernel namespaces for containers).</td></tr>
+<tr><td><strong>nginx</strong></td><td>Popular web server and reverse proxy.</td></tr>
+<tr><td><strong>On-call</strong></td><td>Rotation of people who respond to alerts.</td></tr>
+<tr><td><strong>Orchestration</strong></td><td>Automated placement, scaling and healing of workloads.</td></tr>
+<tr><td><strong>Pipeline</strong></td><td>Automated sequence of stages (build, test, deploy).</td></tr>
+<tr><td><strong>Pod</strong></td><td>Smallest Kubernetes unit: one or more containers sharing network and storage.</td></tr>
+<tr><td><strong>Port</strong></td><td>Number identifying a service on a host (22 SSH, 80 HTTP, 443 HTTPS).</td></tr>
+<tr><td><strong>Postmortem</strong></td><td>Blameless write-up of an incident and follow-up actions.</td></tr>
+<tr><td><strong>Provisioning</strong></td><td>Creating infrastructure (servers, networks, databases).</td></tr>
+<tr><td><strong>Pull request (PR/MR)</strong></td><td>Proposal to merge a branch, reviewed and checked by CI.</td></tr>
+<tr><td><strong>Registry</strong></td><td>Storage for container images or packages (Docker Hub, GHCR, ECR).</td></tr>
+<tr><td><strong>Replica</strong></td><td>One of several identical copies of a workload.</td></tr>
+<tr><td><strong>Reverse proxy</strong></td><td>Server in front of apps that forwards client requests to them.</td></tr>
+<tr><td><strong>Rollback</strong></td><td>Returning to a previous known-good version.</td></tr>
+<tr><td><strong>Rolling update</strong></td><td>Replace instances gradually so service stays up.</td></tr>
+<tr><td><strong>Runbook</strong></td><td>Step-by-step guide for an operational task or alert.</td></tr>
+<tr><td><strong>Secret</strong></td><td>Sensitive value (password, key, token) that must be stored and rotated carefully.</td></tr>
+<tr><td><strong>Security group</strong></td><td>Cloud-level virtual firewall attached to instances.</td></tr>
+<tr><td><strong>Service mesh</strong></td><td>Infrastructure layer handling service-to-service traffic, mTLS and telemetry (Istio, Linkerd).</td></tr>
+<tr><td><strong>SLA / SLO / SLI</strong></td><td>Contractual promise / internal target / the measurement.</td></tr>
+<tr><td><strong>SRE</strong></td><td>Site Reliability Engineering: operations approached with software engineering.</td></tr>
+<tr><td><strong>SSH</strong></td><td>Secure Shell: encrypted remote login and tunnelling.</td></tr>
+<tr><td><strong>Stateless</strong></td><td>Keeps no per-client data between requests; easy to scale.</td></tr>
+<tr><td><strong>Systemd</strong></td><td>Linux init system and service manager.</td></tr>
+<tr><td><strong>Terraform</strong></td><td>Declarative IaC tool for provisioning cloud resources (OpenTofu is the open fork).</td></tr>
+<tr><td><strong>Throughput</strong></td><td>Work completed per unit time.</td></tr>
+<tr><td><strong>TLS</strong></td><td>Transport Layer Security: encryption and identity for connections.</td></tr>
+<tr><td><strong>Toil</strong></td><td>Manual, repetitive operational work that could be automated.</td></tr>
+<tr><td><strong>Trace</strong></td><td>Record of one request's path through multiple services.</td></tr>
+<tr><td><strong>TTL</strong></td><td>Time to live: how long a DNS answer or cache entry stays valid.</td></tr>
+<tr><td><strong>VPC</strong></td><td>Virtual Private Cloud: your private network in a cloud provider.</td></tr>
+<tr><td><strong>VPS</strong></td><td>Virtual Private Server: a rented virtual machine.</td></tr>
+<tr><td><strong>Volume</strong></td><td>Persistent storage attached to a container or VM.</td></tr>
+<tr><td><strong>Webhook</strong></td><td>HTTP callback one system sends to another when an event happens.</td></tr>
+<tr><td><strong>YAML</strong></td><td>Indentation-based data format used by CI, Kubernetes and Ansible.</td></tr>
+<tr><td><strong>Zero downtime</strong></td><td>Deploying without users seeing errors or outages.</td></tr>
+</table>
+
+<div class="callout tip"><strong>Acronym habit</strong><p>When you meet a new acronym, expand it once in your notes. Most DevOps jargon is a simple idea with an intimidating name.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Pick ten terms you could not define before and explain each aloud in one sentence.</li>
+<li>Group the terms into the 12 handbook sections. Which section has the most unfamiliar vocabulary for you? Start there.</li>
+</ol></div>

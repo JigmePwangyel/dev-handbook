@@ -1,0 +1,160 @@
+<h1>Health Checks and Uptime Monitoring</h1>
+<p class="lead">Before anything else can work (load balancing, autoscaling, rolling deploys, alerting) the platform needs a cheap way to ask your service: "are you OK?" Health checks are that question. Synthetic monitoring and status pages extend it to "does it work from the user's side, and do users know?"</p>
+
+<h2>Why health checks exist</h2>
+<p>A process can be running yet useless: deadlocked, out of database connections, still loading its cache. If the load balancer keeps sending traffic to such an instance, users get errors. Health checks let infrastructure make three different decisions:</p>
+<table>
+<tr><th>Question</th><th>Probe</th><th>If it fails</th></tr>
+<tr><td>Is the process alive or hopelessly stuck?</td><td><strong>Liveness</strong></td><td>Restart it</td></tr>
+<tr><td>Is it ready to serve traffic right now?</td><td><strong>Readiness</strong></td><td>Remove from load balancer rotation (do not restart)</td></tr>
+<tr><td>Has it finished booting?</td><td><strong>Startup</strong></td><td>Hold off liveness checks until it succeeds; kill if it never does</td></tr>
+</table>
+<p>Mixing these up is the classic mistake. If liveness checks the database and the DB blips, every instance is "dead", all restart together, and a short DB blip becomes a full outage with a thundering herd on recovery.</p>
+
+<h2>Designing the endpoints</h2>
+<h3>Liveness: <code>/livez</code> or <code>/healthz</code></h3>
+<p>Answers only: "is the event loop/threads responsive?" Should be trivial, fast and <strong>depend on nothing external</strong>. Return 200 if the process can run code.</p>
+<h3>Readiness: <code>/readyz</code></h3>
+<p>Answers: "can I usefully serve a request <em>now</em>?" Check critical, local-to-this-instance prerequisites: initial caches warmed, migrations done, a DB connection obtainable from the pool, not in shutdown. Return 503 while starting up or draining.</p>
+<pre><code>// Express example
+let ready = false, shuttingDown = false;
+
+app.get("/livez", (req, res) =&gt; res.status(200).send("ok"));
+
+app.get("/readyz", async (req, res) =&gt; {
+  if (!ready || shuttingDown) return res.status(503).json({ status: "not ready" });
+  try {
+    await db.query("SELECT 1");                      // fast, with a short timeout
+    return res.status(200).json({ status: "ready" });
+  } catch (e) {
+    return res.status(503).json({ status: "db unavailable" });
+  }
+});
+
+await warmCache(); await runMigrationsIfLeader(); ready = true;
+
+process.on("SIGTERM", async () =&gt; {                 // graceful shutdown
+  shuttingDown = true;                               // readiness flips to 503 first
+  await sleep(10_000);                               // let the LB notice and drain
+  server.close(() =&gt; process.exit(0));
+});</code></pre>
+<div class="callout key"><strong>Shallow vs deep checks</strong><p>Deep checks (verifying every dependency) are tempting but dangerous in the readiness path: if a <em>shared</em> dependency fails, every instance goes unready at once and the load balancer has nowhere to send traffic, turning partial degradation into total outage. Check only what this instance needs to function, with timeouts; report optional dependencies in a separate diagnostic endpoint (<code>/status</code>) that feeds dashboards, not routing.</p></div>
+<ul>
+<li>Keep checks fast (&lt; 100 ms) and cheap; they run every few seconds on every instance.</li>
+<li>Do not require authentication on them, but do not expose internals publicly; restrict to the internal network.</li>
+<li>Return a proper HTTP status (200/503). A 200 with <code>"status":"error"</code> in the body fools the prober.</li>
+</ul>
+
+<h2>Where probes run</h2>
+<h3>Kubernetes</h3>
+<pre><code>containers:
+- name: web
+  image: acme/web:1.8.3
+  ports: [{ containerPort: 8080 }]
+  startupProbe:                  # allow up to 30 x 5 = 150 s to boot
+    httpGet: { path: /livez, port: 8080 }
+    periodSeconds: 5
+    failureThreshold: 30
+  livenessProbe:
+    httpGet: { path: /livez, port: 8080 }
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3          # restart after 3 consecutive failures
+  readinessProbe:
+    httpGet: { path: /readyz, port: 8080 }
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2          # remove from Service endpoints
+    successThreshold: 1
+  lifecycle:
+    preStop: { exec: { command: ["sleep", "10"] } }   # drain before SIGTERM</code></pre>
+<h3>Docker, load balancers, platforms</h3>
+<pre><code># Dockerfile / Compose
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8080/livez || exit 1
+
+# AWS ALB target group health check (Terraform)
+health_check {
+  path                = "/readyz"
+  interval            = 15
+  timeout             = 5
+  healthy_threshold   = 2
+  unhealthy_threshold = 3
+  matcher             = "200"
+}</code></pre>
+<p>Tune thresholds to avoid flapping: require several consecutive failures before removing a target and a couple of successes before adding it back. Set the ASG/ECS "health check grace period" long enough for boot.</p>
+
+<h2>Monitoring from outside: synthetic checks</h2>
+<p>Internal health checks cannot see DNS failures, expired certificates, CDN or firewall misconfigurations, a broken login flow, or regional network problems. <strong>Synthetic monitoring</strong> runs scripted requests against your public endpoints from outside, on a schedule, from several locations.</p>
+<ul>
+<li><strong>Uptime checks</strong>: HTTP GET every 30-60 s from multiple regions; assert status code, response time and a text snippet in the body.</li>
+<li><strong>TLS certificate expiry</strong>: alert 14+ days ahead.</li>
+<li><strong>DNS and domain expiry</strong> checks.</li>
+<li><strong>Multi-step browser flows</strong> (login, add to cart, checkout) with Playwright-based checks: Checkly, Datadog Synthetics, Grafana Synthetic Monitoring, AWS CloudWatch Synthetics.</li>
+<li><strong>Heartbeat / dead man's switch</strong> monitoring for cron jobs and batch tasks: the job pings a URL (Healthchecks.io, Cronitor) on success; no ping in the expected window triggers an alert. This catches jobs that silently never ran.</li>
+</ul>
+<pre><code># Prometheus blackbox_exporter probing an endpoint
+scrape_configs:
+  - job_name: blackbox-http
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs:
+      - targets: [https://www.example.com/, https://api.example.com/healthz]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+# Alerts
+- alert: SiteDown
+  expr: probe_success{job="blackbox-http"} == 0
+  for: 2m
+- alert: CertExpiringSoon
+  expr: probe_ssl_earliest_cert_expiry - time() &lt; 14*24*3600
+  for: 1h
+
+# Cron heartbeat
+0 3 * * *  /opt/backup.sh &amp;&amp; curl -fsS --retry 3 https://hc-ping.com/your-uuid</code></pre>
+<div class="callout tip"><strong>Probe from at least three locations and require agreement</strong><p>A single prober failing is often its own network. Alert when 2 of 3 locations fail for a couple of minutes to avoid false pages. Also run at least one probe from <em>outside your cloud provider</em>, so a provider-wide issue does not blind your monitor.</p></div>
+
+<h2>Status pages</h2>
+<p>When things break, customers want to know: is it me or you? A status page reduces support tickets and builds trust.</p>
+<ul>
+<li>Host it on <strong>separate infrastructure and domain</strong> from your main app (otherwise it goes down with it). Options: Atlassian Statuspage, Instatus, Better Stack, Cachet (self-hosted), or a static page.</li>
+<li>Show components (API, Web app, Payments, Webhooks) with current state: Operational, Degraded performance, Partial outage, Major outage.</li>
+<li>Post incident updates with timestamps; keep a history and show uptime percentages (matching your SLOs).</li>
+<li>Offer subscriptions (email, RSS, Slack, webhook). Automate updates from monitors for obvious outages, but have a human write the message for complex ones.</li>
+<li>Be honest. Hiding problems damages trust more than the problem itself.</li>
+</ul>
+
+<h2>Putting it together</h2>
+<pre class="diagram">
+  users ─▶ DNS ─▶ CDN ─▶ Load balancer ─(readiness)─▶ instances ─(liveness)─▶ restart if stuck
+              ▲                                             │
+              │ external synthetic probes ─ alerts ─▶ on-call
+              │ (uptime, TLS, login flow)                   │
+   status page ◀── incident updates ───────────────────────┘
+</pre>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Liveness probes that check dependencies</strong>, causing restart storms.</li>
+<li><strong>One endpoint for everything</strong> (<code>/health</code> returning 200 always, or deep-checking everything).</li>
+<li><strong>Slow start with an aggressive liveness probe</strong>: the app is killed before it finishes booting. Use startup probes.</li>
+<li><strong>Ignoring graceful shutdown</strong>: instance removed from rotation but killed mid-request; deploys drop connections. Handle SIGTERM and drain.</li>
+<li><strong>Health check endpoints hit by logs/metrics</strong>: they flood logs and skew latency statistics; filter them.</li>
+<li><strong>Green status while users suffer</strong>: health checks say 200 but the login flow is broken. Add synthetic journeys and SLI-based alerts.</li>
+<li><strong>Status page on the same infrastructure</strong> as the product.</li>
+<li><strong>Expired certificates and domains</strong>: boring, common, and preventable with a simple probe.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Add <code>/livez</code> and <code>/readyz</code> to a service. Make readiness fail for the first 20 seconds after boot and observe a Kubernetes or Docker rollout wait for it.</li>
+<li>Kill the database and watch readiness fail while liveness stays green. Explain why that is the desired behaviour.</li>
+<li>Set up a free uptime monitor (UptimeRobot, Better Stack or Healthchecks.io) for a public URL, plus a heartbeat for a cron job. Let the job fail once on purpose and confirm the alert.</li>
+<li>Run <code>openssl s_client -connect example.com:443 -servername example.com 2&gt;/dev/null | openssl x509 -noout -dates</code> and compute days until your cert expires.</li>
+</ol></div>

@@ -1,0 +1,110 @@
+<h1>Probes, Resources and Autoscaling</h1>
+<p class="lead">Kubernetes can only keep your app healthy and right-sized if you tell it what healthy means and how much it needs. Probes, resource requests and limits, and autoscalers are the three levers that turn a pile of Pods into a resilient, efficient system.</p>
+
+<h2>Health probes</h2>
+<p>By default Kubernetes only knows if a container's main process is alive. A deadlocked web server is "alive" but useless. Probes let the kubelet ask the app directly.</p>
+<table>
+<tr><th>Probe</th><th>Question</th><th>On failure</th></tr>
+<tr><td><strong>startupProbe</strong></td><td>Has the app finished booting?</td><td>Container is killed and restarted; other probes are disabled until it passes</td></tr>
+<tr><td><strong>readinessProbe</strong></td><td>Can it serve traffic right now?</td><td>Removed from Service endpoints; <em>not</em> restarted</td></tr>
+<tr><td><strong>livenessProbe</strong></td><td>Is it stuck beyond recovery?</td><td>Container is restarted</td></tr>
+</table>
+<pre><code>containers:
+  - name: shop
+    image: ghcr.io/example/shop:2.3.1
+    startupProbe:                  # allows up to 30 x 5 = 150 s to boot
+      httpGet: { path: /healthz, port: 8080 }
+      periodSeconds: 5
+      failureThreshold: 30
+    readinessProbe:
+      httpGet: { path: /ready, port: 8080 }
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 3
+    livenessProbe:
+      httpGet: { path: /healthz, port: 8080 }
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+      # other mechanisms: tcpSocket, exec (command), grpc</code></pre>
+<div class="callout warn"><strong>Liveness probes cause outages</strong><p>A common disaster: the liveness probe checks the database. The database blips, every Pod fails liveness, Kubernetes restarts the entire fleet at once and turns a blip into an outage. Keep liveness checks <em>local and cheap</em> (is this process responsive?). Put dependency checks in readiness at most, and be careful there too. If unsure, use no liveness probe rather than a bad one.</p></div>
+<p>Readiness is what makes rolling updates safe: a new Pod only receives traffic, and an old one is only removed, once readiness passes.</p>
+
+<h2>Requests and limits</h2>
+<p>Each container declares resources:</p>
+<pre><code>resources:
+  requests:        # what the scheduler RESERVES; used to place the Pod
+    cpu: 250m      # 250 millicores = 0.25 of a core
+    memory: 256Mi
+  limits:          # the ceiling enforced at runtime
+    memory: 512Mi
+    # cpu limit often omitted, see below</code></pre>
+<ul>
+<li><strong>Requests</strong> drive scheduling. A Pod requesting 4 Gi only lands on a node with 4 Gi unreserved. Also the guaranteed share under contention.</li>
+<li><strong>CPU limit</strong>: compressible. Exceeding it means <em>throttling</em> (slowness), not death. Many teams set CPU requests but no CPU limits to avoid needless throttling; others keep them for fairness. Both are defensible; know the trade-off.</li>
+<li><strong>Memory limit</strong>: incompressible. Exceeding it means the kernel kills the container: <code>OOMKilled</code>, exit code 137.</li>
+</ul>
+<p>Without requests, the scheduler thinks Pods are free, overcommits nodes, and everything slows or gets evicted. Without memory limits, one leaky Pod can take down a node's neighbours.</p>
+
+<h3>QoS classes</h3>
+<p>Derived automatically; determines eviction order when a node runs out of memory.</p>
+<table>
+<tr><th>Class</th><th>Condition</th><th>Evicted</th></tr>
+<tr><td>Guaranteed</td><td>Every container has requests = limits for CPU and memory</td><td>Last</td></tr>
+<tr><td>Burstable</td><td>At least one request or limit set, not Guaranteed</td><td>Middle</td></tr>
+<tr><td>BestEffort</td><td>Nothing set</td><td>First</td></tr>
+</table>
+<p>Right-sizing: watch real usage (<code>kubectl top pods</code>, Prometheus) and set memory request close to typical peak with a limit with headroom, and CPU request near typical usage. JVM and Node apps need runtime flags aware of the container limit (modern JVMs are; for Node set <code>--max-old-space-size</code> below the limit).</p>
+
+<h2>Horizontal Pod Autoscaler (HPA)</h2>
+<p>Adds or removes <strong>replicas</strong> based on metrics. It needs metrics-server installed and CPU/memory requests on the Pods (utilisation is computed relative to the request).</p>
+<pre><code>apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: shop }
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: shop
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # avoid flapping
+    scaleUp:
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 60 }</code></pre>
+<p>The formula: <code>desired = ceil(current * currentMetric / targetMetric)</code>. Custom and external metrics (requests per second, queue length) work through a metrics adapter, or use <strong>KEDA</strong>, which scales on Kafka lag, SQS depth, cron schedules and more, and can scale to zero.</p>
+<p>HPA works only if your app scales horizontally (stateless or shared-nothing) and starts fast.</p>
+
+<h2>Vertical Pod Autoscaler (VPA)</h2>
+<p>Adjusts the <strong>requests</strong> of a workload based on observed usage. Modes: <code>Off</code> (recommendations only, safest start), <code>Initial</code>, and <code>Auto</code>/<code>Recreate</code> (evicts Pods to apply new values; newer versions support in-place resize on recent Kubernetes). Do not let HPA and VPA both react to CPU on the same workload. A common pattern: VPA in recommendation mode to guide manual right-sizing.</p>
+
+<h2>Cluster Autoscaler and Karpenter</h2>
+<p>HPA creates Pods, but if no node has room they sit <code>Pending</code>. The <strong>Cluster Autoscaler</strong> watches for unschedulable Pods and adds nodes to a node group; it removes nodes that stay underused and whose Pods can move elsewhere. <strong>Karpenter</strong> (AWS, spreading to others) provisions right-sized individual instances directly without pre-defined node groups, often faster and cheaper, mixing spot and on-demand.</p>
+<pre class="diagram">
+ traffic ↑ ─▶ HPA adds Pods ─▶ no room? Pods Pending ─▶ Cluster Autoscaler adds a node ─▶ Pods scheduled
+ traffic ↓ ─▶ HPA removes Pods ─▶ nodes underused ─▶ autoscaler drains and removes node
+</pre>
+<p>Node scale-up takes minutes. For spiky traffic, keep headroom with low-priority "pause" Pods that get preempted, or a higher minReplicas.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>HPA shows <code>&lt;unknown&gt;</code> targets: metrics-server missing or requests not set.</li>
+<li>Readiness probe too aggressive, so new Pods never become ready and HPA keeps adding more.</li>
+<li>Memory limit lower than the real working set: endless <code>OOMKilled</code> restarts. Check <code>kubectl describe pod</code> for "Last State: Terminated, Reason: OOMKilled".</li>
+<li>Slow startup with a short liveness: restart loop. Use a startupProbe.</li>
+<li>Scale-down kills in-flight requests: handle SIGTERM and use a <code>preStop</code> sleep of a few seconds so endpoints propagate first.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Install metrics-server on kind (it needs <code>--kubelet-insecure-tls</code> locally). Run <code>kubectl top nodes</code>.</li>
+<li>Deploy a CPU-burning app, attach an HPA at 50 percent, and generate load with <code>kubectl run -it load --image=busybox -- sh -c "while true; do wget -q -O- http://shop; done"</code>. Watch <code>kubectl get hpa -w</code>.</li>
+<li>Set a memory limit of 20Mi on a Pod that allocates more and observe OOMKilled.</li>
+</ol></div>

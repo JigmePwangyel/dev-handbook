@@ -1,0 +1,111 @@
+<h1>PaaS and Modern Platforms</h1>
+<p class="lead">Platform-as-a-Service products let you <code>git push</code> and get a running, HTTPS-enabled, autoscaled application. They bundle what the earlier lessons made you assemble by hand: networking, load balancing, certificates, deploys, logs. For many products, this is the right answer for years.</p>
+
+<h2>The idea and why it exists</h2>
+<p>Building a production setup on raw AWS means wiring a VPC, load balancer, autoscaling, CI/CD, TLS, logging and secrets. That is weeks of work and ongoing maintenance, and none of it is your product. A PaaS says: "give me your code (or container) and some environment variables; I'll do the rest". Heroku popularised this in 2009 with <code>git push heroku main</code>; today's platforms extend it with preview environments, edge networks and managed databases.</p>
+<pre class="diagram">
+ git push ──▶ Platform detects framework ──▶ builds (buildpack / Dockerfile)
+                                              │
+                    ┌─────────────────────────▼─────────────────────────┐
+                    │ release: new instances start, health-checked,     │
+                    │ traffic shifted, old ones drained (zero-downtime) │
+                    └─────────────────────────┬─────────────────────────┘
+                                              ▼
+             https://myapp.example.com  (managed TLS, CDN, logs, metrics, rollbacks)
+</pre>
+
+<h2>The landscape</h2>
+<table>
+<tr><th>Platform</th><th>Sweet spot</th><th>Notes</th></tr>
+<tr><td><strong>Vercel</strong></td><td>Frontend frameworks (Next.js, SvelteKit, Astro), edge/serverless functions</td><td>Excellent DX, per-PR preview deployments, global CDN. Costs climb with bandwidth and function usage; not for heavy backends.</td></tr>
+<tr><td><strong>Netlify</strong></td><td>Static sites / Jamstack, forms, serverless functions</td><td>Similar to Vercel; strong for marketing sites and docs.</td></tr>
+<tr><td><strong>Cloudflare Pages / Workers</strong></td><td>Edge-first apps, very cheap at scale</td><td>Workers runtime differs from Node; pairs with D1, R2, KV.</td></tr>
+<tr><td><strong>Render</strong></td><td>Full-stack apps: web services, workers, cron, Postgres, static sites</td><td>Heroku-like simplicity, predictable pricing, Docker support, free tiers for hobby.</td></tr>
+<tr><td><strong>Railway</strong></td><td>Fast prototyping, apps + DBs in one project</td><td>Usage-based billing, great UX, easy service wiring.</td></tr>
+<tr><td><strong>Fly.io</strong></td><td>Containers run close to users in many regions; Firecracker microVMs</td><td>Multi-region by default; more infra knowledge needed; <code>fly launch</code>, <code>fly deploy</code>.</td></tr>
+<tr><td><strong>Heroku</strong></td><td>The original; mature add-on ecosystem</td><td>Still reliable, but no free tier and relatively pricey; buildpacks and Procfile model.</td></tr>
+<tr><td><strong>Cloud Run / App Runner / Azure Container Apps</strong></td><td>"PaaS inside a hyperscaler"</td><td>Stay in your cloud account and IAM/VPC; see the compute lesson.</td></tr>
+<tr><td><strong>Supabase / Neon / PlanetScale-style</strong></td><td>Managed backend/DB layers</td><td>Pair with any compute platform.</td></tr>
+</table>
+<div class="callout info"><strong>Pricing changes constantly</strong><p>Free tiers and plans on these platforms change often. Check current pricing before committing, and model your expected bandwidth, build minutes and function invocations.</p></div>
+
+<h2>A taste: deploying on three platforms</h2>
+<pre><code># Heroku-style (Procfile + buildpack)
+echo "web: node server.js" &gt; Procfile
+heroku create myapp
+git push heroku main
+heroku config:set DATABASE_URL=postgres://...
+heroku logs --tail
+
+# Fly.io (containers, multi-region)
+fly launch                 # generates fly.toml from your Dockerfile
+fly secrets set API_KEY=abc123
+fly deploy
+fly scale count 3 --region fra,iad
+
+# Vercel (frontend + serverless)
+npm i -g vercel
+vercel --prod              # or connect the Git repo; every PR gets a preview URL</code></pre>
+<p>Typical <code>fly.toml</code>:</p>
+<pre><code>app = "myapp"
+primary_region = "fra"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    path = "/healthz"
+    interval = "15s"
+    timeout = "2s"</code></pre>
+
+<h2>When PaaS beats DIY</h2>
+<ul>
+<li><strong>Small team, no dedicated ops.</strong> Engineer time is your scarcest resource; a $200/month platform that saves a week of work per quarter is cheap.</li>
+<li><strong>Early product, uncertain traffic.</strong> You are still finding product-market fit; do not build a platform for a product that may pivot.</li>
+<li><strong>Preview environments per PR</strong> come free, speeding review and QA.</li>
+<li><strong>Standard architecture</strong>: web app, a worker, a database, a cache.</li>
+<li><strong>Compliance and security managed for you</strong> (patching, TLS renewal, DDoS basics).</li>
+</ul>
+
+<h2>When DIY (or a hyperscaler) beats PaaS</h2>
+<ul>
+<li><strong>Scale economics.</strong> At large traffic, per-unit prices matter; companies with big bills move off PaaS (but often later than they think).</li>
+<li><strong>Special requirements</strong>: GPUs, custom networking, private connectivity to on-prem, strict data residency, exotic runtimes.</li>
+<li><strong>Deep integration</strong> with a cloud's IAM, VPC, data services.</li>
+<li><strong>Customisation limits</strong>: you cannot tune the kernel, load balancer or scheduler.</li>
+<li><strong>Compliance</strong> demanding specific audit controls the platform does not offer.</li>
+</ul>
+
+<h2>Trade-offs in detail</h2>
+<table>
+<tr><th>Benefit</th><th>Cost</th></tr>
+<tr><td>Speed to production: hours, not weeks</td><td>Higher price per unit of compute/bandwidth</td></tr>
+<tr><td>No infrastructure to maintain</td><td>Less control, platform's constraints become yours</td></tr>
+<tr><td>Built-in best practices (TLS, zero-downtime deploys)</td><td>Vendor-specific features create lock-in</td></tr>
+<tr><td>Easy to scale up in clicks</td><td>Scaling limits and noisy bills at high volume</td></tr>
+</table>
+<p>Lock-in is reduced when you follow the <strong>twelve-factor</strong> habits: config in env vars, stateless processes, logs to stdout, a Dockerfile in the repo. Then moving to Cloud Run, ECS or Kubernetes later is a weekend, not a rewrite.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Surprise bills</strong> from bandwidth, function invocations, build minutes or team seats. Set spend limits and alerts.</li>
+<li><strong>Databases on free tiers</strong> that sleep or get deleted. Use a proper managed database with backups for real data.</li>
+<li><strong>Ephemeral filesystems</strong>: files written to disk disappear on deploy. Use object storage.</li>
+<li><strong>Cold starts and sleeping apps</strong> on cheap plans.</li>
+<li><strong>No observability beyond basics</strong>: ship logs/metrics to a real system (Grafana Cloud, Datadog, Axiom) as you grow.</li>
+<li><strong>Region mismatch</strong>: app in the US, database in Europe means slow every query.</li>
+</ul>
+
+<div class="callout key"><strong>The graduation path</strong><p>Many successful products follow: PaaS (prototype) &rarr; PaaS + managed DB (launch) &rarr; containers on a hyperscaler (scale and cost) &rarr; Kubernetes (platform for many teams). Each step is justified by a concrete pain, not fashion.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Take a small web app with a Dockerfile and deploy it to Render and Fly.io. Compare time-to-URL, logs UX, and the pricing page for 1 GB RAM always-on.</li>
+<li>Deploy a static site to Netlify or Vercel, then open a pull request that changes it and find the preview URL.</li>
+<li>Add a <code>/healthz</code> endpoint and configure the platform's health check.</li>
+<li>Write down what you would have to change to move this app to Cloud Run. If the answer is "nothing but the deploy command", your app is portable.</li>
+</ol></div>

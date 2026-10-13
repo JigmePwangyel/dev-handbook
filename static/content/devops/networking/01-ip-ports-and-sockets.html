@@ -1,0 +1,160 @@
+<h1>IP Addresses, Ports and Sockets</h1>
+<p class="lead">Every deployment problem eventually becomes "can machine A reach machine B on port N?" This lesson gives you the mental model and the commands to answer that question in seconds instead of hours.</p>
+
+<h2>Why this matters</h2>
+<p>You deploy an app, open the browser and get "connection refused" or a spinning timeout. Without a networking model you can only guess. With one, you can ask precise questions: Is the process listening? On which address? Is a firewall dropping packets? Does DNS point at the right machine? Each question maps to a layer and a tool.</p>
+
+<h2>The layers you actually need</h2>
+<pre class="diagram">
+ Application   HTTP, SSH, Postgres protocol      (your code, nginx)
+ Transport     TCP / UDP  + port numbers         (the OS kernel)
+ Network       IP addresses + routing            (routers)
+ Link          Ethernet / Wi-Fi frames           (switches, NICs)
+</pre>
+<p>The full OSI model has seven layers, but in practice you reason about four: link, IP, TCP/UDP, application. "L4 load balancer" and "L7 load balancer" (later lessons) refer to the transport and application layers.</p>
+
+<h2>IP addresses</h2>
+<p>An IP address identifies a network interface. It is how packets find their destination across routers.</p>
+<ul>
+<li><strong>IPv4</strong>: 32 bits, written <code>203.0.113.10</code>. About 4.3 billion addresses, which ran out, hence NAT and IPv6.</li>
+<li><strong>IPv6</strong>: 128 bits, written <code>2001:db8::1</code>. Effectively unlimited. Most clouds and CDNs support it; many home networks do too.</li>
+</ul>
+
+<h3>Public vs private addresses</h3>
+<table>
+<tr><th>Range (CIDR)</th><th>Use</th></tr>
+<tr><td><code>10.0.0.0/8</code></td><td>Private (large networks, cloud VPCs)</td></tr>
+<tr><td><code>172.16.0.0/12</code></td><td>Private (Docker uses 172.17.0.0/16 by default)</td></tr>
+<tr><td><code>192.168.0.0/16</code></td><td>Private (home routers)</td></tr>
+<tr><td><code>127.0.0.0/8</code></td><td>Loopback: this machine only (<code>127.0.0.1</code>, <code>localhost</code>)</td></tr>
+<tr><td><code>169.254.0.0/16</code></td><td>Link-local (cloud metadata service at <code>169.254.169.254</code>)</td></tr>
+<tr><td>Everything else</td><td>Public, routable on the internet</td></tr>
+</table>
+<p>Private addresses are not routable on the internet. A NAT gateway (your home router, or a cloud NAT gateway) rewrites outgoing packets to a public address. That is why your laptop at <code>192.168.1.20</code> can browse the web but nobody can connect to it directly.</p>
+
+<h3>CIDR notation</h3>
+<p><code>10.0.1.0/24</code> means "the first 24 bits are the network, the last 8 bits are hosts", so 256 addresses (<code>10.0.1.0</code> to <code>10.0.1.255</code>). A <code>/16</code> has 65,536 addresses, a <code>/32</code> is exactly one host. You will see CIDR in firewall rules, security groups and VPC design.</p>
+<table>
+<tr><th>CIDR</th><th>Addresses</th><th>Typical use</th></tr>
+<tr><td>/32</td><td>1</td><td>A single host ("allow only my IP")</td></tr>
+<tr><td>/24</td><td>256</td><td>A subnet</td></tr>
+<tr><td>/16</td><td>65,536</td><td>A whole VPC</td></tr>
+<tr><td>/0</td><td>All</td><td>"Anywhere" (<code>0.0.0.0/0</code>)</td></tr>
+</table>
+
+<h2>Ports</h2>
+<p>An IP gets a packet to a machine. A <strong>port</strong> (0 to 65535) gets it to the right program on that machine. One process "listens" on a port; clients connect to it.</p>
+<table>
+<tr><th>Port</th><th>Protocol</th><th>Notes</th></tr>
+<tr><td>22</td><td>SSH</td><td>Remote shell</td></tr>
+<tr><td>25 / 587</td><td>SMTP</td><td>Mail</td></tr>
+<tr><td>53</td><td>DNS</td><td>UDP and TCP</td></tr>
+<tr><td>80</td><td>HTTP</td><td></td></tr>
+<tr><td>443</td><td>HTTPS</td><td>TCP, and UDP for HTTP/3</td></tr>
+<tr><td>3306</td><td>MySQL</td><td>Never expose publicly</td></tr>
+<tr><td>5432</td><td>PostgreSQL</td><td>Never expose publicly</td></tr>
+<tr><td>6379</td><td>Redis</td><td>Never expose publicly</td></tr>
+<tr><td>3000, 8000, 8080</td><td>Dev servers</td><td>Convention only</td></tr>
+</table>
+<p>Ports 0 to 1023 are "privileged": on Linux only root (or a process with <code>CAP_NET_BIND_SERVICE</code>) may bind them. This is why you run your Node app on 3000 and let nginx (which binds 80/443) forward to it.</p>
+
+<h2>Sockets, TCP and UDP</h2>
+<p>A <strong>socket</strong> is the OS object that represents one end of a connection. A TCP connection is uniquely identified by a 4-tuple:</p>
+<pre class="diagram">
+ (client IP, client port, server IP, server port)
+ (198.51.100.7, 51514, 203.0.113.10, 443)
+</pre>
+<p>The client's port is an <em>ephemeral</em> port (roughly 32768 to 60999 on Linux) picked by the OS. One server port can serve thousands of clients because each connection has a different 4-tuple.</p>
+
+<table>
+<tr><th></th><th>TCP</th><th>UDP</th></tr>
+<tr><td>Connection</td><td>Yes (3-way handshake)</td><td>No</td></tr>
+<tr><td>Reliable, ordered</td><td>Yes (retransmits)</td><td>No</td></tr>
+<tr><td>Overhead</td><td>Higher</td><td>Lower</td></tr>
+<tr><td>Used by</td><td>HTTP/1.1, HTTP/2, SSH, databases</td><td>DNS queries, HTTP/3 (QUIC), video, VPNs</td></tr>
+</table>
+
+<h3>The TCP handshake and common errors</h3>
+<pre class="diagram">
+ Client                         Server
+   │── SYN ────────────────────▶│   "can we talk?"
+   │◀────────────── SYN-ACK ────│   "yes"
+   │── ACK ────────────────────▶│   connection established
+</pre>
+<p>The way a connection fails tells you where to look:</p>
+<table>
+<tr><th>Symptom</th><th>Meaning</th><th>Check</th></tr>
+<tr><td><code>Connection refused</code></td><td>Host reachable, but nothing listening on that port (the OS replied with RST)</td><td>Is the process running? Right port? Bound to the right address?</td></tr>
+<tr><td><code>Connection timed out</code></td><td>Packets silently dropped. Usually a firewall or security group, or wrong IP</td><td>Firewall rules, security group, routing</td></tr>
+<tr><td><code>No route to host</code></td><td>Network layer cannot find a path</td><td>Routing, VPC, wrong subnet</td></tr>
+<tr><td><code>Could not resolve host</code></td><td>DNS failure</td><td>See the DNS lesson</td></tr>
+</table>
+
+<div class="callout key"><strong>Refused vs timeout</strong><p>"Refused" is good news: the network works and the machine answered, so the problem is the process. "Timeout" means something in the path is dropping your packets, almost always a firewall. Memorise this distinction; it halves your debugging time.</p></div>
+
+<h2>Listening addresses: the 0.0.0.0 trap</h2>
+<p>A server chooses which local address to bind:</p>
+<ul>
+<li><code>127.0.0.1</code>: only reachable from the same machine. Perfect for an app behind nginx or a database that only the app uses.</li>
+<li><code>0.0.0.0</code>: all IPv4 interfaces, reachable from anywhere the network allows. <code>::</code> is the IPv6 equivalent.</li>
+<li>A specific private IP such as <code>10.0.1.5</code>: only that interface.</li>
+</ul>
+<pre><code>// Node/Express
+app.listen(3000, '127.0.0.1');   // only nginx on the same box can reach it
+app.listen(3000, '0.0.0.0');     // reachable from the network (needed inside Docker)</code></pre>
+<p>Two classic bugs: (1) the app binds <code>127.0.0.1</code> inside a Docker container, so published ports never work; (2) the database binds <code>0.0.0.0</code> on a public IP with a weak password, and gets found by scanners within hours.</p>
+
+<h2>Diagnostic toolbox</h2>
+<pre><code># What is listening on this machine? (-t tcp, -l listening, -n numeric, -p process)
+sudo ss -tlnp
+#  LISTEN 0 511 127.0.0.1:3000  0.0.0.0:*  users:(("node",pid=1234,fd=19))
+#  LISTEN 0 511 0.0.0.0:80      0.0.0.0:*  users:(("nginx",pid=800,fd=6))
+
+# Who is using port 3000?
+sudo lsof -i :3000
+
+# My addresses and routes
+ip addr
+ip route
+
+# Can I open a TCP connection to host:port? (-z scan only, -v verbose)
+nc -zv example.com 443
+
+# Full HTTP exchange with timing
+curl -v https://example.com/
+curl -o /dev/null -s -w 'dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect} total=%{time_total}\n' https://example.com/
+
+# Path to a destination (where do packets stop?)
+traceroute example.com      # or mtr example.com
+
+# What is my public IP?
+curl -s https://ifconfig.me</code></pre>
+<p><code>netstat</code> is the older equivalent of <code>ss</code>; on macOS use <code>lsof -iTCP -sTCP:LISTEN -n -P</code>.</p>
+
+<h2>A debugging ladder</h2>
+<ol>
+<li><strong>Is the process up?</strong> <code>systemctl status myapp</code>, <code>ss -tlnp | grep 3000</code>.</li>
+<li><strong>Does it answer locally?</strong> <code>curl -i http://127.0.0.1:3000/</code> on the server.</li>
+<li><strong>Does it answer from the server's public/private IP?</strong> Tests the bind address.</li>
+<li><strong>Is the host firewall open?</strong> <code>sudo ufw status</code>.</li>
+<li><strong>Is the cloud firewall open?</strong> Security group / network ACL.</li>
+<li><strong>Does DNS point here?</strong> <code>dig +short example.com</code>.</li>
+</ol>
+<p>Work outward from the process. The first failing step is your culprit.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Hard-coding IPs.</strong> Cloud IPs change when instances are replaced. Use DNS names or service discovery.</li>
+<li><strong>Forgetting UDP.</strong> Opening 443/tcp but not 443/udp silently disables HTTP/3 (it falls back to HTTP/2, so it still works).</li>
+<li><strong>Port conflicts.</strong> <code>EADDRINUSE</code> means another process already has that port. Find it with <code>ss</code> or <code>lsof</code>.</li>
+<li><strong>Ephemeral port exhaustion.</strong> A client making huge numbers of short connections to one server can run out of source ports (<code>TIME_WAIT</code> pile-up). Fix with connection reuse (keep-alive, pooling).</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>ip addr</code> (Linux) or <code>ifconfig</code> (macOS). Identify your loopback and LAN addresses. Is your LAN address in a private range?</li>
+<li>Start a throwaway server: <code>python3 -m http.server 8000 --bind 127.0.0.1</code>. In another terminal run <code>ss -tlnp | grep 8000</code> (or <code>lsof -i :8000</code>) and note the bind address.</li>
+<li>From another machine on your network (or by using your LAN IP), try to reach it. It should be refused or time out. Restart with <code>--bind 0.0.0.0</code> and retry.</li>
+<li>Run <code>nc -zv localhost 9999</code> (nothing is listening) and observe "refused". Compare with <code>nc -zv -w 3 10.255.255.1 80</code>, which should time out.</li>
+<li>Use the <code>curl -w</code> timing command against any site and identify which phase is slowest.</li>
+</ol></div>

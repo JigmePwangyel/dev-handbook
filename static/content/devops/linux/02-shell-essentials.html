@@ -1,0 +1,130 @@
+<h1>Shell Essentials</h1>
+<p class="lead">On a server there is usually no GUI. The shell is how you inspect, change and automate everything. A small set of commands and the idea of pipes cover 90% of daily work.</p>
+
+<h2>Why the command line</h2>
+<p>GUIs are great for one-off tasks but cannot be scripted, version-controlled, repeated on 50 servers, or used over a slow SSH link. Every command you type is also something you can paste into a script, a Dockerfile or a CI job. The shell is the common language of DevOps.</p>
+
+<h2>Shell, terminal, bash</h2>
+<ul>
+<li><strong>Terminal</strong>: the window. <strong>Shell</strong>: the program interpreting your commands (bash on most servers, zsh on macOS, sh/dash for minimal scripts).</li>
+<li>The prompt <code>deploy@web1:~$</code> means user <code>deploy</code> on host <code>web1</code> in the home directory (<code>~</code>); <code>$</code> means normal user, <code>#</code> means root.</li>
+<li>Command anatomy: <code>command [options] [arguments]</code>, e.g. <code>ls -l /var/log</code>.</li>
+</ul>
+
+<h2>Navigating and looking around</h2>
+<pre><code>pwd                    # where am I?
+ls                     # list files
+ls -lah                # long format, hidden files, human sizes
+cd /var/log            # absolute path
+cd ..                  # up one level
+cd ~                   # home (or just: cd)
+cd -                   # back to previous directory
+tree -L 2 /etc/nginx   # directory tree (apt install tree)
+file /bin/ls           # what kind of file is this?
+stat app.log           # size, owner, permissions, timestamps</code></pre>
+
+<h2>Working with files</h2>
+<pre><code>mkdir -p app/releases/v1       # -p creates parents, no error if exists
+touch notes.txt                # create empty file / update timestamp
+cp config.yml config.yml.bak   # copy
+cp -r src/ backup/             # copy directory recursively
+mv old.txt new.txt             # rename OR move
+rm file.txt                    # delete (no trash can!)
+rm -r olddir/                  # delete directory recursively
+ln -s /opt/app/releases/v2 /opt/app/current   # symbolic link</code></pre>
+<div class="callout warn"><strong>rm has no undo</strong><p>Never run <code>rm -rf</code> with a variable you have not checked: <code>rm -rf "$DIR/"</code> with <code>DIR</code> empty becomes <code>rm -rf /</code>. Modern GNU rm refuses <code>/</code>, but not <code>/*</code> or a wrongly-set path. Use <code>ls</code> with the same argument first, and quote variables.</p></div>
+
+<h2>Reading and searching</h2>
+<pre><code>cat file.txt                 # print whole file
+less /var/log/syslog         # page through (q quit, / search, G end, F follow)
+head -n 20 file              # first 20 lines
+tail -n 50 file              # last 50 lines
+tail -f /var/log/nginx/error.log   # follow new lines live (Ctrl+C to stop)
+wc -l file                   # count lines
+
+grep "error" app.log                 # lines containing "error"
+grep -i -n "timeout" app.log         # case-insensitive, with line numbers
+grep -r "DATABASE_URL" /etc/myapp    # recursive search
+grep -v "healthz" access.log         # invert: lines NOT matching
+find /var/log -name "*.log" -mtime -1      # modified in last day
+find . -type f -size +100M                 # big files
+rg "pattern"                         # ripgrep: faster grep (apt install ripgrep)</code></pre>
+
+<h2>Pipes and redirection: the superpower</h2>
+<p>Every program has three streams: <strong>stdin</strong> (0), <strong>stdout</strong> (1), <strong>stderr</strong> (2). The shell lets you wire them together. Small tools doing one thing, composed with pipes, is the Unix philosophy.</p>
+<pre><code>command &gt; out.txt        # stdout to file (overwrite)
+command &gt;&gt; out.txt       # append
+command 2&gt; err.txt       # stderr to file
+command &gt; all.txt 2&gt;&amp;1  # both to the same file
+command &amp;&gt; all.txt       # bash shorthand for the same
+command &gt; /dev/null 2&gt;&amp;1   # discard everything
+command1 | command2      # stdout of 1 becomes stdin of 2
+command &lt; input.txt      # file as stdin</code></pre>
+<p>A realistic pipeline: top 5 client IPs hitting nginx.</p>
+<pre><code>awk '{print $1}' /var/log/nginx/access.log | sort | uniq -c | sort -nr | head -5
+#      1. take field 1 (IP)   2. group   3. count   4. numeric desc   5. top 5</code></pre>
+<table>
+<tr><th>Tool</th><th>Use</th></tr>
+<tr><td><code>sort</code>, <code>uniq</code></td><td>Order and deduplicate/count lines</td></tr>
+<tr><td><code>cut -d, -f2</code></td><td>Extract a column by delimiter</td></tr>
+<tr><td><code>awk</code></td><td>Field-based processing and arithmetic</td></tr>
+<tr><td><code>sed 's/old/new/g'</code></td><td>Stream find/replace</td></tr>
+<tr><td><code>xargs</code></td><td>Turn stdin lines into command arguments</td></tr>
+<tr><td><code>tee file</code></td><td>Write stdin to file and still pass it on</td></tr>
+<tr><td><code>jq</code></td><td>Query and reshape JSON (essential for APIs)</td></tr>
+</table>
+<pre><code>curl -s https://api.github.com/repos/torvalds/linux | jq '.stargazers_count'
+echo "deploy ok" | sudo tee -a /var/log/deploys.log   # append with sudo (redirection ignores sudo!)</code></pre>
+
+<h2>Variables, quoting and exit codes</h2>
+<pre><code>NAME="web server"            # no spaces around =
+echo "$NAME"                 # double quotes: variable expands
+echo '$NAME'                 # single quotes: literal
+export APP_ENV=production    # visible to child processes
+echo "$HOME $USER $PATH"
+today=$(date +%F)            # command substitution
+echo "Backup-$today.tar.gz"
+
+ls /nonexistent; echo $?     # $? = exit code of last command: 0 = success, nonzero = failure
+mkdir build &amp;&amp; cd build      # run second only if first succeeded
+cmd || echo "failed"         # run second only if first failed
+cmd1; cmd2                   # run both regardless</code></pre>
+<p>Exit codes are the glue of automation: CI jobs, cron and deploy scripts all decide success by them.</p>
+
+<h2>Productivity shortcuts</h2>
+<table>
+<tr><th>Keys</th><th>Effect</th></tr>
+<tr><td><code>Tab</code></td><td>Autocomplete paths and commands (press twice for options)</td></tr>
+<tr><td><code>Ctrl+R</code></td><td>Reverse search history</td></tr>
+<tr><td><code>Ctrl+C</code> / <code>Ctrl+D</code></td><td>Interrupt / end of input (logout)</td></tr>
+<tr><td><code>Ctrl+A</code> / <code>Ctrl+E</code></td><td>Start / end of line</td></tr>
+<tr><td><code>Ctrl+L</code></td><td>Clear screen</td></tr>
+<tr><td><code>!!</code></td><td>Repeat last command (<code>sudo !!</code> is a classic)</td></tr>
+<tr><td><code>Alt+.</code></td><td>Insert last argument of previous command</td></tr>
+</table>
+<p>Also useful: <code>man ls</code> or <code>ls --help</code> for docs; <code>tldr tar</code> for friendly examples; <code>which node</code> and <code>type cmd</code> to see what will run; <code>history | grep ssh</code>; <code>alias ll='ls -lah'</code> in <code>~/.bashrc</code>.</p>
+
+<h2>Running things in the background</h2>
+<pre><code>long_task &amp;           # run in background of this shell
+jobs                  # list
+fg %1                 # bring to foreground
+nohup ./task.sh &amp;     # survive logout (output to nohup.out)
+tmux new -s work      # better: a persistent session; detach with Ctrl+B then D
+tmux attach -t work   # come back after SSH dropped</code></pre>
+<div class="callout tip"><strong>Use tmux on servers</strong><p>If your SSH connection drops mid-upgrade, a plain shell kills the job. Inside tmux it keeps running and you reattach later.</p></div>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Unquoted variables with spaces split into several arguments. Quote: <code>"$file"</code>.</li>
+<li><code>sudo cmd &gt; /root/file</code>: the redirect is done by <em>your</em> shell, not sudo. Use <code>tee</code>.</li>
+<li>Copy-pasting commands from the web without reading them, especially <code>curl ... | sudo bash</code>. Download, inspect, then run.</li>
+<li>Smart quotes from documents break commands. Plain <code>"</code> and <code>'</code> only.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>In a scratch directory create 5 files with <code>touch f{1..5}.log</code>, then list, rename one, and delete the rest with a single <code>rm</code>.</li>
+<li>Generate some data: <code>seq 1 1000 | shuf | head -20 | sort -n</code>. Explain each stage.</li>
+<li>Find the five largest directories under <code>/var</code>: <code>sudo du -h --max-depth=2 /var 2&gt;/dev/null | sort -hr | head -5</code>.</li>
+<li>Start <code>tmux</code>, run <code>ping 1.1.1.1</code>, detach, close the terminal, reconnect and reattach.</li>
+</ol></div>

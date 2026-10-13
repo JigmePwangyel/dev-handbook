@@ -1,0 +1,169 @@
+<h1>Helm and Kustomize</h1>
+<p class="lead">A real application is a dozen YAML files, and you need several copies of them: dev, staging, production, each slightly different. Copy-pasting YAML does not scale. Helm and Kustomize are the two standard answers: one templates, the other patches.</p>
+
+<h2>The problem</h2>
+<p>Staging runs 1 replica with a small database; production runs 6 with a big one; the image tag and hostname differ. If you copy the manifests, a fix in one place must be repeated everywhere and the copies drift. We need a <strong>single source</strong> plus a small, explicit set of differences.</p>
+<table>
+<tr><th></th><th>Helm</th><th>Kustomize</th></tr>
+<tr><td>Approach</td><td>Go templates + values; packages as versioned charts</td><td>Plain YAML + declarative patches; no templating</td></tr>
+<tr><td>Built into kubectl</td><td>No (separate CLI)</td><td>Yes: <code>kubectl apply -k</code></td></tr>
+<tr><td>Best for</td><td>Installing third-party software; distributing your app; parametrising</td><td>Your own app's per-environment variations</td></tr>
+<tr><td>Extra features</td><td>Release tracking, hooks, rollback, dependencies</td><td>Simplicity, valid YAML at every step</td></tr>
+</table>
+<p>Many teams use both: Helm for third-party charts (ingress, cert-manager, Prometheus), Kustomize (or Helm) for their own apps.</p>
+
+<h2>Helm</h2>
+<h3>Concepts</h3>
+<ul>
+<li><strong>Chart</strong>: a package: templates + default values + metadata.</li>
+<li><strong>Values</strong>: the parameters you override.</li>
+<li><strong>Release</strong>: one installed instance of a chart in a cluster. Helm tracks revisions in a Secret, so you can upgrade and roll back.</li>
+</ul>
+<pre><code>helm repo add bitnami https://charts.bitnami.com/bitnami
+helm search repo redis
+helm show values bitnami/redis &gt; redis-values.yaml     # see all knobs
+
+helm install cache bitnami/redis -n data --create-namespace -f redis-values.yaml
+helm upgrade cache bitnami/redis -n data -f redis-values.yaml --set replica.replicaCount=3
+helm list -A
+helm history cache -n data
+helm rollback cache 1 -n data
+helm uninstall cache -n data
+
+helm template cache bitnami/redis -f redis-values.yaml   # render YAML locally, no cluster
+helm lint ./mychart</code></pre>
+
+<h3>Chart layout</h3>
+<pre class="diagram">
+ shop/
+ ├── Chart.yaml          name, version (chart), appVersion
+ ├── values.yaml         defaults
+ ├── values-prod.yaml    environment override (optional)
+ ├── templates/
+ │   ├── _helpers.tpl    reusable named templates
+ │   ├── deployment.yaml
+ │   ├── service.yaml
+ │   ├── ingress.yaml
+ │   └── NOTES.txt
+ └── charts/             dependencies
+</pre>
+
+<h3>Templating</h3>
+<pre><code># values.yaml
+replicaCount: 2
+image:
+  repository: ghcr.io/example/shop
+  tag: "2.3.1"
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+ingress:
+  enabled: false
+  host: ""
+
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "shop.fullname" . }}
+  labels:
+    app.kubernetes.io/name: shop
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shop
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: shop
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: shop
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+# templates/ingress.yaml
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+...
+{{- end }}</code></pre>
+<p>Override per environment: <code>helm upgrade --install shop ./shop -f values-prod.yaml --set image.tag=$GIT_SHA</code>. Precedence: chart defaults, then <code>-f</code> files in order, then <code>--set</code>.</p>
+<div class="callout warn"><strong>Template complexity is Helm's cost</strong><p>Indentation-sensitive text templating generating YAML is error-prone and hard to read. Keep templates simple, always check output with <code>helm template</code>, pin chart versions, and review the rendered diff (<code>helm diff</code> plugin) before upgrading production. Treat third-party charts as code you depend on: read what they create.</p></div>
+
+<h2>Kustomize</h2>
+<p>Kustomize keeps a <strong>base</strong> of plain, valid YAML and layers <strong>overlays</strong> that patch it. No placeholders, no template language.</p>
+<pre class="diagram">
+ shop/
+ ├── base/
+ │   ├── kustomization.yaml
+ │   ├── deployment.yaml
+ │   └── service.yaml
+ └── overlays/
+     ├── staging/
+     │   └── kustomization.yaml
+     └── production/
+         ├── kustomization.yaml
+         └── replicas-patch.yaml
+</pre>
+<pre><code># base/kustomization.yaml
+resources:
+  - deployment.yaml
+  - service.yaml
+labels:
+  - pairs: { app.kubernetes.io/name: shop }
+    includeSelectors: true
+
+# overlays/production/kustomization.yaml
+resources:
+  - ../../base
+namespace: shop-prod
+namePrefix: prod-
+images:
+  - name: ghcr.io/example/shop
+    newTag: 2.3.1                 # CI updates this line
+patches:
+  - path: replicas-patch.yaml
+configMapGenerator:
+  - name: shop-config
+    literals:
+      - LOG_LEVEL=warn            # name gets a content hash; changes roll Pods
+
+# overlays/production/replicas-patch.yaml  (strategic merge patch)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+spec:
+  replicas: 6</code></pre>
+<pre><code>kubectl kustomize overlays/production      # render and inspect
+kubectl diff -k overlays/production
+kubectl apply -k overlays/production</code></pre>
+<p>Kustomize can also inline Helm charts (<code>helmCharts:</code>) for post-rendering patches, a handy combination.</p>
+
+<h2>Choosing</h2>
+<ul>
+<li>Installing someone else's software: Helm.</li>
+<li>Your own app, a handful of environments, want readable diffs: Kustomize.</li>
+<li>Shipping an app for external users to configure: Helm chart.</li>
+<li>GitOps: both are first-class in Argo CD and Flux.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Helm values with no schema: add <code>values.schema.json</code> to catch typos.</li>
+<li>Secrets in <code>values.yaml</code> committed to git. Use external secrets instead.</li>
+<li>Helm CRD handling: CRDs in <code>crds/</code> are installed once and never upgraded or deleted by Helm. Plan CRD upgrades separately.</li>
+<li>Kustomize patches silently do nothing if the target name or kind does not match; check the rendered output.</li>
+<li>Unpinned chart versions: <code>helm upgrade</code> may pull breaking changes.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a chart with <code>helm create shop</code>, run <code>helm template shop ./shop</code>, then install it on kind and change <code>replicaCount</code> with <code>--set</code>.</li>
+<li>Build the Kustomize layout above with staging (1 replica) and production (3 replicas) overlays and compare <code>kubectl kustomize</code> output of each.</li>
+<li>Break a Helm upgrade intentionally (bad image tag) and use <code>helm rollback</code>.</li>
+</ol></div>

@@ -1,0 +1,136 @@
+<h1>Anatomy of a Pipeline</h1>
+<p class="lead">Every CI/CD tool has its own syntax, but they all model the same thing: a graph of stages made of jobs made of steps, passing artifacts along, running on machines called runners. Learn the shape once and you can read any pipeline.</p>
+
+<h2>Why think in stages?</h2>
+<p>A pipeline is an assembly line for software. Each station does one job and either passes the work on or stops the line. Ordering matters for two reasons: <strong>fail fast</strong> (cheap checks first so you do not waste 20 minutes building something that fails lint in 10 seconds) and <strong>confidence gradient</strong> (each stage raises confidence before you risk the next, more expensive, more dangerous stage).</p>
+
+<h2>The canonical pipeline</h2>
+<pre class="diagram">
+ ┌────────┐ ┌────────┐ ┌───────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌───────┐
+ │ source │▶│  lint  │▶│ test  │▶│ build  │▶│  scan   │▶│ package │▶│publish │▶│deploy │▶ smoke test
+ │checkout│ │ format │ │unit + │ │compile │ │SAST,deps│ │ docker  │ │registry │ │staging│   │
+ │        │ │ types  │ │integr.│ │bundle  │ │secrets  │ │ image   │ │ push    │ │ prod  │   ▼
+ └────────┘ └────────┘ └───────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘ └───────┘ rollback?
+   seconds    seconds   1-5 min   1-3 min     1-3 min     1-2 min     seconds     minutes
+   &lt;──────── CI: runs on every PR ────────▶ &lt;──────────── CD: runs on main / tags ─────────▶
+</pre>
+<table>
+<tr><th>Stage</th><th>What happens</th><th>Why it exists</th><th>Typical tools</th></tr>
+<tr><td>Checkout</td><td>Clone the repo at the exact commit</td><td>Reproducibility</td><td>git, <code>actions/checkout</code></td></tr>
+<tr><td>Lint / format / type-check</td><td>Static analysis without running code</td><td>Cheapest, fastest feedback</td><td>ESLint, Prettier, <code>tsc</code>, ruff, golangci-lint</td></tr>
+<tr><td>Test</td><td>Unit, then integration tests</td><td>Prove behavior</td><td>Jest, pytest, JUnit, Go test</td></tr>
+<tr><td>Build</td><td>Compile / bundle / transpile</td><td>Prove it builds in a clean env</td><td>npm, Maven, Gradle, go build</td></tr>
+<tr><td>Scan</td><td>SAST, dependency CVEs, secrets, IaC, container scan</td><td>Shift security left</td><td>CodeQL, Semgrep, Trivy, Snyk, gitleaks</td></tr>
+<tr><td>Package</td><td>Create the deployable unit</td><td>One immutable artifact</td><td>Docker/BuildKit, jar, wheel, tarball</td></tr>
+<tr><td>Publish</td><td>Push to a registry/artifact store with a unique tag</td><td>Make the artifact available to deployers</td><td>GHCR, ECR, Docker Hub, Artifactory, npm</td></tr>
+<tr><td>Deploy</td><td>Roll the artifact to an environment</td><td>Get it running</td><td>kubectl/Helm, Argo CD, SSH, Terraform, cloud CLIs</td></tr>
+<tr><td>Smoke / verify</td><td>Hit a health endpoint, run a few critical checks</td><td>Know the deploy worked</td><td>curl, k6, Playwright, synthetic checks</td></tr>
+<tr><td>Rollback / notify</td><td>Revert on failure; tell humans</td><td>Contain damage</td><td>Slack, PagerDuty, previous tag redeploy</td></tr>
+</table>
+
+<h2>Vocabulary</h2>
+<ul>
+<li><strong>Pipeline / workflow:</strong> the whole automated process, triggered by an event.</li>
+<li><strong>Trigger / event:</strong> push, pull request, tag, schedule (cron), manual, webhook, another pipeline finishing.</li>
+<li><strong>Stage:</strong> a phase grouping jobs (GitLab, Jenkins). Stages run in order.</li>
+<li><strong>Job:</strong> a unit of work that runs on one runner. Jobs may run in parallel; each starts with a clean environment.</li>
+<li><strong>Step:</strong> one command or action inside a job. Steps in a job share a filesystem and run sequentially.</li>
+<li><strong>Runner / agent:</strong> the machine or container that executes jobs.</li>
+<li><strong>Artifact:</strong> files a job produces for later jobs or for download (build output, test reports).</li>
+<li><strong>Cache:</strong> files reused between runs to save time (dependencies). Not a source of truth.</li>
+<li><strong>Environment:</strong> a deployment target (staging, production) with its own secrets, protection rules and history.</li>
+</ul>
+
+<h2>Jobs are isolated: artifacts vs cache</h2>
+<p>Each job typically starts on a fresh runner. Anything you want to survive must be passed explicitly. Two mechanisms, constantly confused:</p>
+<table>
+<tr><th></th><th>Artifacts</th><th>Cache</th></tr>
+<tr><td>Purpose</td><td>Pass <em>outputs</em> between jobs; keep results (reports, binaries)</td><td>Speed up by reusing <em>inputs</em> (downloaded dependencies)</td></tr>
+<tr><td>Guaranteed?</td><td>Yes, if the producing job succeeded</td><td>No, best effort; a miss must still work</td></tr>
+<tr><td>Keyed by</td><td>Run + name</td><td>A key you choose (e.g. hash of <code>package-lock.json</code>)</td></tr>
+<tr><td>Example</td><td><code>dist/</code>, coverage XML, test reports, SBOM</td><td><code>~/.npm</code>, <code>~/.m2</code>, pip wheels, Docker layers</td></tr>
+</table>
+<div class="callout tip"><strong>Cache key design</strong><p>Key on the lockfile hash so the cache invalidates exactly when dependencies change, with a fallback prefix key so a near-match still helps. Never cache build outputs you then ship; that breaks reproducibility.</p></div>
+
+<h2>Speed: parallelism, fan-out, matrix, sharding</h2>
+<pre class="diagram">
+              ┌─────▶ lint ────────┐
+ checkout ───▶├─────▶ unit tests ──┤
+              ├─────▶ type-check ──┼──▶ build ──▶ scan ─┬─▶ deploy staging ─▶ e2e ─▶ deploy prod
+              └─────▶ integration ─┘                    └─▶ (parallel) SBOM/sign
+        (fan-out: independent jobs in parallel)   (fan-in: wait for all via needs)
+</pre>
+<ul>
+<li><strong>Fan-out / fan-in:</strong> independent jobs run concurrently; a downstream job declares dependencies (<code>needs:</code> in GitHub/GitLab) and waits.</li>
+<li><strong>Matrix:</strong> run the same job across combinations (Node 20/22 x ubuntu/windows). One definition, N jobs.</li>
+<li><strong>Sharding:</strong> split a long test suite into N slices run in parallel (<code>jest --shard=1/4</code>, Playwright <code>--shard</code>), then merge reports. A 20-minute suite on 4 shards finishes in about 5.</li>
+<li><strong>Caching and incremental builds:</strong> dependency cache, Docker layer cache, build caches (Turborepo, Gradle, Bazel remote cache).</li>
+<li><strong>Path filters:</strong> skip jobs when only docs changed.</li>
+<li><strong>Cancel superseded runs:</strong> a new push to a PR cancels the older run (concurrency groups).</li>
+</ul>
+<p>Parallelism trades money (more concurrent runners) for time. Developer time is almost always more expensive than runner time.</p>
+
+<h2>Pipeline types by trigger</h2>
+<table>
+<tr><th>Trigger</th><th>Runs</th><th>Does NOT do</th></tr>
+<tr><td>Pull request</td><td>Lint, tests, build, scan, preview deploy</td><td>Publish release artifacts or touch prod; PRs from forks get no secrets</td></tr>
+<tr><td>Push to main</td><td>All the above + publish artifact + deploy staging (+ prod)</td><td></td></tr>
+<tr><td>Tag <code>v*</code></td><td>Release build, publish versioned artifacts, create release</td><td></td></tr>
+<tr><td>Schedule</td><td>Nightly full e2e, dependency audit, base image rebuild</td><td></td></tr>
+<tr><td>Manual (<code>workflow_dispatch</code>)</td><td>Ad-hoc deploy / rollback to a chosen version</td><td></td></tr>
+</table>
+
+<h2>Pipeline as code</h2>
+<p>Pipelines are defined in a file in the repo (<code>.github/workflows/*.yml</code>, <code>.gitlab-ci.yml</code>, <code>Jenkinsfile</code>). Benefits: versioned, reviewed, branch-specific (a PR can change the pipeline and test the change), reproducible, and visible. The old way, clicking jobs together in a web UI, produced undocumented, unreproducible "snowflake" CI servers.</p>
+
+<h2>What a stage must provide</h2>
+<ul>
+<li><strong>Determinism:</strong> same inputs, same outputs. Pin tool versions, lock dependencies.</li>
+<li><strong>Idempotence:</strong> re-running a deploy for the same version is safe.</li>
+<li><strong>Clear failure signal:</strong> non-zero exit code means stop; logs say why.</li>
+<li><strong>Timeouts</strong> so hung jobs do not run forever.</li>
+<li><strong>Isolation:</strong> no dependence on state left by earlier runs.</li>
+</ul>
+
+<h2>A pipeline in pseudo-YAML</h2>
+<pre><code># tool-agnostic sketch
+on: [pull_request, push to main]
+
+jobs:
+  lint:        {runs: "npm run lint"}
+  test:        {runs: "npm test",         needs: []}
+  build:       {runs: "npm run build",    needs: [lint, test],  outputs: [dist/]}
+  scan:        {runs: "trivy fs .",       needs: [build]}
+  package:     {runs: "docker build -t app:$SHA .", needs: [scan]}
+  publish:     {runs: "docker push app:$SHA",       needs: [package], only: main}
+  deploy-stg:  {runs: "deploy app:$SHA staging",    needs: [publish], env: staging}
+  smoke:       {runs: "curl -f https://stg/health", needs: [deploy-stg]}
+  deploy-prod: {runs: "deploy app:$SHA production", needs: [smoke],  env: production, approval: true}
+</code></pre>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>One enormous job.</strong> No parallelism, hard to read failures.</li>
+<li><strong>Order that wastes time</strong>: running a 10-minute build before a 5-second lint.</li>
+<li><strong>Relying on cache for correctness.</strong> It can be evicted; builds must work cold.</li>
+<li><strong>Rebuilding per stage.</strong> Pass the artifact (or image digest) instead.</li>
+<li><strong>Mutable tags</strong> (<code>latest</code>) between publish and deploy. Deploy by immutable SHA or digest.</li>
+<li><strong>No verification after deploy.</strong> A deploy job that exits 0 only means the command ran, not that the app is healthy.</li>
+<li><strong>Environment logic hard-coded in scripts</strong> with <code>if branch == main</code> sprinkled everywhere; use the platform's rules/conditions.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<table>
+<tr><th>Decision</th><th>Upside</th><th>Downside</th></tr>
+<tr><td>Many small jobs</td><td>Parallel, clear failures</td><td>Per-job setup overhead (checkout, install), more YAML</td></tr>
+<tr><td>Few big jobs</td><td>Less overhead</td><td>Serial, opaque</td></tr>
+<tr><td>Strict gates everywhere</td><td>Safer</td><td>Slower, more friction</td></tr>
+<tr><td>Full scan on every PR</td><td>Early detection</td><td>Costly; consider diff-aware scans plus nightly full scans</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Draw your project's pipeline using the stage table. Which stages are missing? Which run in the wrong order?</li>
+<li>For each stage, note its duration from a recent run. Find the critical path (the longest chain of dependent jobs); that, not the sum, is your pipeline time.</li>
+<li>Decide for each of these whether it belongs in a cache or an artifact: <code>node_modules</code>, <code>dist/</code>, JUnit XML, a Docker image layer, a downloaded Go module.</li>
+</ol></div>

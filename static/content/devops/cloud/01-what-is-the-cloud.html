@@ -1,0 +1,131 @@
+<h1>What Is "The Cloud"?</h1>
+<p class="lead">"The cloud" is just other people's computers, rented by the second, controlled by an API. That sounds trivial, but the API part changes everything: infrastructure becomes something you can create, change and destroy from code, in minutes, without buying hardware or filing a ticket.</p>
+
+<h2>The problem the cloud solves</h2>
+<p>Before public clouds, running software meant owning or leasing physical servers in a data center (<strong>on-premises</strong>, or "on-prem"). To launch a product you would:</p>
+<ol>
+<li>Forecast how much capacity you needed 1-3 years out (and almost always get it wrong).</li>
+<li>Order servers, wait weeks for delivery, rack them, cable them, install an OS.</li>
+<li>Pay the full cost up front (capital expenditure, "CapEx") whether or not anyone used the product.</li>
+<li>Staff people to replace failed disks, patch firmware, manage power and cooling, and handle physical security.</li>
+</ol>
+<p>If you under-provisioned, a successful launch crashed your site and you could not add capacity for weeks. If you over-provisioned, you paid for idle machines. The cloud turns this into <strong>operational expenditure (OpEx)</strong>: you pay for what you use, and capacity arrives in seconds.</p>
+
+<table>
+<tr><th></th><th>On-premises</th><th>Public cloud</th></tr>
+<tr><td>Time to get a server</td><td>Weeks to months</td><td>Seconds to minutes</td></tr>
+<tr><td>Cost model</td><td>Large upfront CapEx</td><td>Pay-as-you-go OpEx</td></tr>
+<tr><td>Scaling</td><td>Buy more hardware</td><td>API call / autoscaling</td></tr>
+<tr><td>Hardware failures</td><td>Your team's pager</td><td>Provider's problem (mostly)</td></tr>
+<tr><td>Control</td><td>Total (physical access, custom hardware)</td><td>Limited to what the provider exposes</td></tr>
+<tr><td>Steady, predictable, huge workload</td><td>Can be cheaper</td><td>Can be pricier at scale</td></tr>
+<tr><td>Compliance / data residency</td><td>Fully in your hands</td><td>Shared; needs careful configuration</td></tr>
+</table>
+
+<div class="callout info"><strong>Hybrid and multi-cloud</strong><p><em>Hybrid</em> means part on-prem, part cloud (often for legacy systems or regulated data). <em>Multi-cloud</em> means using more than one provider. Both add complexity; most teams are better off mastering one cloud first. Do not adopt multi-cloud "to avoid lock-in" without a concrete requirement; you will pay for portability in engineering time.</p></div>
+
+<h2>The service models: IaaS, PaaS, SaaS, FaaS</h2>
+<p>The cloud sells abstractions at different heights. The higher you go, the less you manage, and the less you can customise.</p>
+<pre class="diagram">
+ You manage ───────────────────────────────────────────────────────▶ Provider manages
+
+ On-prem      IaaS            PaaS              FaaS             SaaS
+ ─────────    ─────────       ─────────         ─────────        ─────────
+ Application  Application     Application       Function code    (nothing)
+ Data         Data            Data              Data config      Config only
+ Runtime      Runtime         ░ Runtime ░       ░ Runtime ░      ░░░░░░░░
+ OS           OS              ░ OS ░            ░ OS ░           ░░░░░░░░
+ Virtualization ░░░░░░░       ░░░░░░░░░         ░░░░░░░░░        ░░░░░░░░
+ Servers      ░░░░░░░░░       ░░░░░░░░░         ░░░░░░░░░        ░░░░░░░░
+ Network/DC   ░░░░░░░░░       ░░░░░░░░░         ░░░░░░░░░        ░░░░░░░░
+                  ░ = managed by the provider
+</pre>
+<table>
+<tr><th>Model</th><th>You get</th><th>Examples</th><th>You still handle</th></tr>
+<tr><td><strong>IaaS</strong> (Infrastructure)</td><td>Virtual machines, disks, networks</td><td>AWS EC2, GCP Compute Engine, Azure VMs</td><td>OS patching, runtime, scaling, app</td></tr>
+<tr><td><strong>PaaS</strong> (Platform)</td><td>A place to push code; platform runs it</td><td>Heroku, Elastic Beanstalk, App Engine, Render</td><td>App code, config, data</td></tr>
+<tr><td><strong>FaaS</strong> / serverless</td><td>Run a function per event; pay per invocation</td><td>AWS Lambda, Cloud Functions, Azure Functions</td><td>Function code, limits, cold starts</td></tr>
+<tr><td><strong>SaaS</strong> (Software)</td><td>A finished product</td><td>Gmail, Slack, Salesforce, GitHub</td><td>Users, settings, data you put in</td></tr>
+</table>
+<p>There are also <strong>managed services</strong> in between: a database like Amazon RDS is "IaaS with the boring parts removed". You do not patch Postgres or replace its disks, but you still choose instance size and schema.</p>
+
+<div class="callout key"><strong>Pick the highest abstraction that fits</strong><p>Every layer you manage is a layer you must patch, monitor, secure and be paged for. A good default: use SaaS if a product exists, managed services for state (databases, queues), PaaS/containers/serverless for your code, and raw VMs only when you need the control.</p></div>
+
+<h2>The shared responsibility model</h2>
+<p>Security in the cloud is split. The provider secures the cloud; you secure what you put <em>in</em> it.</p>
+<table>
+<tr><th>Provider is responsible for</th><th>You are responsible for</th></tr>
+<tr><td>Physical data centers, power, cooling</td><td>Who can access your account (IAM, MFA)</td></tr>
+<tr><td>Hypervisor and host hardware</td><td>Guest OS patching (on IaaS)</td></tr>
+<tr><td>Network backbone, managed service internals</td><td>Network rules (security groups, firewall)</td></tr>
+<tr><td>Durability of services like S3 itself</td><td>Whether your S3 bucket is public</td></tr>
+<tr><td></td><td>Encryption choices, backups, application code, data classification</td></tr>
+</table>
+<p>The majority of real-world cloud breaches are <strong>customer misconfiguration</strong>: a public bucket, an access key committed to GitHub, an over-permissive role, an open database port. The provider's data center was never the weak link.</p>
+
+<h2>Regions and Availability Zones</h2>
+<p>Cloud providers are not one big computer. They are a hierarchy:</p>
+<ul>
+<li><strong>Region</strong>: a geographic area (e.g. <code>us-east-1</code> N. Virginia, <code>eu-west-1</code> Ireland, <code>ap-southeast-1</code> Singapore). Regions are independent: separate pricing, separate service availability, separate failure domains.</li>
+<li><strong>Availability Zone (AZ)</strong>: one or more discrete data centers within a region, with independent power and networking, connected to the others by low-latency links (e.g. <code>us-east-1a</code>, <code>1b</code>, <code>1c</code>).</li>
+<li><strong>Edge locations</strong>: hundreds of small points of presence used by CDNs and DNS to serve content close to users.</li>
+</ul>
+<pre class="diagram">
+ AWS Cloud
+ ├── Region us-east-1 (N. Virginia)
+ │    ├── AZ us-east-1a   [data center(s)]
+ │    ├── AZ us-east-1b   [data center(s)]
+ │    └── AZ us-east-1c   [data center(s)]
+ ├── Region eu-west-1 (Ireland)
+ │    ├── AZ eu-west-1a ...
+ └── Edge locations (CloudFront, Route 53) worldwide
+</pre>
+<h3>How to choose a region</h3>
+<ul>
+<li><strong>Latency</strong>: close to your users (or your other systems).</li>
+<li><strong>Data residency / law</strong>: GDPR or contracts may require data to stay in a country or bloc.</li>
+<li><strong>Service availability</strong>: new services launch in a few regions first.</li>
+<li><strong>Price</strong>: the same instance can cost 10-30% more in some regions.</li>
+</ul>
+<p>Surviving a single data center failure means spreading across <strong>AZs</strong>. Surviving a whole region outage needs <strong>multi-region</strong>, which is much harder and costlier (see the scaling lesson).</p>
+
+<h2>Pricing models</h2>
+<table>
+<tr><th>Model</th><th>How it works</th><th>Typical saving</th><th>Best for</th></tr>
+<tr><td>On-demand</td><td>Pay per second/hour, no commitment</td><td>0% (baseline)</td><td>Spiky, new or unknown workloads</td></tr>
+<tr><td>Reserved / Savings Plans</td><td>Commit to 1-3 years of usage</td><td>30-70%</td><td>Steady baseline load</td></tr>
+<tr><td>Spot / Preemptible</td><td>Spare capacity; can be reclaimed on ~2 min notice</td><td>60-90%</td><td>Batch jobs, CI runners, stateless workers</td></tr>
+<tr><td>Free tier</td><td>Limited free usage</td><td>-</td><td>Learning (watch the expiry!)</td></tr>
+</table>
+<p>Beyond compute, remember the <em>hidden meters</em>: data transfer out to the internet (and between AZs/regions), requests, storage operations, NAT gateway processing, and idle resources like unattached disks and Elastic IPs. See the cost-management lesson.</p>
+
+<h2>Getting started safely</h2>
+<ol>
+<li>Create the account and immediately enable <strong>MFA on the root user</strong>. Then stop using root; create an admin identity (an IAM Identity Center user) for daily work.</li>
+<li>Set a <strong>budget alert</strong> (e.g. $10) before launching anything.</li>
+<li>Install the CLI and confirm who you are:</li>
+</ol>
+<pre><code>aws --version
+aws configure sso          # or: aws configure
+aws sts get-caller-identity
+# {
+#   "UserId": "AIDA...",
+#   "Account": "123456789012",
+#   "Arn": "arn:aws:iam::123456789012:user/alice"
+# }</code></pre>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Treating the cloud as a cheaper data center.</strong> "Lift and shift" of pet servers often costs more and gains little. Gains come from elasticity, managed services and automation.</li>
+<li><strong>Clicking in the console only.</strong> Console-built infrastructure cannot be reviewed, repeated or recovered. Move to Infrastructure as Code early.</li>
+<li><strong>Forgetting to turn things off.</strong> The meter runs until you delete the resource.</li>
+<li><strong>Assuming "managed" means "no responsibility".</strong> You still own backups testing, access control and capacity choices.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a free cloud account, enable MFA on root, and create a $5 budget alert.</li>
+<li>Run <code>aws ec2 describe-regions --output table</code> and then <code>aws ec2 describe-availability-zones --region eu-west-1</code>. How many AZs does each region have?</li>
+<li>For three tools you use daily (e.g. GitHub, Postgres, Docker Hub), classify them as IaaS, PaaS, FaaS or SaaS.</li>
+<li>Pick a hypothetical app with EU customers. Which region would you choose and why?</li>
+</ol></div>

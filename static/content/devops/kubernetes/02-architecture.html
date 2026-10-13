@@ -1,0 +1,101 @@
+<h1>Kubernetes Architecture</h1>
+<p class="lead">A Kubernetes cluster is a set of machines split into a control plane that makes decisions and worker nodes that run your containers. Underneath, everything is one idea repeated many times: a controller compares desired state with actual state and closes the gap.</p>
+
+<h2>The big picture</h2>
+<pre class="diagram">
+                        CONTROL PLANE
+ ┌───────────────────────────────────────────────────────────┐
+ │  kubectl / CI / UIs ─────▶ ┌────────────────┐             │
+ │                            │  kube-apiserver │◀──────┐     │
+ │                            └───────┬────────┘       │     │
+ │                                    │ read/write     │     │
+ │                              ┌─────▼─────┐   watch  │     │
+ │                              │   etcd    │          │     │
+ │                              └───────────┘          │     │
+ │   ┌────────────────┐   ┌───────────────────────┐    │     │
+ │   │ kube-scheduler │   │ kube-controller-manager│───┘     │
+ │   └────────────────┘   └───────────────────────┘          │
+ └──────────────────────────────┬────────────────────────────┘
+                                │ (all talk only via the API server)
+        ┌───────────────────────┼───────────────────────┐
+ ┌──────▼───────────┐   ┌───────▼──────────┐   ┌────────▼─────────┐
+ │ NODE 1           │   │ NODE 2           │   │ NODE 3           │
+ │ kubelet          │   │ kubelet          │   │ kubelet          │
+ │ kube-proxy       │   │ kube-proxy       │   │ kube-proxy       │
+ │ containerd       │   │ containerd       │   │ containerd       │
+ │ [Pod][Pod][Pod]  │   │ [Pod][Pod]       │   │ [Pod][Pod][Pod]  │
+ └──────────────────┘   └──────────────────┘   └──────────────────┘
+</pre>
+
+<h2>Control plane components</h2>
+<h3>kube-apiserver</h3>
+<p>The front door and the <strong>only</strong> component that talks to etcd. Every client (kubectl, the scheduler, kubelets, controllers, your CI) uses its REST API. It authenticates the caller, authorises the request (RBAC), runs admission controllers (which can validate or mutate objects, e.g. inject defaults or reject privileged Pods) and persists the result. It is stateless and can be run in multiple replicas behind a load balancer.</p>
+
+<h3>etcd</h3>
+<p>A distributed, strongly consistent key-value store (Raft consensus) holding the entire cluster state: every Deployment, Secret, Node and Pod. If etcd is lost and you have no backup, the cluster forgets everything it was supposed to run. Run 3 or 5 members for quorum, use fast SSDs, and back it up (<code>etcdctl snapshot save</code>). Managed offerings do this for you.</p>
+
+<h3>kube-scheduler</h3>
+<p>Watches for Pods that have no node assigned and picks one. It runs two phases: <strong>filtering</strong> (remove nodes that cannot host the Pod: not enough CPU or memory, taints the Pod does not tolerate, wrong node selector) and <strong>scoring</strong> (rank the survivors: spread across zones, prefer nodes with the image cached, balance load). It then writes the chosen node name into the Pod; it never starts anything itself.</p>
+
+<h3>kube-controller-manager</h3>
+<p>A single binary that runs many controllers: the Deployment controller, ReplicaSet controller, Node controller (marks nodes NotReady, evicts Pods), Job controller, EndpointSlice controller, ServiceAccount controller and more. Each is a loop of the form described below.</p>
+
+<h3>cloud-controller-manager</h3>
+<p>On cloud providers, this integrates with the cloud API: creating a load balancer when you make a <code>Service</code> of type LoadBalancer, attaching disks, reporting node lifecycle.</p>
+
+<h2>Node components</h2>
+<h3>kubelet</h3>
+<p>The agent on each node. It watches the API server for Pods assigned to its node, tells the container runtime to start the containers, runs probes, reports status back and mounts volumes. It is the one that actually makes a Pod real.</p>
+
+<h3>Container runtime</h3>
+<p>Anything implementing the Container Runtime Interface (CRI): <code>containerd</code> (most common) or <code>CRI-O</code>. Docker Engine itself has not been supported directly since 1.24, but images built with Docker run fine, since the image format is a standard (OCI).</p>
+
+<h3>kube-proxy</h3>
+<p>Programs the node's network rules (iptables or IPVS; nftables in newer versions) so that traffic sent to a Service's virtual IP gets load-balanced to the Pods behind it. Some CNI plugins like Cilium replace it with eBPF. Covered in the networking lesson.</p>
+
+<h3>CNI plugin</h3>
+<p>Not part of core, but required: a Container Network Interface plugin (Calico, Cilium, Flannel, the cloud provider's VPC CNI) gives each Pod an IP and makes Pod-to-Pod traffic work across nodes.</p>
+
+<h2>The reconciliation loop</h2>
+<p>This is the single most important concept in Kubernetes.</p>
+<pre class="diagram">
+        ┌─────────────────────────────────────────┐
+        ▼                                         │
+  observe actual state ──▶ compare to desired ──▶ act to reduce difference
+  (watch API server)        (spec in etcd)        (create/delete/update)
+</pre>
+<p>Every object has a <code>spec</code> (what you want) and a <code>status</code> (what is). Controllers use <em>watches</em>, not polling, to be notified of changes. They are <strong>level-triggered</strong>: they react to "current state differs from desired" rather than to individual events, so if a controller crashes and restarts it simply re-reads the world and carries on. That makes the system robust.</p>
+
+<h3>Walkthrough: <code>kubectl apply -f deployment.yaml</code> with 3 replicas</h3>
+<ol>
+<li>kubectl sends the Deployment to the API server, which authenticates, authorises, validates, and stores it in etcd.</li>
+<li>The Deployment controller sees a new Deployment and creates a ReplicaSet.</li>
+<li>The ReplicaSet controller sees "want 3, have 0" and creates 3 Pod objects (no node assigned yet).</li>
+<li>The scheduler sees 3 unscheduled Pods, filters and scores nodes, and binds each Pod to a node.</li>
+<li>The kubelet on each chosen node sees a Pod bound to it, pulls the image, asks containerd to start the containers, then reports status Running.</li>
+<li>The EndpointSlice controller notices ready Pods and updates Service endpoints; kube-proxy updates rules.</li>
+</ol>
+<p>No component calls another directly. They coordinate only by reading and writing objects through the API server. That loose coupling is why you can swap in a custom scheduler or add your own controller.</p>
+
+<div class="callout key"><strong>Declarative and extensible</strong><p>Because everything is "objects plus controllers", you can add new object types with CustomResourceDefinitions and write your own controller (an <em>operator</em>) to manage, say, a PostgreSQL cluster. Tools like cert-manager, Argo CD and Crossplane work exactly this way.</p></div>
+
+<h2>Self-healing in practice</h2>
+<table>
+<tr><th>Failure</th><th>Who reacts</th><th>What happens</th></tr>
+<tr><td>Container process exits</td><td>kubelet</td><td>Restarts it (with exponential backoff)</td></tr>
+<tr><td>Pod deleted or evicted</td><td>ReplicaSet controller</td><td>Creates replacement</td></tr>
+<tr><td>Node stops reporting</td><td>Node controller</td><td>Marks NotReady, then evicts Pods after a timeout; they reschedule elsewhere</td></tr>
+<tr><td>Pod fails readiness</td><td>EndpointSlice controller</td><td>Removed from Service until healthy</td></tr>
+</table>
+
+<h2>Pitfalls and best practices</h2>
+<ul>
+<li>The API server is the bottleneck and the security perimeter. Restrict who can reach it and use RBAC.</li>
+<li>Do not run workloads on control plane nodes in production; they are tainted by default for this reason.</li>
+<li>Back up etcd, or use a managed control plane.</li>
+<li>Keep versions skewed within supported limits (kubelet may lag the API server by a few minor versions); upgrade control plane first.</li>
+<li>Do not edit objects the controllers manage (e.g. Pods owned by a ReplicaSet): your change will be reverted.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<p>On a local cluster (next lesson), run <code>kubectl get pods -n kube-system</code> and identify the control plane components as Pods. Then run <code>kubectl get events -w</code> in one terminal and <code>kubectl create deployment demo --image=nginx --replicas=3</code> in another; match each event to a step in the walkthrough above.</p></div>

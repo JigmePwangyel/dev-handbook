@@ -1,0 +1,121 @@
+<h1>Services and Networking</h1>
+<p class="lead">Pods come and go and their IPs change constantly. A Service gives a set of Pods one stable name and virtual IP, and load-balances across the healthy ones. This lesson covers the Service types, cluster DNS, what kube-proxy really does, and how NetworkPolicy locks traffic down.</p>
+
+<h2>The networking model</h2>
+<p>Kubernetes imposes three rules, implemented by the CNI plugin:</p>
+<ol>
+<li>Every Pod gets its own IP.</li>
+<li>Any Pod can reach any other Pod by IP without NAT, across nodes.</li>
+<li>Agents on a node can reach all Pods on that node.</li>
+</ol>
+<p>This flat network is simple for apps, but Pod IPs are ephemeral. If <code>frontend</code> hard-coded <code>10.244.1.17</code> for the API, it would break at the next restart. Hence Services.</p>
+
+<h2>Service basics</h2>
+<p>A Service selects Pods by label and exposes them on a stable virtual IP (the ClusterIP) and DNS name. Only Pods that pass their readiness probe receive traffic.</p>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  type: ClusterIP            # default
+  selector:
+    app: shop                # matches Pod labels
+  ports:
+    - name: http
+      port: 80               # port on the Service
+      targetPort: 8080       # port on the Pod (number or named port)</code></pre>
+<p>Behind the scenes the EndpointSlice controller keeps a list of ready Pod IPs for the Service: <code>kubectl get endpointslices -l kubernetes.io/service-name=shop</code>. If this list is empty, your selector is wrong or no Pods are ready. This is the number one cause of "my Service doesn't work".</p>
+
+<h2>Service types</h2>
+<table>
+<tr><th>Type</th><th>Reachable from</th><th>Use</th></tr>
+<tr><td><code>ClusterIP</code></td><td>Inside the cluster only</td><td>Internal service-to-service calls (most Services)</td></tr>
+<tr><td><code>NodePort</code></td><td>Any node IP at port 30000-32767</td><td>Dev, or as a building block for external load balancers</td></tr>
+<tr><td><code>LoadBalancer</code></td><td>Internet or VPC via a cloud load balancer</td><td>Exposing a service directly; one cloud LB per Service</td></tr>
+<tr><td><code>ExternalName</code></td><td>Inside the cluster</td><td>DNS alias (CNAME) to an external hostname</td></tr>
+<tr><td>Headless (<code>clusterIP: None</code>)</td><td>Inside the cluster</td><td>DNS returns Pod IPs directly; used with StatefulSets</td></tr>
+</table>
+<pre class="diagram">
+  Internet ──▶ Cloud LB ──▶ NodePort (every node) ──▶ ClusterIP ──▶ Pod, Pod, Pod
+               (LoadBalancer)      (NodePort)         (virtual IP)
+  Each type builds on the previous one.
+</pre>
+<pre><code>apiVersion: v1
+kind: Service
+metadata:
+  name: shop-public
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"   # provider specific
+spec:
+  type: LoadBalancer
+  selector: { app: shop }
+  ports:
+    - port: 443
+      targetPort: 8080
+  externalTrafficPolicy: Local   # preserve client IP, avoid extra hop</code></pre>
+<div class="callout warn"><strong>Cost trap</strong><p>Each LoadBalancer Service provisions a separate cloud load balancer (typically $15-25/month plus traffic). For many HTTP services, use one Ingress or Gateway in front instead (next lesson).</p></div>
+
+<h2>Cluster DNS</h2>
+<p>CoreDNS runs in the cluster and every Pod is configured to use it. Each Service gets:</p>
+<pre><code>shop.default.svc.cluster.local
+&lt;service&gt;.&lt;namespace&gt;.svc.cluster.local</code></pre>
+<p>Within the same namespace just use <code>shop</code>; across namespaces use <code>shop.other-ns</code>. Pods in a StatefulSet behind a headless Service get <code>db-0.db.default.svc.cluster.local</code>. Environment variables like <code>SHOP_SERVICE_HOST</code> also exist but DNS is the recommended approach.</p>
+<pre><code>kubectl run tmp --rm -it --image=busybox:1.36 -- nslookup shop
+kubectl run tmp --rm -it --image=curlimages/curl -- curl -s http://shop/healthz</code></pre>
+
+<h2>How kube-proxy works</h2>
+<p>The ClusterIP is <strong>virtual</strong>: no interface owns it and nothing listens on it. kube-proxy on each node watches Services and EndpointSlices and programs kernel rules so that packets addressed to the ClusterIP are rewritten (DNAT) to a randomly chosen ready Pod IP.</p>
+<ul>
+<li><strong>iptables mode</strong> (long-time default): chains of rules with probability-based selection. Fine up to a few thousand Services, rule updates get slow beyond that.</li>
+<li><strong>IPVS mode</strong>: kernel load balancer with hash tables and more algorithms; scales better.</li>
+<li><strong>nftables mode</strong>: the modern replacement for iptables, GA in recent releases.</li>
+<li><strong>eBPF (Cilium)</strong>: can replace kube-proxy entirely, with better performance and observability.</li>
+</ul>
+<p>Load balancing happens at connection level (L4), so a long-lived gRPC or HTTP/2 connection sticks to one Pod. For per-request balancing you need an L7 proxy, a service mesh, or client-side balancing with a headless Service.</p>
+
+<h2>NetworkPolicy</h2>
+<p>By default <strong>all Pods can talk to all Pods</strong>. A compromised frontend can reach your database. NetworkPolicy is a firewall at the Pod level. Once any policy selects a Pod, traffic of that direction is denied except what policies allow. It requires a CNI that enforces it (Calico, Cilium; plain Flannel does not).</p>
+<pre><code># 1. Default deny all ingress in the namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: shop
+spec:
+  podSelector: {}          # all Pods
+  policyTypes: [Ingress]
+---
+# 2. Allow only the API to reach the database on 5432
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-allow-api
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels: { app: db }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: api }
+      ports:
+        - protocol: TCP
+          port: 5432</code></pre>
+<p>If you also deny egress, remember to allow DNS (UDP/TCP 53 to kube-dns) or everything breaks mysteriously.</p>
+
+<h2>Pitfalls and best practices</h2>
+<ul>
+<li>Match <code>targetPort</code> to the port your app actually listens on, and make the app listen on <code>0.0.0.0</code>, not <code>127.0.0.1</code>.</li>
+<li>Use named ports so changing a number does not require editing every Service.</li>
+<li>Start with a default-deny policy per namespace, then add allows.</li>
+<li>Do not use NodePort in production for public traffic; node IPs change.</li>
+<li>Expose databases only as ClusterIP.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Deploy nginx with 3 replicas and a ClusterIP Service. Run <code>kubectl get endpointslices</code> and note the three Pod IPs.</li>
+<li>From a temporary busybox Pod, <code>wget -qO- shop</code>. Break the selector label and watch the endpoints go empty.</li>
+<li>On a kind cluster with Calico or Cilium, apply a default-deny policy and confirm the busybox Pod can no longer reach nginx.</li>
+</ol></div>

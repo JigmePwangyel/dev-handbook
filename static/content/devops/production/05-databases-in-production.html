@@ -1,0 +1,126 @@
+<h1>Databases in Production</h1>
+<p class="lead">Your stateless app servers are cattle; the database is the one pet you cannot lose. It is usually the first bottleneck, the hardest thing to scale and the source of the worst outages. This lesson covers connection management, replicas, indexes, safe migrations, the managed-vs-self-hosted decision and caching, with Postgres as the running example.</p>
+
+<h2>1. Connections are expensive: pooling</h2>
+<p>A Postgres connection is a whole OS process using several MB of RAM. The default <code>max_connections</code> is 100. If you run 20 app replicas each with a pool of 10, you are already at 200 and the database falls over. Scaling the app can take down the DB.</p>
+<pre class="diagram">
+ app pod ─┐                                     ┌─ pg conn 1
+ app pod ─┤ 200 client conns ─▶ [ PgBouncer ] ─┼─ pg conn 2     (e.g. 20 real server connections)
+ app pod ─┘                                     └─ pg conn ...
+</pre>
+<ul>
+<li><strong>In-app pool</strong> (node-postgres <code>Pool</code>, HikariCP, SQLAlchemy): size it small. A common formula is connections = (cores * 2) + disks on the DB, shared across <em>all</em> app instances.</li>
+<li><strong>External pooler</strong> (PgBouncer, RDS Proxy, Supavisor): multiplexes many clients onto few server connections. Use <code>pool_mode = transaction</code>; note it breaks session features such as <code>SET</code>, advisory locks and (older) prepared statements.</li>
+</ul>
+<pre><code># pgbouncer.ini
+[databases]
+app = host=10.0.0.5 port=5432 dbname=app
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 20
+auth_type = scram-sha-256</code></pre>
+<div class="callout warn"><strong>Symptom: "remaining connection slots are reserved"</strong><p>Usually a leak (connections not released) or too many replicas times pool size. Check <code>SELECT state, count(*) FROM pg_stat_activity GROUP BY 1;</code>. Set <code>idle_in_transaction_session_timeout</code> and <code>statement_timeout</code> so a stuck client cannot hold resources forever.</p></div>
+
+<h2>2. Replication and read replicas</h2>
+<p>A primary handles writes and streams its write-ahead log (WAL) to replicas. Replicas provide two different things, which people confuse:</p>
+<table>
+<tr><th>Purpose</th><th>Mechanism</th><th>Notes</th></tr>
+<tr><td>High availability</td><td>Standby that can be promoted (synchronous or async)</td><td>Failover automation: Patroni, RDS Multi-AZ, Cloud SQL HA</td></tr>
+<tr><td>Read scaling</td><td>Async replicas serving read-only queries</td><td>Reads may be <em>stale</em> (replication lag)</td></tr>
+</table>
+<p>The classic bug: a user submits a form (write to primary), the next page reads from a replica that has not caught up, and the data "disappears". Mitigate by reading from the primary right after writes ("read your writes"), or routing only reports and search to replicas. Monitor lag: <code>SELECT now() - pg_last_xact_replay_timestamp();</code> on the replica.</p>
+
+<h2>3. Indexes</h2>
+<p>An index trades write speed and disk for read speed. Without one, Postgres scans the whole table.</p>
+<pre><code>EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20;
+-- "Seq Scan on orders" on a big table = missing index
+
+CREATE INDEX CONCURRENTLY idx_orders_customer_created
+  ON orders (customer_id, created_at DESC);</code></pre>
+<ul>
+<li><strong><code>CONCURRENTLY</code> is mandatory in production.</strong> A plain <code>CREATE INDEX</code> takes a lock that blocks writes for the entire build. The concurrent variant takes longer, cannot run inside a transaction and can leave an <code>INVALID</code> index if it fails (drop and retry).</li>
+<li>Column order matters in composite indexes: equality columns first, then range/sort columns.</li>
+<li>Index foreign keys; Postgres does not do it for you.</li>
+<li>Find unused indexes with <code>pg_stat_user_indexes</code> (<code>idx_scan = 0</code>) and slow queries with the <code>pg_stat_statements</code> extension.</li>
+</ul>
+
+<h2>4. Safe schema migrations</h2>
+<p>Use a migration tool (Flyway, Liquibase, Alembic, Prisma Migrate, golang-migrate, Rails/Django migrations): versioned, in git, applied in CI/CD, never by hand. The danger is that during a rolling deploy <strong>old and new code run against the same schema simultaneously</strong>, and some DDL takes long locks.</p>
+
+<h3>The expand / contract pattern</h3>
+<p>Never make a breaking change in one step. Rename a column in phases:</p>
+<ol>
+<li><strong>Expand</strong>: add the new column (nullable). Deploy code that writes to both.</li>
+<li><strong>Backfill</strong> old rows in small batches (not one giant UPDATE).</li>
+<li>Deploy code that reads from the new column.</li>
+<li><strong>Contract</strong>: stop writing the old column, then drop it in a later release.</li>
+</ol>
+
+<h3>Dangerous operations and their safe forms</h3>
+<table>
+<tr><th>Risky</th><th>Why</th><th>Safer</th></tr>
+<tr><td><code>CREATE INDEX</code></td><td>Blocks writes</td><td><code>CREATE INDEX CONCURRENTLY</code></td></tr>
+<tr><td><code>ALTER TABLE ... ADD COLUMN ... DEFAULT x</code> (PG &lt; 11)</td><td>Rewrote whole table</td><td>PG 11+ is instant for constant defaults; otherwise add nullable, backfill</td></tr>
+<tr><td><code>ALTER COLUMN TYPE</code></td><td>Table rewrite under lock</td><td>New column + backfill + swap</td></tr>
+<tr><td><code>ADD CONSTRAINT FOREIGN KEY / CHECK</code></td><td>Full scan under lock</td><td>Add <code>NOT VALID</code>, then <code>VALIDATE CONSTRAINT</code></td></tr>
+<tr><td><code>SET NOT NULL</code></td><td>Full scan</td><td>Add valid CHECK (col IS NOT NULL) first, then SET NOT NULL</td></tr>
+<tr><td>Dropping a column still read by old code</td><td>Errors during rollout</td><td>Stop using it first, drop later</td></tr>
+</table>
+<pre><code>-- always protect yourself from queueing behind a long transaction
+SET lock_timeout = '3s';
+SET statement_timeout = '60s';
+ALTER TABLE orders ADD COLUMN currency text;</code></pre>
+<p>Why <code>lock_timeout</code>: an ALTER waits for a lock, and while it waits <em>every other query queues behind it</em>, so a quick DDL stuck behind a long-running transaction can stall the whole application. Fail fast and retry.</p>
+<p>Also: test migrations against a copy of production-sized data, take a backup first, and keep migrations backward compatible so you can roll back the <em>app</em> without rolling back the schema. Run them as a separate pipeline step (a one-off job) rather than at app startup when you have many replicas.</p>
+
+<h2>5. Managed vs self-hosted</h2>
+<table>
+<tr><th></th><th>Managed (RDS, Cloud SQL, Neon, Supabase, Aiven)</th><th>Self-hosted (VM or Kubernetes operator)</th></tr>
+<tr><td>Backups, PITR</td><td>Built-in</td><td>You build and test (pgBackRest, WAL-G)</td></tr>
+<tr><td>Failover</td><td>Click to enable</td><td>Patroni/CloudNativePG, you operate</td></tr>
+<tr><td>Patching</td><td>Scheduled windows</td><td>You</td></tr>
+<tr><td>Cost</td><td>Higher per unit</td><td>Cheaper compute, expensive in human time</td></tr>
+<tr><td>Control</td><td>Limited extensions/config, no OS access</td><td>Full</td></tr>
+<tr><td>Lock-in</td><td>Moderate (standard Postgres protocol eases exit)</td><td>None</td></tr>
+</table>
+<p><strong>Default advice:</strong> use managed unless you have a specific reason and a person who knows how to run databases. The price premium is almost always smaller than one bad weekend. Whichever you pick, a database on the same VPS as the app is acceptable only for small projects, with off-box backups.</p>
+
+<h2>6. Caching with Redis</h2>
+<p>Caching removes load from the database for data that is read often and changes rarely. The standard pattern is <strong>cache-aside</strong>:</p>
+<pre><code>async function getProduct(id) {
+  const key = `product:${id}`;
+  const hit = await redis.get(key);
+  if (hit) return JSON.parse(hit);
+
+  const row = await db.query('SELECT * FROM products WHERE id=$1', [id]);
+  // TTL with jitter avoids many keys expiring in the same second
+  await redis.set(key, JSON.stringify(row), 'EX', 300 + Math.floor(Math.random()*60));
+  return row;
+}
+// on update: DEL product:{id}  (invalidate)</code></pre>
+<ul>
+<li><strong>Always set a TTL</strong>, so stale data and memory growth are bounded. Configure <code>maxmemory</code> and <code>maxmemory-policy allkeys-lru</code> for caches.</li>
+<li><strong>Cache stampede</strong>: a hot key expires and 1000 requests hit the DB simultaneously. Use jittered TTLs, request coalescing or a short lock.</li>
+<li><strong>Invalidation</strong> is the hard part: prefer short TTLs plus explicit deletes on writes over elaborate schemes.</li>
+<li>Do not treat a cache as the source of truth unless you configure persistence deliberately (AOF/RDB) and accept the trade-offs. Never expose Redis publicly; require auth and TLS.</li>
+<li>Redis also serves as a session store, rate-limit counter and job queue backend.</li>
+</ul>
+
+<h2>7. Operational basics</h2>
+<ul>
+<li>Monitor: connections, replication lag, disk space (a full disk is the classic outage), cache hit ratio, slow queries, locks, autovacuum and transaction ID age.</li>
+<li>Private network only; TLS to the database; per-service credentials with least privilege.</li>
+<li>Alert on disk at 70-80%, not 95%.</li>
+<li>Run <code>EXPLAIN</code> on new queries in code review; add an ORM N+1 detector.</li>
+</ul>
+
+<div class="callout key"><strong>Rule of thumb</strong><p>Scale the database in this order: fix queries and indexes, add pooling, cache, add read replicas, scale up the instance, and only then consider sharding. Each step is cheaper than the next.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run Postgres in Docker, create a 5-million-row table with <code>generate_series</code>, run a filtered query with <code>EXPLAIN ANALYZE</code>, add an index with <code>CONCURRENTLY</code> and compare timings.</li>
+<li>Put PgBouncer in front and use <code>pgbench -c 200</code> to watch connection counts in <code>pg_stat_activity</code> with and without it.</li>
+<li>Plan the expand/contract steps (on paper) to rename <code>users.fullname</code> to <code>users.display_name</code> with zero downtime.</li>
+</ol></div>

@@ -1,0 +1,218 @@
+<h1>Capstone: Infrastructure as Code and Monitoring</h1>
+<p class="lead">Stage 4: stop clicking in a provider dashboard. Describe the server, firewall and DNS record in Terraform so the whole environment can be rebuilt from git, then add Prometheus, Grafana and an external uptime check so you find out about problems before your users do.</p>
+
+<h2>Part A: Terraform the VPS</h2>
+<p>We use Hetzner Cloud for the example (cheap and a clean provider), but the pattern is identical for DigitalOcean, AWS Lightsail/EC2 or any other provider: a server resource, an SSH key, a firewall and a DNS record. Cloudflare manages DNS here.</p>
+
+<h3>Layout</h3>
+<pre class="diagram">
+infra/
+├── versions.tf       # provider + version constraints, backend
+├── variables.tf
+├── main.tf           # ssh key, firewall, server, dns
+├── cloud-init.yaml   # bootstrap: user, docker, ufw, nginx
+├── outputs.tf
+└── terraform.tfvars  # NOT committed if it holds secrets; use TF_VAR_* env vars
+</pre>
+
+<pre><code># versions.tf
+terraform {
+  required_version = "&gt;= 1.9"
+  required_providers {
+    hcloud     = { source = "hetznercloud/hcloud", version = "~&gt; 1.49" }
+    cloudflare = { source = "cloudflare/cloudflare", version = "~&gt; 5.0" }
+  }
+  # Remote state with locking: S3-compatible bucket (Hetzner/R2/AWS). Never commit state - it contains secrets.
+  backend "s3" {
+    bucket = "acme-tfstate"
+    key    = "notely/prod.tfstate"
+    region = "eu-west-1"
+    use_lockfile = true
+  }
+}
+
+provider "hcloud" { token = var.hcloud_token }
+provider "cloudflare" { api_token = var.cloudflare_token }</code></pre>
+<pre><code># variables.tf
+variable "hcloud_token"     { type = string, sensitive = true }
+variable "cloudflare_token" { type = string, sensitive = true }
+variable "zone_id"          { type = string }
+variable "domain"           { type = string, default = "notely.example.com" }
+variable "ssh_public_keys"  { type = list(string) }
+variable "admin_cidrs"      { type = list(string), default = ["0.0.0.0/0", "::/0"] }  # tighten to your IP</code></pre>
+<pre><code># main.tf
+resource "hcloud_ssh_key" "admin" {
+  for_each   = toset(var.ssh_public_keys)
+  name       = "admin-${substr(sha1(each.value), 0, 8)}"
+  public_key = each.value
+}
+
+resource "hcloud_firewall" "web" {
+  name = "notely-web"
+  rule { direction = "in", protocol = "tcp", port = "22",  source_ips = var.admin_cidrs }
+  rule { direction = "in", protocol = "tcp", port = "80",  source_ips = ["0.0.0.0/0", "::/0"] }
+  rule { direction = "in", protocol = "tcp", port = "443", source_ips = ["0.0.0.0/0", "::/0"] }
+}
+
+resource "hcloud_server" "app" {
+  name         = "notely-prod"
+  server_type  = "cx22"
+  image        = "ubuntu-24.04"
+  location     = "fsn1"
+  ssh_keys     = [for k in hcloud_ssh_key.admin : k.id]
+  firewall_ids = [hcloud_firewall.web.id]
+  user_data    = file("${path.module}/cloud-init.yaml")
+  backups      = true            # provider-level snapshots: a convenience, NOT a substitute for DB backups
+
+  lifecycle { ignore_changes = [user_data] }   # avoid destroying the server when bootstrap script changes
+}
+
+resource "cloudflare_dns_record" "app" {
+  zone_id = var.zone_id
+  name    = var.domain
+  type    = "A"
+  content = hcloud_server.app.ipv4_address
+  ttl     = 300
+  proxied = false
+}</code></pre>
+<pre><code># outputs.tf
+output "ip" { value = hcloud_server.app.ipv4_address }</code></pre>
+<pre><code># cloud-init.yaml - runs once at first boot
+#cloud-config
+users:
+  - name: deploy
+    groups: [docker]
+    shell: /bin/bash
+    sudo: false
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA...your-key
+      - ssh-ed25519 AAAA...ci-deploy-key
+package_update: true
+package_upgrade: true
+packages: [nginx, certbot, python3-certbot-nginx, ufw, fail2ban, unattended-upgrades]
+runcmd:
+  - curl -fsSL https://get.docker.com | sh
+  - usermod -aG docker deploy
+  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/; s/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  - systemctl reload ssh
+  - mkdir -p /opt/notely && chown deploy:deploy /opt/notely
+  - ufw allow OpenSSH && ufw allow 80,443/tcp && ufw --force enable</code></pre>
+
+<h3>The Terraform workflow</h3>
+<pre><code>export TF_VAR_hcloud_token=...  TF_VAR_cloudflare_token=...   # secrets from env or a secret manager
+terraform init
+terraform fmt -recursive &amp;&amp; terraform validate
+terraform plan -out tfplan        # READ the plan: what will be created, changed, destroyed?
+terraform apply tfplan
+terraform output ip</code></pre>
+<div class="callout warn"><strong>Terraform pitfalls</strong><p>State holds secrets and is the source of truth: use a remote encrypted backend with locking and never commit it. Treat <code>-/+ destroy and create</code> in a plan as a red flag for stateful resources (set <code>prevent_destroy = true</code> on volumes or databases). Never edit resources by hand in the console; drift makes the next apply surprising. Run <code>terraform plan</code> in CI on pull requests and apply only from main after review.</p></div>
+<p>Prove the value: run <code>terraform destroy</code> on a test copy, then <code>apply</code> again and time how long a clean environment takes (a few minutes). Then redeploy the app with your pipeline. That is disaster recovery in miniature. For ongoing configuration of the OS (rather than first boot), Ansible is the next step.</p>
+
+<h2>Part B: Metrics with Prometheus and Grafana</h2>
+<p>Add a monitoring stack to a second compose file on the server, <code>/opt/notely/monitoring/compose.yaml</code>. Prometheus scrapes <code>/metrics</code> from the API and from exporters for the host (node_exporter) and database (postgres_exporter); Grafana visualises.</p>
+<pre><code>services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - promdata:/prometheus
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
+    ports: ["127.0.0.1:9090:9090"]
+    extra_hosts: ["host.docker.internal:host-gateway"]
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    pid: host
+    network_mode: host                  # sees real host network stats; listens on :9100
+    volumes: ["/:/host:ro,rslave"]
+    command: ["--path.rootfs=/host"]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin
+      GF_SERVER_ROOT_URL: https://grafana.example.com
+    secrets: [grafana_admin]
+    volumes: [grafdata:/var/lib/grafana]
+    ports: ["127.0.0.1:3001:3000"]
+
+secrets:
+  grafana_admin: { file: ./grafana_admin.txt }
+volumes: { promdata: {}, grafdata: {} }</code></pre>
+<pre><code># prometheus.yml
+global: { scrape_interval: 15s, evaluation_interval: 15s }
+rule_files: [alerts.yml]
+scrape_configs:
+  - job_name: notely-api
+    static_configs: [{ targets: ["host.docker.internal:3000"] }]
+  - job_name: node
+    static_configs: [{ targets: ["host.docker.internal:9100"] }]</code></pre>
+<p>Note <code>/metrics</code> is blocked in public nginx but reachable on localhost for Prometheus. Expose Grafana through nginx on its own hostname with TLS and a strong password (or only via an SSH tunnel: <code>ssh -L 3001:localhost:3001 deploy@host</code>). Never publish Prometheus without authentication.</p>
+<p>In Grafana add Prometheus as a data source (<code>http://prometheus:9090</code>, since they share a compose network when in the same file) and build panels with PromQL:</p>
+<pre><code># request rate by status
+sum by (status) (rate(http_request_duration_seconds_count[5m]))
+# error ratio
+sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m])) / sum(rate(http_request_duration_seconds_count[5m]))
+# p95 latency
+histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+# disk free percent
+100 * node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}</code></pre>
+<p>Import community dashboard "Node Exporter Full" (ID 1860) for instant host graphs.</p>
+
+<h3>Alert rules</h3>
+<pre><code># alerts.yml
+groups:
+  - name: notely
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m])) / sum(rate(http_request_duration_seconds_count[5m])) &gt; 0.05
+        for: 5m
+        labels: { severity: page }
+        annotations: { summary: "5xx ratio above 5% for 5 minutes" }
+      - alert: DiskAlmostFull
+        expr: node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"} &lt; 0.15
+        for: 10m
+        labels: { severity: ticket }
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels: { severity: page }</code></pre>
+<p>To deliver alerts add Alertmanager (route to email, Slack or ntfy) or use Grafana's built-in alerting with a contact point. Alert on symptoms users feel (errors, latency, availability) more than causes (CPU 80%).</p>
+
+<h2>Part C: The external uptime check</h2>
+<p>Everything above runs on the same box. If the VPS dies, your monitoring dies with it and nobody is told. You need a probe <strong>from outside</strong>:</p>
+<ul>
+<li>A hosted service: UptimeRobot, Better Stack, Uptime Kuma on a second cheap host, or Grafana Cloud synthetic monitoring. Check <code>https://notely.example.com/healthz</code> every minute, expect HTTP 200 and a keyword, alert via email/Slack/phone.</li>
+<li>Also monitor certificate expiry (alert at 14 days) and the domain's renewal date.</li>
+<li>Use a dead-man's switch (healthchecks.io) for your backup job: it alerts when the ping stops arriving.</li>
+</ul>
+
+<h2>Part D: Logs</h2>
+<p>At minimum <code>docker compose logs</code> works but rotates away. Configure Docker's log driver limits so logs cannot fill the disk, and consider shipping them to Loki with Grafana Alloy:</p>
+<pre><code># /etc/docker/daemon.json
+{ "log-driver": "local", "log-opts": { "max-size": "10m", "max-file": "5" } }
+# then: systemctl restart docker (containers must be recreated to pick it up)</code></pre>
+
+<h2>Final acceptance tests</h2>
+<table>
+<tr><th>Test</th><th>Expected</th></tr>
+<tr><td><code>terraform destroy &amp;&amp; terraform apply</code>, then run the deploy pipeline</td><td>Site back up with HTTPS in under about 20 minutes, with no manual console clicks</td></tr>
+<tr><td><code>docker stop</code> the API container</td><td>TargetDown/uptime alert reaches you within a few minutes; container restarts if policy applies</td></tr>
+<tr><td>Generate load with <code>k6</code> or <code>hey</code></td><td>Grafana shows request rate and latency change</td></tr>
+<tr><td>Restore last night's backup into a scratch container</td><td>Notes present; time recorded</td></tr>
+<tr><td>Walk the production readiness checklist</td><td>Gaps listed as issues in your repo</td></tr>
+</table>
+
+<div class="callout key"><strong>You have now done DevOps</strong><p>Code goes in at one end; a monitored, TLS-protected, reproducible service comes out at the other, with rollback, backups and alerts. Every extra tool you learn later (Kubernetes, Argo CD, Vault) is a refinement of one of these steps.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write the Terraform, run <code>plan</code>, and read every line of it before <code>apply</code>.</li>
+<li>Bring up Prometheus and Grafana, graph request rate while you hit the API with a loop, and create the error-rate alert. Trigger it by making the API return 500s.</li>
+<li>Set up an external uptime check and verify you receive the alert when you <code>docker compose stop api</code>.</li>
+<li>Stretch: move Terraform into CI (plan on PR, apply on merge) and add a second environment using a workspace or separate tfvars.</li>
+</ol></div>

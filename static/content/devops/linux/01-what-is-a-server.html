@@ -1,0 +1,109 @@
+<h1>What Is a Server?</h1>
+<p class="lead">A server is just a computer that runs a program waiting for requests, usually with no screen or keyboard, always on, reachable over a network. There is no magic: everything you do on a server is something you can do on a Linux laptop.</p>
+
+<h2>Why servers, and why Linux</h2>
+<p>Your laptop sleeps, changes networks and sits behind your home router. A server has a stable public IP address, runs 24/7 in a data centre with redundant power and networking, and is administered remotely. Roughly 90%+ of public cloud workloads and nearly all containers run Linux: it is free, scriptable, stable, secure and the target every tool in this handbook assumes. Learning it is the foundation of everything else.</p>
+
+<h2>Kinds of servers</h2>
+<table>
+<tr><th>Type</th><th>What it is</th><th>Pros</th><th>Cons</th></tr>
+<tr><td><strong>Bare metal</strong></td><td>A whole physical machine (yours or rented)</td><td>Max performance, no neighbours</td><td>Slow to provision, you manage hardware</td></tr>
+<tr><td><strong>Virtual machine</strong></td><td>A slice of a physical host with its own kernel</td><td>Strong isolation, any OS</td><td>Some overhead</td></tr>
+<tr><td><strong>VPS</strong></td><td>A rented VM with fixed monthly price (Hetzner, DigitalOcean, Linode/Akamai, Vultr)</td><td>Cheap ($4-10/mo), simple</td><td>Manual scaling, you secure it</td></tr>
+<tr><td><strong>Cloud instance</strong></td><td>VM from a hyperscaler (AWS EC2, GCP Compute Engine, Azure VM), billed per second</td><td>API-driven, huge ecosystem</td><td>Pricing and IAM complexity</td></tr>
+<tr><td><strong>Container host / serverless</strong></td><td>You supply code or an image; the provider runs it</td><td>No server to patch</td><td>Less control, platform lock-in</td></tr>
+</table>
+<pre class="diagram">
+ Bare metal            Virtual machines              Containers
+ ┌──────────┐     ┌─────┐┌─────┐┌─────┐       ┌────┐┌────┐┌────┐
+ │   OS     │     │ App ││ App ││ App │       │App ││App ││App │
+ │          │     │ OS  ││ OS  ││ OS  │       └────┘└────┘└────┘
+ │ hardware │     └─────┘└─────┘└─────┘       ┌──────────────────┐
+ └──────────┘     ┌────────────────────┐      │ one host OS kernel│
+                  │ hypervisor + hardware│    └──────────────────┘
+                  └────────────────────┘
+</pre>
+
+<h2>Choosing a distribution</h2>
+<p>A distro bundles the Linux kernel with a package manager and defaults. For servers, pick something boring and widely documented.</p>
+<table>
+<tr><th>Distro</th><th>Family</th><th>Package tool</th><th>Notes</th></tr>
+<tr><td><strong>Ubuntu Server LTS</strong> (24.04, 26.04)</td><td>Debian</td><td>apt</td><td>Best default for learners; biggest tutorial base; 5 years support per LTS</td></tr>
+<tr><td><strong>Debian</strong></td><td>Debian</td><td>apt</td><td>Very stable, minimal</td></tr>
+<tr><td><strong>Rocky / AlmaLinux</strong></td><td>RHEL</td><td>dnf</td><td>Free RHEL-compatible; common in enterprises</td></tr>
+<tr><td><strong>Fedora Server</strong></td><td>RHEL upstream</td><td>dnf</td><td>Newer packages, short lifecycle</td></tr>
+<tr><td><strong>Alpine</strong></td><td>Independent</td><td>apk</td><td>Tiny; popular for container images (uses musl libc)</td></tr>
+</table>
+<div class="callout tip"><strong>Recommendation</strong><p>Use the latest <strong>Ubuntu LTS</strong> for this handbook. Always choose an LTS (long-term support) release for servers so you get security patches for years without forced upgrades. Commands for Rocky/Alma are noted where they differ.</p></div>
+
+<h2>Sizing a first server</h2>
+<ul>
+<li>1 vCPU and 1-2 GB RAM runs a small Node/Python app plus nginx fine. A database plus app wants 2-4 GB.</li>
+<li>Pick a region near your users. Pick SSD/NVMe disk. 25 GB is plenty to learn.</li>
+<li>Check bandwidth/traffic allowance and whether snapshots/backups cost extra.</li>
+</ul>
+
+<h2>Getting your first VPS</h2>
+<ol>
+<li>Create an account with a provider (Hetzner, DigitalOcean, Vultr, Linode, or an AWS Lightsail/EC2 free tier).</li>
+<li>Generate an SSH key on your laptop <em>before</em> creating the server (next lesson covers SSH deeply):
+<pre><code>ssh-keygen -t ed25519 -C "you@laptop" -f ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub     # paste this PUBLIC key into the provider's form</code></pre></li>
+<li>Create the server: choose Ubuntu LTS, a small plan, your region, and select your SSH key. Prefer key auth over a root password.</li>
+<li>Note the public IPv4 address the provider displays.</li>
+</ol>
+
+<h2>Connecting</h2>
+<pre><code>ssh root@203.0.113.10                 # first login (some providers use "ubuntu" or "debian")
+# The authenticity prompt appears once:
+# "The authenticity of host ... can't be established. ED25519 key fingerprint is SHA256:..."
+# Type "yes" to trust it; it's stored in ~/.ssh/known_hosts.</code></pre>
+<p>You are now typing commands on a computer in a data centre. Verify:</p>
+<pre><code>hostnamectl            # hostname, OS, kernel, virtualization type
+cat /etc/os-release    # distro and version
+uname -r               # kernel version
+nproc; free -h; df -h  # CPUs, memory, disk
+ip -br addr            # network interfaces and IPs
+uptime                 # how long running, load averages</code></pre>
+
+<h2>First 10 minutes on a new server</h2>
+<p>A fresh public server is scanned by bots within minutes. Do this immediately:</p>
+<pre><code># 1. Update everything
+apt update &amp;&amp; apt upgrade -y
+
+# 2. Create a normal user with sudo rights
+adduser deploy
+usermod -aG sudo deploy
+
+# 3. Install your key for that user
+rsync --archive --chown=deploy:deploy ~/.ssh /home/deploy
+
+# 4. Test login in a SECOND terminal before closing the first
+ssh deploy@203.0.113.10
+sudo whoami           # should print "root"
+
+# 5. Enable a firewall allowing SSH (and web later)
+sudo ufw allow OpenSSH
+sudo ufw allow 80,443/tcp
+sudo ufw enable
+sudo ufw status</code></pre>
+<div class="callout warn"><strong>Do not lock yourself out</strong><p>Enable the firewall only after allowing SSH, and keep your existing session open while testing a new login. If you do get locked out, providers offer a web console and rescue mode.</p></div>
+<p>The SSH lesson covers disabling root and password logins.</p>
+
+<h2>Pets vs cattle</h2>
+<p>A hand-configured server you nurse and fear to reboot is a <em>pet</em>. Servers that are created from a script, interchangeable, and replaced rather than repaired are <em>cattle</em>. This handbook starts with a pet to learn the mechanics, then moves toward cattle with scripts, containers and infrastructure as code. Keep notes of every command you run; those notes are your future automation.</p>
+
+<h2>Cost hygiene</h2>
+<ul>
+<li>Servers bill while they exist, even if idle. Delete what you no longer use.</li>
+<li>Set a billing alert on cloud accounts, especially AWS/GCP.</li>
+<li>Snapshots and unattached volumes and IPs also cost money.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create the cheapest Ubuntu LTS VPS you can, with your SSH key.</li>
+<li>SSH in and run the verification commands above; write down the kernel version, RAM and disk size.</li>
+<li>Do the "first 10 minutes" steps: new user, key, firewall.</li>
+<li>No spare money? Install Multipass (<code>multipass launch --name lab</code>) or Vagrant/UTM to get a local Ubuntu VM and follow along identically.</li>
+</ol></div>

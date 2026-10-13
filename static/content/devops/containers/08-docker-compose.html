@@ -1,0 +1,216 @@
+<h1>Docker Compose</h1>
+<p class="lead">Real applications are several containers: an API, a database, a cache, a reverse proxy. Starting each with a long <code>docker run</code> line, creating networks and volumes by hand and remembering the order is error-prone. Compose lets you describe the whole stack in one YAML file and manage it with a single command.</p>
+
+<h2>Why Compose</h2>
+<ul>
+<li><strong>Declarative:</strong> the file is the documentation and the source of truth. Check it into Git.</li>
+<li><strong>One command:</strong> <code>docker compose up</code> creates the network, volumes and containers in dependency order.</li>
+<li><strong>Service discovery:</strong> each service name becomes a DNS name on the project network.</li>
+<li><strong>Reproducible dev environments:</strong> a new teammate clones the repo and runs one command.</li>
+</ul>
+<p>Compose is the V2 plugin invoked as <code>docker compose</code> (with a space). The old Python <code>docker-compose</code> binary is end-of-life. The file is named <code>compose.yaml</code> (preferred) or <code>docker-compose.yml</code>, and the old top-level <code>version:</code> key is obsolete: omit it.</p>
+
+<h2>A complete example: app + Postgres + Redis + nginx</h2>
+<pre><code>name: shop                                # project name (prefixes networks/volumes)
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [front]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      target: runtime
+    image: shop/api:dev
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      REDIS_URL: redis://cache:6379
+      DATABASE_URL: postgres://app:${DB_PASSWORD}@db:5432/shop
+    env_file:
+      - .env                              # extra vars, lower priority than "environment"
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=&gt;process.exit(r.ok?0:1)).catch(()=&gt;process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    networks: [front, back]
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+      POSTGRES_DB: shop
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d shop"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [back]
+    restart: unless-stopped
+
+  cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    networks: [back]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  front:
+  back:</code></pre>
+<p>And the nginx config the proxy mounts, forwarding to the API by service name:</p>
+<pre><code># nginx/default.conf
+server {
+  listen 80;
+  location / {
+    proxy_pass http://api:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+}</code></pre>
+<pre class="diagram">
+ Internet ─:80─▶ [nginx] ── front ── [api] ── back ──┬─▶ [db]    (pgdata volume)
+                                                     └─▶ [cache] (redisdata volume)
+ Only nginx publishes a port. db and cache are unreachable from outside.
+</pre>
+
+<h2>Key concepts in that file</h2>
+<h3>Healthchecks and depends_on</h3>
+<p>Plain <code>depends_on: [db]</code> only waits until the db container has <em>started</em>, not until Postgres accepts connections. The app then crashes with "connection refused". Using <code>condition: service_healthy</code> waits for the healthcheck to pass. Conditions are <code>service_started</code> (default), <code>service_healthy</code> and <code>service_completed_successfully</code> (for one-shot init jobs such as migrations). Your app should still retry connections on startup, since databases restart at any time.</p>
+<h3>Environment variables and env files</h3>
+<ul>
+<li><code>environment:</code> sets variables directly; values can interpolate from your shell or <code>.env</code>: <code>${VAR}</code>, <code>${VAR:-default}</code>, <code>${VAR:?error message}</code>.</li>
+<li>A file named <code>.env</code> next to <code>compose.yaml</code> is read automatically for <em>interpolation in the compose file</em>. <code>env_file:</code> injects variables <em>into the container</em>. They are different mechanisms.</li>
+<li>Never commit real secrets. Commit a <code>.env.example</code> and gitignore <code>.env</code>.</li>
+<li>Precedence (high to low): <code>docker compose run -e</code>, shell environment, <code>environment:</code>, <code>env_file:</code>, image <code>ENV</code>.</li>
+</ul>
+<h3>Secrets</h3>
+<pre><code>services:
+  db:
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt        # mounted at /run/secrets/db_password</code></pre>
+<h3>Profiles</h3>
+<p>Profiles make services optional so they do not start by default:</p>
+<pre><code>services:
+  adminer:
+    image: adminer
+    profiles: ["debug"]
+    ports: ["8081:8080"]
+  migrate:
+    build: ./api
+    command: ["node", "migrate.js"]
+    profiles: ["tools"]
+    depends_on:
+      db: { condition: service_healthy }
+
+# docker compose up -d                       # core services only
+# docker compose --profile debug up -d       # + adminer
+# docker compose run --rm migrate            # explicit run of a profiled service</code></pre>
+
+<h2>Dev vs. prod: override files</h2>
+<p>Compose merges <code>compose.yaml</code> with <code>compose.override.yaml</code> automatically. Put production-safe defaults in the base and developer conveniences in the override; or use explicit files per environment.</p>
+<pre><code># compose.override.yaml  (auto-loaded in dev)
+services:
+  api:
+    build:
+      target: dev
+    command: ["npm", "run", "dev"]
+    volumes:
+      - ./api:/app                  # live code via bind mount
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+      - "9229:9229"                 # node debugger
+    environment:
+      NODE_ENV: development
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"       # let your local psql connect
+
+# compose.prod.yaml
+services:
+  api:
+    image: ghcr.io/acme/shop-api:${TAG:?set TAG}   # pull a built image, never build in prod
+    restart: always
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+# Production invocation (skips the override file):
+# docker compose -f compose.yaml -f compose.prod.yaml up -d</code></pre>
+<p>Merge rules: scalars are replaced, maps are merged, lists such as <code>ports</code> and <code>volumes</code> are appended. Run <code>docker compose config</code> to see the final merged result, which is the best debugging tool for override confusion.</p>
+<p>For hot reload without bind mounts, Compose has <code>develop: watch:</code> with <code>docker compose watch</code>, which syncs or rebuilds on file changes (and avoids many bind mount performance issues on Mac).</p>
+
+<h2>Common commands</h2>
+<table>
+<tr><th>Command</th><th>Does</th></tr>
+<tr><td><code>docker compose up -d</code></td><td>Create and start everything in the background</td></tr>
+<tr><td><code>docker compose up -d --build</code></td><td>Rebuild images first</td></tr>
+<tr><td><code>docker compose up -d --wait</code></td><td>Block until services are healthy (great in CI)</td></tr>
+<tr><td><code>docker compose ps</code></td><td>Status and health of services</td></tr>
+<tr><td><code>docker compose logs -f api</code></td><td>Follow one service's logs</td></tr>
+<tr><td><code>docker compose exec api sh</code></td><td>Shell in a running service</td></tr>
+<tr><td><code>docker compose run --rm api npm test</code></td><td>One-off container from a service definition</td></tr>
+<tr><td><code>docker compose build [--no-cache]</code></td><td>Build images</td></tr>
+<tr><td><code>docker compose pull</code></td><td>Pull newer images</td></tr>
+<tr><td><code>docker compose restart api</code></td><td>Restart one service</td></tr>
+<tr><td><code>docker compose stop</code> / <code>start</code></td><td>Stop/start without removing</td></tr>
+<tr><td><code>docker compose down</code></td><td>Stop and remove containers and networks (volumes kept)</td></tr>
+<tr><td><code>docker compose down -v</code></td><td>Also delete named volumes (data loss!)</td></tr>
+<tr><td><code>docker compose config</code></td><td>Validate and print resolved config</td></tr>
+<tr><td><code>docker compose up -d --scale worker=3</code></td><td>Run multiple replicas (service must not publish a fixed host port)</td></tr>
+</table>
+
+<h2>Pitfalls and best practices</h2>
+<ul>
+<li><strong>Do not use Compose as a production orchestrator for critical multi-host systems.</strong> It is excellent for dev, CI and small single-host deployments; for rolling updates, self-healing across machines and autoscaling, move to Kubernetes or a managed container service.</li>
+<li><strong>Pin image tags</strong>, same rule as everywhere.</li>
+<li><strong>Do not publish every port.</strong> Only the entry point needs to be public; internal services reach each other via the network.</li>
+<li><strong>YAML indentation errors</strong>: use <code>docker compose config</code> to catch them.</li>
+<li><strong><code>.env</code> quoting</strong>: values are taken literally; quotes and trailing spaces can end up in the value.</li>
+<li><strong>Changed Dockerfile but no effect</strong>: you need <code>--build</code> or <code>docker compose build</code>.</li>
+<li><strong>Stale data after changing init scripts</strong>: files in <code>docker-entrypoint-initdb.d</code> only run on an empty data volume. Remove the volume to re-run.</li>
+<li>Set <code>name:</code> or use <code>-p</code> so two checkouts of the same repo do not collide on project names.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write the compose file above for a small app of your own (any API that reads <code>DATABASE_URL</code>). Add a <code>.env</code> with <code>DB_PASSWORD</code>.</li>
+<li>Run <code>docker compose up -d --wait</code>, then <code>docker compose ps</code>. Stop the db with <code>docker compose stop db</code> and watch the api's health respond.</li>
+<li>Remove the <code>condition: service_healthy</code> and see whether the API fails on a cold start. Put it back.</li>
+<li>Add a <code>compose.override.yaml</code> with a bind mount and inspect the merge with <code>docker compose config</code>.</li>
+<li>Run <code>docker compose down</code>, then <code>up</code> again: is the data still there? Now try <code>down -v</code>.</li>
+</ol></div>

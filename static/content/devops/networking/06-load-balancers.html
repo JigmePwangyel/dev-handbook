@@ -1,0 +1,163 @@
+<h1>Load Balancers</h1>
+<p class="lead">One server is a single point of failure and a scaling ceiling. A load balancer spreads traffic over many servers, removes unhealthy ones automatically, and lets you deploy without downtime.</p>
+
+<h2>The problem</h2>
+<p>With one app server: when it crashes, you are down; when you deploy, you are down; when traffic doubles, you are slow. Adding a second server does not help by itself, because clients need a single address to talk to. A load balancer (LB) is that address. It accepts connections and forwards each to one of several backends.</p>
+<pre class="diagram">
+                         ┌──▶ app-1  10.0.1.11:3000   healthy
+ Clients ──▶  LB ────────┼──▶ app-2  10.0.1.12:3000   healthy
+ (one address)  │        └──▶ app-3  10.0.1.13:3000   FAILED health check: removed from rotation
+                │
+                └─ periodically probes GET /health on each backend
+</pre>
+<p>Benefits: <strong>availability</strong> (failed nodes bypassed), <strong>scalability</strong> (add nodes), <strong>zero-downtime deploys</strong> (drain one node at a time), <strong>TLS offload</strong>, a single place for logging and WAF rules.</p>
+
+<h2>Layer 4 vs Layer 7</h2>
+<table>
+<tr><th></th><th>L4 (transport)</th><th>L7 (application)</th></tr>
+<tr><td>Sees</td><td>IPs, ports, TCP/UDP</td><td>HTTP: host, path, headers, cookies</td></tr>
+<tr><td>Decision based on</td><td>Connection 4-tuple</td><td>Request content</td></tr>
+<tr><td>Speed</td><td>Very fast, millions of connections</td><td>More CPU (parses and often terminates TLS)</td></tr>
+<tr><td>Features</td><td>Pass-through, any protocol (Postgres, MQTT, SMTP, gRPC raw)</td><td>Path/host routing, redirects, header rewrite, WAF, sticky cookies, HTTP/2 to HTTP/1.1</td></tr>
+<tr><td>TLS</td><td>Usually passes through encrypted traffic</td><td>Usually terminates TLS</td></tr>
+<tr><td>Examples</td><td>AWS NLB, HAProxy <code>mode tcp</code>, nginx <code>stream</code>, IPVS</td><td>AWS ALB, HAProxy <code>mode http</code>, nginx <code>http</code>, Envoy, Traefik</td></tr>
+</table>
+<p>Rule of thumb: use L7 for web apps and APIs (routing by path is invaluable: <code>/api</code> to one pool, <code>/</code> to another). Use L4 for non-HTTP protocols, extreme throughput, static IPs, or when you must preserve end-to-end TLS.</p>
+
+<h2>Balancing algorithms</h2>
+<table>
+<tr><th>Algorithm</th><th>How</th><th>Best for / caveat</th></tr>
+<tr><td>Round robin</td><td>Rotate through servers in order</td><td>Equal servers, similar request costs. Ignores load.</td></tr>
+<tr><td>Weighted round robin</td><td>Servers get a share proportional to weight</td><td>Mixed instance sizes; also canary (weight 5 to the new node)</td></tr>
+<tr><td>Least connections</td><td>Send to the server with fewest active connections</td><td>Long or uneven requests, WebSockets</td></tr>
+<tr><td>Least response time</td><td>Fewest connections plus fastest responses</td><td>Heterogeneous backends</td></tr>
+<tr><td>IP hash / consistent hash</td><td>Same client (or key) maps to same server</td><td>Cheap stickiness; per-key caches. Skews behind NAT.</td></tr>
+<tr><td>Random (power of two choices)</td><td>Pick two at random, take the less loaded</td><td>Large pools; avoids herd effects</td></tr>
+</table>
+
+<h2>Health checks</h2>
+<p>The LB is only as good as its health checks. Two kinds:</p>
+<ul>
+<li><strong>Passive</strong>: observe real traffic; mark a backend down after N failures (nginx <code>max_fails</code>).</li>
+<li><strong>Active</strong>: the LB probes an endpoint on an interval (HAProxy <code>check</code>, ALB target group health checks).</li>
+</ul>
+<p>Typical settings: probe every 5 to 10 s, mark unhealthy after 2 to 3 failures, healthy after 2 to 5 successes, timeout 2 to 5 s.</p>
+<pre><code>// A useful /health endpoint (Express)
+app.get('/health', async (req, res) =&gt; {
+  try {
+    await db.query('SELECT 1');           // can I do my job?
+    res.status(200).json({ status: 'ok', version: process.env.GIT_SHA });
+  } catch (e) {
+    res.status(503).json({ status: 'degraded' });
+  }
+});</code></pre>
+<div class="callout warn"><strong>Shallow vs deep health checks</strong><p>A check that only returns 200 hides a broken database connection. But a check that fails whenever any dependency (a third-party API) is down can make the LB eject <em>every</em> node at once, turning a partial outage into a total one. Prefer: <strong>liveness</strong> (process responds) for restart decisions, <strong>readiness</strong> (can serve traffic: DB reachable, caches warm) for LB membership, and never check non-essential dependencies.</p></div>
+
+<h2>Connection draining</h2>
+<p>When removing a node (deploy, scale-in) the LB should stop sending <em>new</em> requests but let in-flight ones finish: "connection draining" (ALB: <em>deregistration delay</em>, default 300 s; lower it to match your longest request). Combined with graceful shutdown in your app (see the zero-downtime lesson), deploys drop no requests.</p>
+
+<h2>Session stickiness</h2>
+<p>If the app keeps user session state in server memory, the user must keep hitting the same server, or they appear logged out. Options:</p>
+<ul>
+<li><strong>Sticky sessions</strong>: LB sets a cookie (ALB duration-based or app cookie; HAProxy <code>cookie SERVERID insert</code>) or hashes the client IP.</li>
+<li><strong>Externalise state (preferred)</strong>: sessions in Redis or a database, or stateless signed tokens (JWT). Any server can then handle any request.</li>
+</ul>
+<p>Stickiness hurts: uneven load, lost sessions when a node dies, awkward scaling and draining. Treat it as a stopgap and design services stateless (a core 12-factor principle).</p>
+
+<h2>nginx as a simple load balancer</h2>
+<pre><code>upstream app_pool {
+    least_conn;
+    server 10.0.1.11:3000 weight=3 max_fails=3 fail_timeout=15s;
+    server 10.0.1.12:3000 weight=1;
+    server 10.0.1.13:3000 backup;          # used only if the others are down
+    keepalive 64;
+}
+server {
+    listen 80;
+    location / {
+        proxy_pass http://app_pool;
+        proxy_next_upstream error timeout http_502 http_503;   # retry another node
+        proxy_next_upstream_tries 2;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+    }
+}</code></pre>
+<p>Open-source nginx has only passive health checks (active probes need nginx Plus). Be careful with <code>proxy_next_upstream</code> and non-idempotent requests: nginx does not retry POST by default after the request was sent unless you add <code>non_idempotent</code>.</p>
+
+<h2>HAProxy example</h2>
+<p>HAProxy is a dedicated, extremely efficient LB with rich active health checks and stats.</p>
+<pre><code># /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
+    maxconn 20000
+
+defaults
+    mode http
+    log global
+    option httplog
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+
+frontend https_in
+    bind :80
+    bind :443 ssl crt /etc/haproxy/certs/example.pem alpn h2,http/1.1
+    http-request redirect scheme https unless { ssl_fc }
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+
+    acl is_api path_beg /api
+    use_backend api_pool if is_api
+    default_backend web_pool
+
+backend web_pool
+    balance roundrobin
+    option httpchk GET /health
+    http-check expect status 200
+    server web1 10.0.1.11:3000 check inter 5s fall 3 rise 2
+    server web2 10.0.1.12:3000 check inter 5s fall 3 rise 2
+
+backend api_pool
+    balance leastconn
+    cookie SERVERID insert indirect nocache      # sticky sessions
+    option httpchk GET /health
+    server api1 10.0.1.21:4000 check cookie a1
+    server api2 10.0.1.22:4000 check cookie a2
+
+listen stats
+    bind 127.0.0.1:8404
+    stats enable
+    stats uri /stats</code></pre>
+<pre><code>haproxy -c -f /etc/haproxy/haproxy.cfg    # validate
+sudo systemctl reload haproxy</code></pre>
+
+<h2>Managed load balancers (AWS example)</h2>
+<table>
+<tr><th>Service</th><th>Layer</th><th>Notes</th></tr>
+<tr><td>ALB (Application LB)</td><td>L7</td><td>Host/path routing, TLS via ACM certs, WebSockets, gRPC, auth via OIDC, WAF integration, target groups (instances, IPs, Lambda, containers)</td></tr>
+<tr><td>NLB (Network LB)</td><td>L4</td><td>Static IPs, ultra-low latency, TCP/UDP/TLS</td></tr>
+<tr><td>GWLB</td><td>L3</td><td>Insert firewall appliances</td></tr>
+</table>
+<p>Key ALB concepts: <strong>listeners</strong> (port 443 with a certificate) have <strong>rules</strong> (if host is <code>api.example.com</code> or path is <code>/img/*</code>) that forward to <strong>target groups</strong>, each with a health check config. Put the ALB in at least two Availability Zones, targets in private subnets, and a security group allowing 80/443 from the internet while the targets allow traffic <em>only from the ALB's security group</em>. GCP (Cloud Load Balancing) and Azure (Application Gateway / Front Door) offer equivalents; Kubernetes Ingress and Service type LoadBalancer provision them for you.</p>
+
+<h2>Is the load balancer itself a single point of failure?</h2>
+<p>Yes, if you run one. Solutions: managed LBs are redundant across zones by design; self-hosted ones use two nodes with a floating IP (keepalived/VRRP), or DNS with multiple A records, or anycast. This is why teams usually pay for the managed one.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Real client IP lost</strong>: backends see the LB's IP. Use <code>X-Forwarded-For</code> (L7) or the PROXY protocol (L4).</li>
+<li><strong>Idle timeout mismatches</strong>: app keep-alive shorter than LB idle timeout causes sporadic 502/504.</li>
+<li><strong>Uneven deploys</strong>: new version unhealthy but health check too shallow: LB sends traffic to broken nodes.</li>
+<li><strong>Thundering herd after restart</strong>: all nodes start cold and are marked healthy before caches/JIT are warm. Use slow-start (ALB slow start mode, HAProxy <code>slowstart</code>).</li>
+<li><strong>Retry storms</strong>: aggressive retries on a struggling backend amplify the overload.</li>
+<li><strong>Stateful in-memory data</strong> (uploads on local disk, in-memory sessions or caches) breaks the moment there are two servers.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Start three tiny backends that print their port: <code>for p in 3001 3002 3003; do (python3 -m http.server $p --bind 127.0.0.1 &amp;); done</code> (or three Node processes returning their PID).</li>
+<li>Configure the nginx upstream above with those ports. Request repeatedly: <code>for i in $(seq 6); do curl -s localhost/ | head -1; done</code> and watch the distribution; try <code>weight</code> and <code>least_conn</code>.</li>
+<li>Kill one backend. Observe failed requests (and then none, once nginx has marked it down or retried with <code>proxy_next_upstream</code>).</li>
+<li>Install HAProxy, use the config above with <code>check</code>, open the stats page and watch a backend flip to DOWN when stopped.</li>
+<li>Write down: which of your app's state lives in memory or on local disk and would break behind a load balancer?</li>
+</ol></div>

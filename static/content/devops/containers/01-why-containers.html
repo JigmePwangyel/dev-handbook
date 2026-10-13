@@ -1,0 +1,121 @@
+<h1>Why Containers?</h1>
+<p class="lead">Containers exist to solve one stubborn problem: software that behaves differently depending on where it runs. A container packages your application together with everything it needs, then runs it as an isolated process on a shared kernel. It is not magic and it is not a tiny virtual machine, and once you see what it really is, most of Docker stops being mysterious.</p>
+
+<h2>The problem: "works on my machine"</h2>
+<p>Imagine a Node.js API. On your laptop it runs on Node 22, macOS, with a globally installed <code>libvips</code>, an <code>.env</code> file you forgot to commit, and PostgreSQL 16. The production server runs Ubuntu 22.04, Node 18 installed years ago, no <code>libvips</code>, and a different locale. The code is identical, yet:</p>
+<ul>
+<li>A native dependency fails to compile because the system library is missing or a different version.</li>
+<li>A date-formatting bug appears because of a different timezone or ICU version.</li>
+<li>Two apps on the same server need Python 3.9 and Python 3.12 and fight over the system interpreter.</li>
+<li>A new teammate spends two days following an outdated "setup" wiki page.</li>
+<li>Staging passes and production fails, and nobody can say what differs between them.</li>
+</ul>
+<p>Without containers the usual workarounds are long README setup guides, configuration-management scripts that try to converge a server into a known state, or per-language version managers (nvm, pyenv, rbenv, virtualenv). Each solves one slice. None of them ships the <em>whole</em> environment (OS libraries, runtime, app, config defaults) as one artifact.</p>
+
+<div class="callout key"><strong>The container idea</strong><p>Build the environment once, as an immutable <em>image</em>. Run that exact image on your laptop, in CI, in staging and in production. If it works in one place, it works in all of them, because the filesystem the process sees is byte-for-byte the same.</p></div>
+
+<h2>Virtual machines vs. containers</h2>
+<p>Before containers, the standard answer to isolation was the virtual machine. A hypervisor (KVM, VMware, Hyper-V, Xen) emulates hardware, and each VM boots a full guest operating system with its own kernel.</p>
+<pre class="diagram">
+   Virtual machines                         Containers
+ ┌────────┐ ┌────────┐ ┌────────┐     ┌────────┐ ┌────────┐ ┌────────┐
+ │  App A │ │  App B │ │  App C │     │  App A │ │  App B │ │  App C │
+ │  Libs  │ │  Libs  │ │  Libs  │     │  Libs  │ │  Libs  │ │  Libs  │
+ │Guest OS│ │Guest OS│ │Guest OS│     └───┬────┘ └───┬────┘ └───┬────┘
+ │(kernel)│ │(kernel)│ │(kernel)│     ┌───┴──────────┴──────────┴────┐
+ └───┬────┘ └───┬────┘ └───┬────┘     │  Container runtime (Docker)  │
+ ┌───┴──────────┴──────────┴────┐     ├──────────────────────────────┤
+ │          Hypervisor          │     │   Host OS (ONE shared kernel)│
+ ├──────────────────────────────┤     ├──────────────────────────────┤
+ │      Host OS / Hardware      │     │           Hardware           │
+ └──────────────────────────────┘     └──────────────────────────────┘
+</pre>
+<table>
+<tr><th></th><th>Virtual machine</th><th>Container</th></tr>
+<tr><td>Isolation boundary</td><td>Hardware-level (hypervisor)</td><td>Kernel-level (namespaces, cgroups)</td></tr>
+<tr><td>Kernel</td><td>Own kernel per VM</td><td>Shares the host kernel</td></tr>
+<tr><td>Typical size</td><td>Gigabytes</td><td>Megabytes to a few hundred MB</td></tr>
+<tr><td>Startup</td><td>Tens of seconds to minutes</td><td>Milliseconds to seconds</td></tr>
+<tr><td>Overhead</td><td>Memory for a whole OS each</td><td>Near zero; it is just a process</td></tr>
+<tr><td>Density</td><td>Tens per host</td><td>Hundreds to thousands per host</td></tr>
+<tr><td>Security isolation</td><td>Stronger (smaller attack surface)</td><td>Weaker (kernel bugs affect all)</td></tr>
+<tr><td>Different OS kernel</td><td>Yes (Windows VM on Linux host)</td><td>No, must match host kernel type</td></tr>
+</table>
+<p>The trade-off is real: containers give up some isolation strength in exchange for speed and density. This is why multi-tenant clouds that run untrusted code (AWS Lambda, Fargate) wrap containers in micro-VMs such as Firecracker. For your own trusted services, plain containers are the norm. Containers and VMs also combine: most production containers run <em>inside</em> VMs (EC2 instances, GCE nodes).</p>
+
+<h2>What a container really is</h2>
+<p>There is no "container" object in the Linux kernel. A container is an ordinary Linux process (plus its children) that the kernel has been told to lie to and to limit. Three kernel features do nearly all the work.</p>
+
+<h3>1. Namespaces: what a process can see</h3>
+<p>A namespace gives a process its own private view of one kind of system resource.</p>
+<table>
+<tr><th>Namespace</th><th>Isolates</th><th>Effect inside the container</th></tr>
+<tr><td><code>pid</code></td><td>Process IDs</td><td>Your app is PID 1; it cannot see host processes</td></tr>
+<tr><td><code>net</code></td><td>Network stack</td><td>Own interfaces, IP, routing table, ports</td></tr>
+<tr><td><code>mnt</code></td><td>Mount points</td><td>Own root filesystem (<code>/</code>)</td></tr>
+<tr><td><code>uts</code></td><td>Hostname</td><td>Own hostname</td></tr>
+<tr><td><code>ipc</code></td><td>Shared memory, semaphores</td><td>Private IPC</td></tr>
+<tr><td><code>user</code></td><td>UID/GID mapping</td><td>Root inside can map to unprivileged outside</td></tr>
+<tr><td><code>cgroup</code></td><td>cgroup view</td><td>Own view of resource hierarchy</td></tr>
+</table>
+
+<h3>2. cgroups: how much a process can use</h3>
+<p>Control groups limit and account for CPU, memory, I/O and process counts. When you run <code>docker run --memory=256m --cpus=0.5</code>, Docker simply writes those numbers into a cgroup. If the process exceeds the memory limit, the kernel's OOM killer terminates it (you will meet this as exit code 137).</p>
+
+<h3>3. Union filesystems: what files it has</h3>
+<p>An image is a stack of read-only filesystem layers. At run time the container runtime merges them with a union/overlay filesystem (<code>overlay2</code> on modern Linux) and adds a thin writable layer on top. Many containers can share the same underlying read-only layers, which is why starting a container is nearly instant and storage is cheap. Layers are covered in depth in the images lesson.</p>
+
+<h3>Seeing it with your own eyes</h3>
+<p>You can build a crude container by hand on any Linux box, with no Docker at all:</p>
+<pre><code># Run bash in new PID, mount and UTS namespaces (needs root)
+sudo unshare --pid --fork --mount-proc --uts bash
+
+# Inside the new shell:
+hostname demo          # changes hostname only inside this namespace
+ps aux                 # shows only a couple of processes, bash is PID 1
+exit</code></pre>
+<p>Now with Docker, see the same truth from the host side:</p>
+<pre><code>docker run -d --name web nginx:1.27
+docker top web                 # the processes, as seen from the host
+ps aux | grep "nginx: master"  # the SAME process is visible on the host, with a normal PID
+docker exec web ps aux         # inside the container the master is PID 1</code></pre>
+<p>The same process has two PIDs depending on which namespace you ask. That is the whole trick.</p>
+
+<div class="callout info"><strong>Docker Desktop on Mac and Windows</strong><p>The Linux kernel features above do not exist on macOS or Windows. Docker Desktop transparently runs a small Linux VM (using Apple Virtualization framework or WSL 2) and runs your containers inside it. So "containers share the host kernel" really means "share the Linux VM's kernel" on those platforms.</p></div>
+
+<h2>What you get from containers</h2>
+<ul>
+<li><strong>Reproducibility.</strong> The image is immutable. Same bytes, same behavior.</li>
+<li><strong>Isolation of dependencies.</strong> Two apps with conflicting library versions coexist peacefully.</li>
+<li><strong>Fast onboarding.</strong> <code>docker compose up</code> replaces a 30-step setup document.</li>
+<li><strong>Efficient resource use.</strong> Many more workloads per server than with VMs.</li>
+<li><strong>A universal deployment unit.</strong> Kubernetes, ECS, Cloud Run, Fly.io and Nomad all consume the same OCI image format.</li>
+<li><strong>Easy rollback.</strong> Deploying a version means running image tag X; rolling back means running tag X-1.</li>
+</ul>
+
+<h2>What containers do NOT give you</h2>
+<ul>
+<li><strong>Not a security sandbox by default.</strong> A root process in a default container is far more powerful than people assume. See the security lesson.</li>
+<li><strong>Not persistence.</strong> The writable layer disappears with the container. Data needs volumes.</li>
+<li><strong>Not orchestration.</strong> Docker alone does not restart across machines, scale or load balance. That is Kubernetes' job.</li>
+<li><strong>Not a fix for bad architecture.</strong> A tangled app in a container is a tangled app in a container.</li>
+<li><strong>Not portable across CPU architectures.</strong> An <code>arm64</code> image will not run natively on <code>amd64</code>; see multi-arch builds.</li>
+</ul>
+
+<div class="callout warn"><strong>Common misconception</strong><p>"Containers are lightweight VMs." Thinking this way leads to SSH-ing into containers, running several services in one, and treating them as pets. Treat a container as a <em>single process with a packaged filesystem</em>: disposable, replaceable, one concern each.</p></div>
+
+<h2>A quick mental model</h2>
+<ul>
+<li><strong>Image</strong>: the recipe-plus-ingredients, a read-only template (like a class).</li>
+<li><strong>Container</strong>: a running (or stopped) instance of an image (like an object).</li>
+<li><strong>Registry</strong>: a server where images are stored and shared (like a package repository).</li>
+<li><strong>Dockerfile</strong>: the text recipe for building an image.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Install Docker (next lesson) and run <code>docker run --rm alpine cat /etc/os-release</code>. Compare with your host OS. Why does it say Alpine?</li>
+<li>Run <code>docker run --rm alpine uname -r</code> and <code>uname -r</code> on your host (on Linux). Are the kernel versions identical? Why?</li>
+<li>Run <code>docker run -d --name sleeper alpine sleep 600</code>, then find its PID on the host with <code>docker inspect -f '{{.State.Pid}}' sleeper</code>. On Linux, inspect <code>/proc/&lt;pid&gt;/ns/</code> to see its namespaces.</li>
+<li>Run <code>docker run --rm --memory=10m alpine sh -c 'head -c 50m /dev/zero | tail'</code> and observe it get killed. You just met cgroups.</li>
+</ol></div>

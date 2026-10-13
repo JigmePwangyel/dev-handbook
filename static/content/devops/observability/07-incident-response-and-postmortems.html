@@ -1,0 +1,165 @@
+<h1>Incident Response and Postmortems</h1>
+<p class="lead">Outages are inevitable. What distinguishes mature teams is not that they never have incidents, but that they respond in a calm, coordinated way, restore service fast, and learn so the same failure does not recur. This lesson is the playbook.</p>
+
+<h2>Why a process matters</h2>
+<p>Without one, an incident looks like this: twelve people in a chat, three of them debugging the same thing, nobody telling customers anything, someone deploying an untested fix, no record of what was tried. Stress makes smart people chaotic. A lightweight, practised structure replaces improvisation with roles and habits.</p>
+
+<h2>The lifecycle</h2>
+<pre class="diagram">
+ Detect ─▶ Triage ─▶ Mobilise ─▶ Mitigate ─▶ Resolve ─▶ Postmortem ─▶ Improve
+ (alert)   (severity)  (roles)    (stop the    (root       (blameless,   (action items
+                                   bleeding)   cause fix)   written)      tracked)
+        ◀──────── communicate throughout: internal + external ────────▶
+</pre>
+<p>The priority order is always: <strong>mitigate first, diagnose second</strong>. Rolling back a deploy, failing over, disabling a feature flag or adding capacity restores users even if you do not yet understand why. Root-cause investigation can continue after customers are safe.</p>
+
+<h2>Severity levels</h2>
+<p>Agree on definitions in advance so people do not argue at 3 a.m. Example:</p>
+<table>
+<tr><th>Sev</th><th>Definition</th><th>Response</th></tr>
+<tr><td><strong>SEV1</strong></td><td>Critical: major outage or data loss/security breach; most users affected; revenue stopped</td><td>Page everyone needed now, all hands, exec notified, status page update within 15 min, updates every 30 min</td></tr>
+<tr><td><strong>SEV2</strong></td><td>Major feature degraded or significant subset of users affected</td><td>Page on-call, incident commander assigned, status page, updates every 60 min</td></tr>
+<tr><td><strong>SEV3</strong></td><td>Minor impact, workaround exists</td><td>Handle in business hours; ticket</td></tr>
+<tr><td><strong>SEV4</strong></td><td>Cosmetic or no user impact</td><td>Backlog</td></tr>
+</table>
+<p>When in doubt, <strong>declare higher</strong>; downgrading is free, upgrading late is costly. Declaring an incident should be easy and never a source of blame: a Slack command like <code>/incident declare</code> that spins up a channel, a doc and a call.</p>
+
+<h2>Roles</h2>
+<table>
+<tr><th>Role</th><th>Responsibility</th></tr>
+<tr><td><strong>Incident Commander (IC)</strong></td><td>Runs the response; makes decisions; delegates; does <em>not</em> debug. Keeps the big picture, prevents chaos, decides when to escalate or roll back.</td></tr>
+<tr><td><strong>Operations / technical lead</strong></td><td>Hands on keyboard: investigates and applies mitigation, may lead sub-teams.</td></tr>
+<tr><td><strong>Communications lead</strong></td><td>Updates the status page, support teams, executives and affected customers on a fixed cadence.</td></tr>
+<tr><td><strong>Scribe</strong></td><td>Keeps a timestamped log of events, hypotheses and actions. This becomes the postmortem timeline.</td></tr>
+<tr><td><strong>Subject-matter experts</strong></td><td>Pulled in on request (database, networking, vendor contact).</td></tr>
+</table>
+<p>In small teams one person may wear two hats, but the IC and the main debugger should be different people. Anyone can call for an IC. Rotate the IC role, and train people through drills and shadowing.</p>
+
+<h2>During the incident: a checklist</h2>
+<ol>
+<li><strong>Acknowledge</strong> the page. Verify the impact (dashboards, a quick manual test).</li>
+<li><strong>Declare</strong> the incident and severity; open a dedicated channel (<code>#inc-2026-10-05-checkout</code>) and call.</li>
+<li><strong>Assign roles</strong>: "I am IC; Priya is ops lead; Sam is comms and scribe."</li>
+<li><strong>Ask "what changed?"</strong> Deploys, config changes, feature flags, infra changes, traffic spikes, third-party status pages. Most incidents follow a change.</li>
+<li><strong>Mitigate</strong>: rollback, flag off, failover, scale up, shed load, block bad traffic.</li>
+<li><strong>Communicate</strong> on schedule even if there is nothing new ("still investigating, next update in 30 minutes").</li>
+<li><strong>Verify recovery</strong> via SLI/metrics, not just "the error stopped".</li>
+<li><strong>Stand down</strong>, declare resolved, and schedule the postmortem.</li>
+</ol>
+<div class="callout tip"><strong>IC phrases that keep order</strong><p>"Status check: ops lead, what do we know and what are you trying?" / "Proposed action: roll back release 1.8.3. Any objections? None. Do it." / "Let's park the root-cause theory; mitigation first." / "I'm handing IC to Dana; Dana, do you accept?" (hand off after 2-4 hours; fatigue causes mistakes).</p></div>
+
+<h2>Communication</h2>
+<ul>
+<li><strong>Internal</strong>: a single channel and one source of truth. Post facts, hypotheses and actions with timestamps. Keep side conversations out of it.</li>
+<li><strong>External</strong>: use a status page (Statuspage, Instatus, Better Stack). Be prompt, honest and specific about impact; avoid speculating on root cause.</li>
+<li><strong>Template cadence</strong>: Investigating &rarr; Identified &rarr; Monitoring &rarr; Resolved.</li>
+</ul>
+<pre><code>[Investigating] 14:07 UTC
+Some customers are unable to complete checkout. We are investigating.
+Next update by 14:37 UTC.
+
+[Identified] 14:25 UTC
+We identified the cause as a faulty release and are rolling it back.
+
+[Resolved] 14:48 UTC
+Checkout is working normally. The issue lasted from 13:58 to 14:41 UTC.
+A full report will follow.</code></pre>
+<p>If personal data or security is involved, loop in legal/security immediately; there may be notification deadlines (e.g. 72 hours under GDPR).</p>
+
+<h2>Blameless postmortems</h2>
+<p>After the incident, write up what happened. The goal is learning, not punishment. Complex systems fail because of many contributing factors; "human error" is a symptom, not a cause. If an engineer could make that mistake, the system (tooling, process, guardrails, documentation) allowed it. Punishing people drives problems underground and ensures nobody reports near misses.</p>
+<div class="callout key"><strong>Blameless does not mean consequence-free for the system</strong><p>It means we ask <em>"how did our system make this easy to do and hard to catch?"</em> rather than <em>"who messed up?"</em>. Name actions and decisions neutrally ("the deploy changed X"), explain the reasoning that made sense at the time, and focus on fixes. Accountability is for completing action items.</p></div>
+<p>Hold the review within a few business days, while memories are fresh. Publish the result widely; shared learning is the point. Do it for any SEV1/2, any budget-burning incident, and interesting near misses.</p>
+
+<h3>Postmortem template</h3>
+<pre><code># Postmortem: Checkout outage on 2026-10-05
+
+**Status:** Final | **Severity:** SEV2 | **Authors:** Priya, Sam
+**Incident Commander:** Dana | **Duration:** 43 min (13:58 - 14:41 UTC)
+
+## Summary
+One-paragraph plain-language description: what broke, who was affected, how long.
+
+## Impact
+- ~18% of checkout attempts failed for 43 minutes (~3,100 failed orders)
+- Estimated revenue impact: $X; 212 support tickets; 51% of error budget consumed
+
+## Timeline (UTC)
+13:52  Release 1.8.3 deployed to 100% of pods
+13:58  Error ratio crosses 2%; HighErrorRatio alert fires
+14:01  On-call acknowledges; IC declared; #inc channel opened
+14:12  Hypothesis: DB connection exhaustion; confirmed by pool metrics
+14:25  Decision to roll back
+14:41  Rollback complete; error ratio normal
+14:48  Incident resolved
+
+## Root cause and contributing factors
+- Trigger: 1.8.3 introduced a query per cart item (N+1) that exhausted the DB pool
+- Contributing: no load test in CI; canary stage skipped for "small change";
+  pool exhaustion not alerted; runbook for DB saturation outdated
+
+## What went well
+- Alert fired within 6 minutes; rollback is one command and worked
+
+## What went poorly / where we got lucky
+- 24 minutes to link the symptom to the release; deploy markers missing on dashboards
+- Lucky: it happened at low-traffic hour
+
+## Detection and response metrics
+Time to detect: 6 min | Time to mitigate: 43 min | Time to resolve: 50 min
+
+## Action items
+| Action | Type | Owner | Due | Ticket |
+| Add DB pool saturation alert | detect | Sam | 10-12 | OPS-311 |
+| Make canary stage mandatory in pipeline | prevent | Priya | 10-19 | OPS-312 |
+| Add deploy annotations to Grafana | detect | Lee | 10-12 | OPS-313 |
+| Add N+1 query check to test suite | prevent | Dana | 10-26 | OPS-314 |
+
+## Lessons learned / appendix
+Graphs, logs, links to chat history, related incidents.</code></pre>
+
+<h3>Doing "root cause" well</h3>
+<ul>
+<li>Use <strong>"5 whys"</strong> or a causal tree but expect several contributing causes rather than a single root.</li>
+<li>Ask about the <strong>detection</strong>, <strong>response</strong> and <strong>prevention</strong> layers separately.</li>
+<li>Distinguish <em>triggers</em> (the change) from <em>latent conditions</em> (why the system could not tolerate it).</li>
+<li>Good action items are <strong>specific, owned, dated, and tracked to completion</strong>. "Be more careful" is not an action item; "make canary mandatory" is.</li>
+<li>Prioritise: a postmortem with 30 unscheduled items accomplishes nothing. Pick the few highest leverage.</li>
+</ul>
+
+<h2>Metrics to track</h2>
+<table>
+<tr><th>Metric</th><th>Meaning</th></tr>
+<tr><td>MTTD</td><td>Mean time to detect</td></tr>
+<tr><td>MTTA</td><td>Mean time to acknowledge</td></tr>
+<tr><td>MTTR</td><td>Mean time to recover/resolve (be careful: skewed by outliers; look at distributions)</td></tr>
+<tr><td>Incident count by severity and cause</td><td>Trends and recurring themes</td></tr>
+<tr><td>Action-item completion rate</td><td>Whether learning is real</td></tr>
+</table>
+
+<h2>Preparing</h2>
+<ul>
+<li><strong>Practise</strong>: tabletop exercises and "game days" (see the resilience lesson).</li>
+<li><strong>Keep tooling ready</strong>: access for on-call people, break-glass credentials, a tested rollback path, up-to-date runbooks, a contacts list for vendors.</li>
+<li><strong>Train new on-callers</strong>: shadow, then reverse-shadow before going solo.</li>
+<li><strong>Out-of-band comms</strong>: if Slack is down you need a fallback (phone bridge, another tool).</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>The IC diving into debugging and losing control of the response.</li>
+<li>Hero culture: one person fixing everything silently at 4 a.m., with no record or sharing.</li>
+<li>Skipping communication while "busy fixing".</li>
+<li>Rushing a risky fix instead of a safe rollback.</li>
+<li>Postmortems that blame individuals, or are never written for "small" incidents.</li>
+<li>Action items that die in the backlog. Review them in a regular meeting.</li>
+<li>Declaring victory too early; verify recovery and watch for recurrence.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write your team's severity definitions on one page and agree on them.</li>
+<li>Run a 30-minute tabletop: "the primary database is unreachable at 2 a.m." Assign IC, ops, comms, scribe and walk through who does what.</li>
+<li>Write a blameless postmortem for the last real incident you remember, using the template. Count how many action items fall into detect, mitigate and prevent.</li>
+<li>Set up a status page (even a free tier) and draft the three update templates above.</li>
+</ol></div>

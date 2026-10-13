@@ -1,0 +1,135 @@
+<h1>Compute Options: VMs, Containers, Kubernetes, Serverless</h1>
+<p class="lead">"Where does my code run?" has five serious answers in the cloud. Each trades control for convenience. Choosing well is mostly about your team's size, your traffic shape, and how much operations work you are willing to own.</p>
+
+<h2>The spectrum</h2>
+<pre class="diagram">
+ More control, more ops work                              Less control, less ops work
+ ◀────────────────────────────────────────────────────────────────────────────────▶
+  VMs (EC2)     Kubernetes     ECS on EC2    Fargate / Cloud Run    Lambda / Functions
+  you patch     you run apps   you run       you run containers,    you run functions,
+  the OS        + cluster ops  containers    nothing below          nothing else
+</pre>
+
+<h2>1. Virtual machines (EC2, Compute Engine, Azure VM)</h2>
+<p>You get a full OS. You install the runtime, deploy the app (often via systemd or Docker), patch the OS, configure autoscaling and load balancing.</p>
+<ul>
+<li><strong>Good for:</strong> legacy apps, special OS/kernel/GPU needs, licensed software, long-running stateful servers, maximum control, predictable steady load (cheapest per unit with reservations).</li>
+<li><strong>Costs:</strong> patching, hardening, AMI management, capacity planning, configuration drift.</li>
+<li><strong>Tip:</strong> bake images (Packer) or use user-data/Ansible so VMs are disposable; never hand-edit.</li>
+</ul>
+
+<h2>2. Containers on managed orchestrators (ECS / Fargate)</h2>
+<p>You package the app as a Docker image and tell the platform "run 3 copies, behind this load balancer". <strong>ECS</strong> schedules containers; with <strong>Fargate</strong> there are no servers to manage: you specify CPU and memory per task and pay for what runs.</p>
+<pre><code># Minimal ECS task definition fragment (Fargate)
+{
+  "family": "web",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+  "taskRoleArn":      "arn:aws:iam::123456789012:role/web-task-role",
+  "containerDefinitions": [{
+    "name": "web",
+    "image": "123456789012.dkr.ecr.eu-west-1.amazonaws.com/web:1.4.2",
+    "portMappings": [{ "containerPort": 8080 }],
+    "healthCheck": { "command": ["CMD-SHELL", "curl -f http://localhost:8080/healthz || exit 1"] }
+  }]
+}</code></pre>
+<ul>
+<li><strong>Good for:</strong> most web services and APIs, background workers; teams that want containers without Kubernetes complexity.</li>
+<li><strong>Trade-offs:</strong> AWS-specific; Fargate costs ~20-40% more per vCPU than equivalent EC2 but saves a lot of ops time; limited customisation (no privileged containers, no DaemonSets).</li>
+</ul>
+
+<h2>3. Kubernetes (EKS, GKE, AKS)</h2>
+<p>A portable, extensible orchestrator with a huge ecosystem (Helm, operators, service meshes, GitOps). The cloud runs the control plane; you still run nodes, upgrades (every ~4 months a new minor version), networking add-ons, ingress, observability and security policy.</p>
+<ul>
+<li><strong>Good for:</strong> many services and teams, platform engineering, multi-cloud/portability needs, complex scheduling (GPU, batch), rich ecosystem tooling.</li>
+<li><strong>Costs:</strong> a real learning curve and an ongoing operations burden. EKS control plane is ~$73/month before any nodes. You likely need a platform team.</li>
+<li><strong>Middle path:</strong> GKE Autopilot and EKS Auto Mode manage nodes for you.</li>
+</ul>
+
+<h2>4. Serverless containers (Cloud Run, Azure Container Apps, App Runner)</h2>
+<p>Deploy an image; the platform handles HTTPS, autoscaling (including to zero) and billing per request/CPU-second. Cloud Run in particular is a great default: any container, any language, scale to zero, up to hundreds of instances.</p>
+<pre><code>gcloud run deploy web \
+  --image europe-docker.pkg.dev/my-proj/apps/web:1.4.2 \
+  --region europe-west1 \
+  --allow-unauthenticated \
+  --min-instances 0 --max-instances 20 \
+  --concurrency 80</code></pre>
+<ul>
+<li><strong>Good for:</strong> HTTP services with variable traffic, internal tools, APIs, small teams.</li>
+<li><strong>Trade-offs:</strong> cold starts when scaled to zero; request time limits; harder for long-lived connections or heavy background processing (though workers/jobs variants exist).</li>
+</ul>
+
+<h2>5. Functions (Lambda, Cloud Functions, Azure Functions)</h2>
+<p>Write a handler; the platform runs it per event. Billing is per invocation and per ms of runtime. Scales from zero to thousands of concurrent executions automatically.</p>
+<pre><code>// Node.js Lambda behind an HTTP API
+export const handler = async (event) =&gt; {
+  const name = event.queryStringParameters?.name ?? "world";
+  return {
+    statusCode: 200,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ message: `Hello, ${name}` }),
+  };
+};</code></pre>
+<ul>
+<li><strong>Good for:</strong> event-driven glue (S3 upload triggers, queue consumers, webhooks, scheduled jobs), spiky or low traffic APIs, prototypes.</li>
+<li><strong>Trade-offs:</strong>
+ <ul>
+ <li><strong>Cold starts</strong>: 100 ms to a few seconds when a new environment spins up (mitigate with provisioned concurrency, small packages, SnapStart for Java).</li>
+ <li><strong>Limits</strong>: 15 min max runtime, memory up to 10 GB, payload size caps.</li>
+ <li><strong>Cost inversion</strong>: at high, steady traffic, containers are cheaper.</li>
+ <li><strong>Harder local dev, debugging and observability</strong>; distributed by default; connection pooling issues with databases (use RDS Proxy).</li>
+ <li><strong>Vendor lock-in</strong> to event formats and triggers.</li>
+ </ul>
+</li>
+</ul>
+
+<h2>Decision table</h2>
+<table>
+<tr><th>Situation</th><th>Start with</th><th>Why</th></tr>
+<tr><td>Small team, one or few web services</td><td>Cloud Run / Fargate / PaaS</td><td>Minimal ops, container portability</td></tr>
+<tr><td>Spiky/event-driven glue</td><td>Lambda / Functions</td><td>Zero idle cost, event integrations</td></tr>
+<tr><td>Dozens of services, several teams</td><td>Kubernetes</td><td>Standard platform, ecosystem, portability</td></tr>
+<tr><td>Legacy app needing a full OS</td><td>VMs (+ Packer/Ansible)</td><td>Compatibility, control</td></tr>
+<tr><td>Steady high load, cost-critical</td><td>VMs/containers on EC2 with reservations</td><td>Lowest unit cost</td></tr>
+<tr><td>Batch / ML / GPU</td><td>EC2 spot, AWS Batch, K8s jobs</td><td>Cheap interruptible capacity</td></tr>
+<tr><td>Long-running connections (WebSockets)</td><td>Containers or VMs</td><td>Functions are request/response oriented</td></tr>
+<tr><td>Static front end</td><td>S3+CloudFront / Vercel / Netlify</td><td>No compute needed at all</td></tr>
+</table>
+
+<h2>Comparing the dimensions</h2>
+<table>
+<tr><th></th><th>VM</th><th>ECS/Fargate</th><th>Kubernetes</th><th>Cloud Run</th><th>Lambda</th></tr>
+<tr><td>Ops burden</td><td>High</td><td>Low-Med</td><td>High</td><td>Low</td><td>Lowest</td></tr>
+<tr><td>Scale to zero</td><td>No</td><td>No (tasks)</td><td>Not by default</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Startup time</td><td>Minutes</td><td>~30-60 s</td><td>Seconds (pods)</td><td>Seconds</td><td>ms to s</td></tr>
+<tr><td>Portability</td><td>High</td><td>Low</td><td>Highest</td><td>High (image)</td><td>Low</td></tr>
+<tr><td>Cost at steady load</td><td>Lowest</td><td>Medium</td><td>Low-Med</td><td>Medium</td><td>Highest</td></tr>
+</table>
+
+<div class="callout tip"><strong>A safe default path</strong><p>Containerise your app first (it keeps every option open). Start on the simplest managed container platform. Move to Kubernetes only when you feel concrete pain: dozens of services, need for custom scheduling or a shared platform. Add Lambda where events make it natural.</p></div>
+
+<h2>Cross-cutting concerns</h2>
+<ul>
+<li><strong>Statelessness</strong>: all options scale best if instances hold no local state. Keep sessions in Redis/DB, files in S3.</li>
+<li><strong>Configuration</strong>: env vars + Secrets Manager; never bake secrets into images.</li>
+<li><strong>Right-sizing</strong>: measure CPU/memory and shrink. Most instances are over-provisioned by 2-3x.</li>
+<li><strong>Architecture</strong>: ARM (Graviton, Axion, Ampere) is usually ~20% cheaper; build multi-arch images.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Choosing Kubernetes for a 3-person team with one service ("résumé-driven architecture").</li>
+<li>Using Lambda for a steady 500 requests/sec API and being surprised by the bill.</li>
+<li>Ignoring cold starts in latency-sensitive paths.</li>
+<li>Running one big pet VM with no autoscaling and no image-based rebuild path.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Containerise a small HTTP app and deploy the same image to Cloud Run (or App Runner/Fargate). Measure the cold-start latency by requesting after 15 idle minutes.</li>
+<li>Write a Lambda that resizes an image when uploaded to S3. Check the invocation count and billed duration in CloudWatch.</li>
+<li>For a workload of 100 requests/second, 200 ms average, estimate monthly cost on Lambda versus two t3.small instances using the pricing calculator. Where is the crossover?</li>
+</ol></div>

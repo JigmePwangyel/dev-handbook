@@ -1,0 +1,144 @@
+<h1>Terraform in CI/CD</h1>
+<p class="lead">Running <code>terraform apply</code> from a laptop works until two people do it at once, someone applies uncommitted code, or the person with production credentials is on holiday. Moving Terraform into a pipeline makes infrastructure changes reviewed, auditable and consistent, using the same pull-request workflow as application code.</p>
+
+<h2>The standard workflow</h2>
+<pre class="diagram">
+ feature branch ──▶ Pull Request ──▶ CI: fmt, validate, lint, security scan, terraform plan
+                                         │  plan output posted as a PR comment
+                                         ▼
+                                  human review (code + plan) ──▶ approve
+                                         │
+                                  merge to main
+                                         ▼
+                             CI: terraform apply (saved plan)  ──▶ cloud
+                                         │
+                                  post-apply: outputs, notifications
+</pre>
+<p>The key rule: <strong>the plan a reviewer approved is the plan that gets applied</strong>. Infrastructure changes are not "done" until merged, and nobody needs production credentials on their laptop.</p>
+
+<h2>Example: GitHub Actions</h2>
+<pre><code>name: terraform
+on:
+  pull_request:
+    paths: ["infra/**"]
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+
+permissions:
+  id-token: write        # OIDC to the cloud, no long-lived keys
+  contents: read
+  pull-requests: write   # to comment the plan
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_environment: prod
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: infra/live/prod/app } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-terraform-plan   # read-only role
+          aws-region: eu-west-1
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.5 }
+      - run: terraform fmt -check -recursive
+      - run: terraform init -input=false
+      - run: terraform validate
+      - run: terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+      - uses: actions/github-script@v7        # comment the plan on the PR
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('infra/live/prod/app/plan.txt','utf8').slice(0, 60000);
+            github.rest.issues.createComment({
+              ...context.repo, issue_number: context.issue.number,
+              body: "```\n" + plan + "\n```"
+            });
+
+  apply:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production        # protected environment: requires manual approval
+    defaults: { run: { working-directory: infra/live/prod/app } }
+    concurrency: tf-prod-app       # never two applies at once
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/gha-terraform-apply   # write role
+          aws-region: eu-west-1
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init -input=false
+      - run: terraform apply -input=false -auto-approve</code></pre>
+<p>Notes: the simple form above re-plans on merge; for strict "apply what was reviewed" upload the <code>tfplan</code> artifact from the PR run and apply that, or use a purpose-built tool.</p>
+
+<h3>Credentials: use OIDC, not stored keys</h3>
+<p>CI platforms (GitHub, GitLab) can issue short-lived signed tokens that your cloud trusts to assume a role. No access keys sit in repo secrets to leak. Use a read-only role for PR plans and a separate write role that only the protected main branch can assume.</p>
+
+<h2>Purpose-built automation</h2>
+<table>
+<tr><th>Tool</th><th>Notes</th></tr>
+<tr><td>HCP Terraform (Terraform Cloud)</td><td>Hosted runs, state, policy, VCS integration; usage-based pricing</td></tr>
+<tr><td>Atlantis (open source)</td><td>Self-hosted; comment <code>atlantis plan</code> / <code>atlantis apply</code> on the PR; locks per directory</td></tr>
+<tr><td>Spacelift, env0, Scalr</td><td>Commercial platforms with policy, drift detection, stacks</td></tr>
+<tr><td>Terragrunt + plain CI</td><td>DRY configuration and multi-folder orchestration</td></tr>
+</table>
+
+<h2>Policy as code</h2>
+<p>Reviewers miss things. Encode rules and enforce them automatically against the plan:</p>
+<ul>
+<li>No S3 buckets or security groups open to the world; all disks encrypted; mandatory cost tags; only approved regions and instance sizes.</li>
+<li><strong>Static scanners</strong> on the code: Trivy (successor of tfsec), Checkov, KICS: easy to add as a CI step.</li>
+<li><strong>OPA / Conftest</strong> with Rego, evaluated on <code>terraform show -json tfplan</code>:
+<pre><code>package terraform
+
+deny[msg] {
+  r := input.resource_changes[_]
+  r.type == "aws_s3_bucket_public_access_block"
+  r.change.after.block_public_acls == false
+  msg := sprintf("%s must block public ACLs", [r.address])
+}</code></pre></li>
+<li><strong>Sentinel</strong> (HCP Terraform), and <strong>cost estimation</strong> with Infracost, which comments the monthly price delta on each PR.</li>
+<li><strong>Native testing</strong>: <code>terraform test</code> (HCL test files) and tools like Terratest for integration tests.</li>
+</ul>
+<div class="callout tip"><strong>Fail fast, cheap checks first</strong><p>Order the pipeline: fmt, validate, lint, security scan, then plan. Developers get feedback in seconds, and plans (which call the cloud API) only run on code that is already sane.</p></div>
+
+<h2>OpenTofu</h2>
+<p>In 2023 HashiCorp changed Terraform's license from MPL to the Business Source License. The community forked the last open-source version as <strong>OpenTofu</strong>, now a Linux Foundation project. It is a drop-in replacement for most users: same HCL, same providers (via its own registry), command <code>tofu</code> instead of <code>terraform</code>. It adds features such as client-side state encryption and early variable evaluation. The two diverge slowly; check compatibility for newer features. If your concern is licensing or vendor independence, OpenTofu is a sound choice; otherwise either works, and everything in these lessons applies to both.</p>
+
+<h2>Pulumi, CDK and friends</h2>
+<table>
+<tr><th>Tool</th><th>Language</th><th>Model</th><th>Notes</th></tr>
+<tr><td>Terraform / OpenTofu</td><td>HCL (declarative DSL)</td><td>Multi-cloud, huge provider ecosystem</td><td>Limited logic; readable and constrained, which many teams like</td></tr>
+<tr><td>Pulumi</td><td>TypeScript, Python, Go, C#, Java, YAML</td><td>Multi-cloud, state in Pulumi Cloud or self-managed backends</td><td>Real loops, functions, unit tests; risk of over-clever code</td></tr>
+<tr><td>AWS CDK</td><td>TypeScript, Python, etc.</td><td>Synthesises to CloudFormation</td><td>AWS-only; high-level constructs; CDK for Terraform (CDKTF) was deprecated in 2025</td></tr>
+<tr><td>CloudFormation</td><td>YAML/JSON</td><td>AWS native, state managed by AWS</td><td>No state file to manage; verbose; AWS-only</td></tr>
+<tr><td>Crossplane</td><td>Kubernetes YAML (CRDs)</td><td>Manage cloud resources from a cluster</td><td>Fits GitOps shops; operationally heavier</td></tr>
+</table>
+<p>Choosing: Terraform/OpenTofu has the largest ecosystem, hiring pool and community modules. Pick Pulumi when your team prefers general-purpose languages and testing tools. Pick CDK/CloudFormation for AWS-only shops that want AWS-managed state. The workflow described here (PR, plan, review, apply from CI) applies to all of them.</p>
+
+<h2>Pitfalls and best practices</h2>
+<ul>
+<li>Auto-applying on merge to production without a protected environment or approval for risky stacks. Keep a manual gate for destructive or sensitive layers.</li>
+<li>Plans containing secrets posted into PR comments. Mask sensitive values and be careful about public repos.</li>
+<li>Pipeline concurrency: use locking and CI concurrency groups; state locking is the last line of defence.</li>
+<li>Giving CI admin credentials. Scope roles to the stack; separate plan and apply roles.</li>
+<li>Failed applies halfway: do not panic; fix the cause and re-apply (idempotent). Do not delete state.</li>
+<li>Plan drift between PR time and merge time: apply a fresh plan, or re-plan on merge and require approval if it differs.</li>
+<li>Pin tool versions in CI to match local versions.</li>
+<li>Back-pressure for emergencies: define a documented break-glass path, and back-port manual changes into code.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a repo with a small Terraform config (even the local provider) and a workflow running fmt, validate and plan on PRs.</li>
+<li>Add <code>trivy config .</code> or Checkov as a step and make it fail on a deliberately insecure resource.</li>
+<li>Add a protected environment so the apply job waits for manual approval.</li>
+<li>Optional: run Atlantis locally with its docker image and see the PR-comment workflow.</li>
+</ol></div>

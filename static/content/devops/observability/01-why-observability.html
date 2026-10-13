@@ -1,0 +1,98 @@
+<h1>Why Observability?</h1>
+<p class="lead">Deploying is half the job. The other half is knowing, at any moment, whether your system is working for users and, when it isn't, finding out why in minutes rather than hours. Production is where software meets reality, and reality is full of surprises that no test suite predicted.</p>
+
+<h2>What breaks in production</h2>
+<p>Staging passes, CI is green, the release goes out. Then:</p>
+<ul>
+<li>A dependency (payment API, DNS, a database) gets slow and every request piles up behind it.</li>
+<li>Memory leaks that only show after 3 days of uptime.</li>
+<li>A cron job and a deploy collide; a certificate expires; a disk fills with logs.</li>
+<li>One customer's data triggers a code path nobody tested.</li>
+<li>A cloud AZ has a bad hour. A retry loop turns a small blip into a storm.</li>
+<li>Traffic is 10x because of a marketing email nobody told engineering about.</li>
+<li>The service is "up" but returning wrong answers, or fast for most users and failing for 2%.</li>
+</ul>
+<p>Without instrumentation you learn about these from customers, on social media, or the CEO. That is the worst possible monitoring system.</p>
+
+<h2>Monitoring vs observability</h2>
+<table>
+<tr><th></th><th>Monitoring</th><th>Observability</th></tr>
+<tr><td>Question answered</td><td>"Is something wrong?" (known failure modes)</td><td>"Why is it wrong?" (including unknown unknowns)</td></tr>
+<tr><td>Approach</td><td>Predefined dashboards and alerts on known metrics</td><td>Rich telemetry you can slice and query ad hoc</td></tr>
+<tr><td>Works best for</td><td>Predictable failures: disk full, CPU high</td><td>Complex distributed systems with novel failures</td></tr>
+<tr><td>Analogy</td><td>Car dashboard warning lights</td><td>Mechanic's diagnostic computer with full data access</td></tr>
+</table>
+<p>Observability is a property of a system: <em>can you understand its internal state from its outputs?</em> Monitoring is something you do with those outputs. You need both: monitoring detects, observability explains.</p>
+
+<h2>The three pillars</h2>
+<pre class="diagram">
+                     ┌───────────── Your running system ─────────────┐
+                     │                                               │
+          ┌──────────┼───────────┬───────────────────┐               │
+          ▼          ▼           ▼                   ▼
+       LOGS        METRICS      TRACES            (also: profiles, events)
+   "what happened" "how much /   "where did this
+    discrete events  how often"   request spend time"
+    with context     numbers      across services
+          │          over time         │
+          ▼              ▼             ▼
+      Loki / ELK    Prometheus      Tempo / Jaeger
+          └──────────────┴─────────────┘
+                         ▼
+        Grafana / dashboards / alerts / on-call humans
+</pre>
+<table>
+<tr><th>Pillar</th><th>What it is</th><th>Strength</th><th>Weakness</th><th>Example</th></tr>
+<tr><td><strong>Logs</strong></td><td>Timestamped records of discrete events</td><td>Rich detail, great for debugging one case</td><td>Voluminous, costly, hard to aggregate</td><td><code>{"level":"error","msg":"payment failed","order":881}</code></td></tr>
+<tr><td><strong>Metrics</strong></td><td>Numeric measurements aggregated over time</td><td>Cheap, fast, ideal for alerting and trends</td><td>Little context; high cardinality is expensive</td><td><code>http_requests_total{status="500"} 42</code></td></tr>
+<tr><td><strong>Traces</strong></td><td>The journey of one request across services as timed spans</td><td>Pinpoints which service/call is slow</td><td>Needs instrumentation everywhere; sampling</td><td>Checkout: 1.2s = API 40ms + DB 900ms + payment 250ms</td></tr>
+</table>
+<p>They complement each other in a typical investigation:</p>
+<ol>
+<li><strong>Metrics</strong> alert you: error rate on checkout jumped to 8%.</li>
+<li><strong>Traces</strong> show the slow/failing hop: calls to the inventory service time out.</li>
+<li><strong>Logs</strong> from that service, filtered by the trace ID, show the exact exception: connection pool exhausted.</li>
+</ol>
+<p>Increasingly, a fourth signal is added: <strong>continuous profiling</strong> (where CPU/memory goes in code), and <strong>events</strong> (deploys, config changes) overlaid on graphs, since most outages follow a change.</p>
+
+<h2>Instrument first, ask questions later</h2>
+<p>The key shift for developers: telemetry is part of the feature. When you build a new endpoint, you also decide how you will know it is healthy: the request counter, latency histogram, structured logs with context, and a span. Adding it after an incident is too late; the data from the incident is already gone.</p>
+<div class="callout key"><strong>High cardinality and high dimensionality</strong><p>The hardest incidents involve one user, one tenant, one build version, one region. Systems that let you slice by arbitrary attributes (<code>customer_id</code>, <code>region</code>, <code>version</code>, <code>feature_flag</code>) answer "why only them?" quickly. That ability, more than any tool, is what separates observable systems from merely monitored ones. Keep it in logs/traces; be careful in metrics labels (cost explodes).</p></div>
+
+<h2>What good looks like</h2>
+<ul>
+<li>You learn about incidents from alerts, not users.</li>
+<li>Any engineer can open a dashboard and answer "is the service healthy?" in 10 seconds.</li>
+<li>From an alert, you reach the relevant logs and traces in two clicks.</li>
+<li>Every deploy appears as a marker on the graphs.</li>
+<li>Reliability is measured against explicit targets (SLOs) rather than gut feel.</li>
+</ul>
+
+<h2>A starter stack</h2>
+<table>
+<tr><th>Need</th><th>Open source / self-hosted</th><th>Hosted</th></tr>
+<tr><td>Metrics</td><td>Prometheus, Mimir, VictoriaMetrics</td><td>Grafana Cloud, Datadog, CloudWatch</td></tr>
+<tr><td>Logs</td><td>Loki, ELK/OpenSearch</td><td>Datadog, CloudWatch Logs, Splunk, Axiom</td></tr>
+<tr><td>Traces</td><td>Tempo, Jaeger</td><td>Honeycomb, Datadog APM, Lightstep, X-Ray</td></tr>
+<tr><td>Instrumentation</td><td>OpenTelemetry (vendor-neutral standard)</td><td>Same</td></tr>
+<tr><td>Dashboards</td><td>Grafana</td><td>Grafana Cloud, Datadog</td></tr>
+<tr><td>Alerting</td><td>Alertmanager, Grafana Alerting</td><td>PagerDuty, Opsgenie, Grafana OnCall</td></tr>
+</table>
+<p>Use <strong>OpenTelemetry</strong> as the instrumentation layer so you can change backends without re-instrumenting.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Dashboard theatre</strong>: 40 graphs nobody looks at. Fewer, purposeful ones win.</li>
+<li><strong>Monitoring causes, not symptoms</strong>: alerting on CPU 80% instead of "users see errors".</li>
+<li><strong>Telemetry cost blow-up</strong>: unbounded logs and high-cardinality metrics can become your second-largest cloud bill.</li>
+<li><strong>Siloed tools</strong>: logs, metrics and traces that cannot be correlated lose most of their value (use shared IDs and labels).</li>
+<li><strong>Monitoring the monitor</strong>: if Prometheus is down, who alerts? Use an external heartbeat/dead-man's switch.</li>
+<li><strong>Averages lie</strong>: a 200 ms average can hide a 5 s p99. Use percentiles/histograms.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Pick a service you own. Write down: how would you know in under 5 minutes that it is broken? That one user's request is slow? That it broke because of last Tuesday's deploy?</li>
+<li>List the last three production incidents you remember. For each, which pillar would have found the cause fastest, and did you have it?</li>
+<li>Run <code>docker run -p 3000:3000 grafana/otel-lgtm</code> (an all-in-one Loki-Grafana-Tempo-Mimir demo) and explore the Grafana UI.</li>
+</ol></div>

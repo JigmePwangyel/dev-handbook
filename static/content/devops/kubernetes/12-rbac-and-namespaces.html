@@ -1,0 +1,132 @@
+<h1>Namespaces, RBAC and Pod Security</h1>
+<p class="lead">A cluster is shared by many teams, apps and automation. Without boundaries, one team's mistake deletes another's database. Namespaces partition the cluster, RBAC decides who can do what, quotas stop noisy neighbours, and Pod security keeps containers from escaping.</p>
+
+<h2>Namespaces</h2>
+<p>A namespace is a named scope for most resources. Names must be unique within a namespace, not across the cluster, so <code>web</code> can exist in both <code>staging</code> and <code>prod</code>. Default ones: <code>default</code>, <code>kube-system</code> (control plane add-ons), <code>kube-public</code>, <code>kube-node-lease</code>.</p>
+<pre><code>kubectl create namespace shop-prod
+kubectl get pods -n shop-prod
+kubectl config set-context --current --namespace=shop-prod
+kubectl api-resources --namespaced=false      # cluster-scoped kinds: Node, PV, StorageClass, Namespace...</code></pre>
+<p>Common layouts: one namespace per team, per app, or per environment-per-app. For hard isolation between environments (prod vs dev) use separate clusters; namespaces are a soft boundary (shared nodes, shared kernel, shared control plane).</p>
+<div class="callout info"><strong>What namespaces do NOT do</strong><p>They do not isolate the network (use NetworkPolicy), do not limit resources (use ResourceQuota), and do not restrict permissions (use RBAC). They are just the scope to which those controls attach.</p></div>
+
+<h2>ServiceAccounts: identity for Pods</h2>
+<p>Humans authenticate with certificates or an OIDC identity provider; Pods authenticate as a <strong>ServiceAccount</strong>. Every namespace has a <code>default</code> one. The token is projected into the Pod at <code>/var/run/secrets/kubernetes.io/serviceaccount/</code> and is short-lived and audience-bound in modern clusters.</p>
+<pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: shop
+  namespace: shop-prod
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/shop   # cloud identity binding
+automountServiceAccountToken: false   # do not mount a token unless the app calls the API</code></pre>
+<p>Give each workload its own ServiceAccount; never share <code>default</code>. Most apps never talk to the Kubernetes API, so disable the token mount.</p>
+
+<h2>RBAC</h2>
+<p>Role-Based Access Control answers "may subject S perform verb V on resource R?" It is purely additive: there are no deny rules; absence of a grant means denied.</p>
+<table>
+<tr><th>Object</th><th>Scope</th><th>Meaning</th></tr>
+<tr><td><code>Role</code></td><td>One namespace</td><td>A set of permissions</td></tr>
+<tr><td><code>ClusterRole</code></td><td>Cluster-wide (or reusable template)</td><td>Permissions, including non-namespaced resources</td></tr>
+<tr><td><code>RoleBinding</code></td><td>One namespace</td><td>Grants a Role or ClusterRole to subjects within that namespace</td></tr>
+<tr><td><code>ClusterRoleBinding</code></td><td>Cluster-wide</td><td>Grants across all namespaces</td></tr>
+</table>
+<pre><code>apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-reader
+  namespace: shop-prod
+rules:
+  - apiGroups: [""]                 # "" = core group
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dev-team-read-pods
+  namespace: shop-prod
+subjects:
+  - kind: Group
+    name: shop-developers           # from your identity provider
+    apiGroup: rbac.authorization.k8s.io
+  - kind: ServiceAccount
+    name: shop
+    namespace: shop-prod
+roleRef:
+  kind: Role
+  name: pod-reader
+  apiGroup: rbac.authorization.k8s.io</code></pre>
+<p>Test it without guessing:</p>
+<pre><code>kubectl auth can-i delete pods -n shop-prod --as=jane
+kubectl auth can-i list secrets -n shop-prod --as=system:serviceaccount:shop-prod:shop
+kubectl auth can-i --list -n shop-prod --as=jane</code></pre>
+<p>Built-in ClusterRoles to reuse: <code>view</code>, <code>edit</code>, <code>admin</code> (namespace-level) and <code>cluster-admin</code> (everything). A typical pattern: bind <code>edit</code> to developers in their own namespaces via RoleBinding, <code>view</code> in prod.</p>
+<div class="callout warn"><strong>RBAC pitfalls</strong><ul><li>Never bind <code>cluster-admin</code> to CI tokens or apps casually; it is root for the cluster.</li><li><code>get secrets</code>, <code>create pods</code>, <code>exec</code> and the <code>escalate</code>/<code>bind</code> verbs are powerful: reading secrets reveals credentials, creating a Pod can mount them.</li><li>Wildcards (<code>resources: ["*"]</code>) grow with new CRDs. Be explicit.</li><li>Audit with tools like <code>kubectl-who-can</code>, rbac-lookup or Kubescape.</li></ul></div>
+
+<h2>ResourceQuota and LimitRange</h2>
+<p>Without limits, one namespace can consume the entire cluster.</p>
+<pre><code>apiVersion: v1
+kind: ResourceQuota
+metadata: { name: team-quota, namespace: shop-dev }
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.memory: 40Gi
+    pods: "50"
+    persistentvolumeclaims: "10"
+    services.loadbalancers: "1"      # avoid surprise cloud bills
+---
+apiVersion: v1
+kind: LimitRange
+metadata: { name: defaults, namespace: shop-dev }
+spec:
+  limits:
+    - type: Container
+      default:        { memory: 256Mi }
+      defaultRequest: { cpu: 100m, memory: 128Mi }
+      max:            { memory: 2Gi }</code></pre>
+<p>When a compute quota is set, Pods must declare requests/limits or be rejected; a LimitRange supplies defaults so developers do not hit that wall.</p>
+
+<h2>Pod security</h2>
+<p>By default a container may run as root, add Linux capabilities or even be <code>privileged</code>, which is nearly host root. The built-in <strong>Pod Security Admission</strong> enforces three standard profiles per namespace via labels:</p>
+<table>
+<tr><th>Profile</th><th>Allows</th></tr>
+<tr><td><code>privileged</code></td><td>Anything (system components only)</td></tr>
+<tr><td><code>baseline</code></td><td>Blocks known escalations: hostNetwork, privileged, hostPath etc.</td></tr>
+<tr><td><code>restricted</code></td><td>Hardened best practice: non-root, no privilege escalation, seccomp, drop all capabilities</td></tr>
+</table>
+<pre><code>kubectl label namespace shop-prod \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/warn=restricted</code></pre>
+<p>A Pod that passes <code>restricted</code>:</p>
+<pre><code>spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: shop
+      image: ghcr.io/example/shop:2.3.1
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }</code></pre>
+<p>For richer rules (only allow images from your registry, require labels) use a policy engine: Kyverno, OPA Gatekeeper, or the built-in ValidatingAdmissionPolicy (CEL).</p>
+
+<h2>Checklist</h2>
+<ul>
+<li>Separate namespaces per team or app; default-deny NetworkPolicy in each.</li>
+<li>A ServiceAccount per workload, least-privilege Roles, token mounting off by default.</li>
+<li>Quotas and LimitRanges on shared namespaces.</li>
+<li><code>restricted</code> Pod Security on app namespaces.</li>
+<li>Humans via SSO groups, not shared kubeconfig certificates.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a namespace, a ServiceAccount, a Role that can only list Pods, and a RoleBinding. Verify with <code>kubectl auth can-i</code> using <code>--as=system:serviceaccount:...</code>.</li>
+<li>Add a ResourceQuota of 2 Pods and try to scale a Deployment to 5. Read the error events.</li>
+<li>Label a namespace <code>enforce=restricted</code> and try to run <code>nginx</code> as root; then fix the Pod's securityContext.</li>
+</ol></div>

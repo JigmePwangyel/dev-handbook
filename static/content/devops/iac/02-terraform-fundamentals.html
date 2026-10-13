@@ -1,0 +1,228 @@
+<h1>Terraform Fundamentals</h1>
+<p class="lead">Terraform is the most widely used provisioning tool. You describe cloud resources in HCL, run <code>terraform plan</code> to preview exactly what will change, and <code>terraform apply</code> to make it so. This lesson builds a real example: a VM with a security group on AWS.</p>
+
+<h2>How it works</h2>
+<pre class="diagram">
+  *.tf files (desired)         state file (what Terraform believes exists)
+        │                                   │
+        └──────────▶  terraform plan  ◀─────┘
+                           │  compares, and refreshes against the real cloud API
+                           ▼
+                  proposed diff: + create  ~ update  - destroy
+                           │ (you review)
+                           ▼
+                    terraform apply ──▶ provider plugin ──▶ AWS / GCP / Azure / ... API
+</pre>
+<p>Terraform builds a <strong>dependency graph</strong> from references between resources, so it creates things in the right order and in parallel where possible. <strong>Providers</strong> are plugins that translate resources into API calls for a specific platform (AWS, Google, Azure, Cloudflare, Kubernetes, GitHub, Datadog and thousands more).</p>
+
+<h2>Install and workflow</h2>
+<pre><code>brew install terraform        # or OpenTofu: brew install opentofu  (command: tofu)
+terraform version
+
+terraform init       # download providers/modules, set up backend (run first, and after adding providers)
+terraform fmt        # canonical formatting
+terraform validate   # syntax and internal consistency
+terraform plan       # preview; changes nothing
+terraform apply      # make the changes (asks for "yes")
+terraform destroy    # delete everything this configuration manages</code></pre>
+
+<h2>HCL building blocks</h2>
+<table>
+<tr><th>Block</th><th>Purpose</th></tr>
+<tr><td><code>terraform</code></td><td>Required Terraform and provider versions, backend</td></tr>
+<tr><td><code>provider</code></td><td>Configure a provider (region, credentials)</td></tr>
+<tr><td><code>resource</code></td><td>A thing to create and manage</td></tr>
+<tr><td><code>data</code></td><td>Read-only lookup of something that exists (an AMI, a VPC)</td></tr>
+<tr><td><code>variable</code></td><td>Input parameter</td></tr>
+<tr><td><code>locals</code></td><td>Named expressions to avoid repetition</td></tr>
+<tr><td><code>output</code></td><td>Values to print or share after apply</td></tr>
+<tr><td><code>module</code></td><td>Reuse a group of resources (next lesson)</td></tr>
+</table>
+<p>Resources reference each other with <code>TYPE.NAME.ATTRIBUTE</code> (for example <code>aws_security_group.web.id</code>), and that reference is what creates the dependency.</p>
+
+<h2>Complete example: a web server VM and security group</h2>
+<p>Layout: three files in a directory (the names are convention only; Terraform loads every <code>.tf</code> file in the folder).</p>
+
+<h3>versions.tf</h3>
+<pre><code>terraform {
+  required_version = "&gt;= 1.7"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 5.60"      # allow 5.x, at least 5.60
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+  default_tags {
+    tags = { Project = "demo", ManagedBy = "terraform" }   # applied to everything
+  }
+}</code></pre>
+
+<h3>variables.tf</h3>
+<pre><code>variable "region" {
+  type    = string
+  default = "eu-west-1"
+}
+
+variable "instance_type" {
+  type        = string
+  description = "EC2 size"
+  default     = "t3.micro"
+}
+
+variable "ssh_allowed_cidr" {
+  type        = string
+  description = "Your public IP in CIDR form, e.g. 203.0.113.7/32"
+  validation {
+    condition     = can(cidrnetmask(var.ssh_allowed_cidr))
+    error_message = "Must be a valid CIDR block."
+  }
+}
+
+variable "key_name" {
+  type        = string
+  description = "Name of an existing EC2 key pair"
+}</code></pre>
+
+<h3>main.tf</h3>
+<pre><code># Look up the latest Ubuntu 24.04 AMI instead of hard-coding an ID
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]   # Canonical
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+}
+
+# Use the account's default VPC to keep the example short
+data "aws_vpc" "default" {
+  default = true
+}
+
+resource "aws_security_group" "web" {
+  name_prefix = "web-"
+  description = "Allow HTTP from anywhere, SSH from my IP"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "HTTP"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = [var.ssh_allowed_cidr]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_instance" "web" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  key_name               = var.key_name
+  vpc_security_group_ids = [aws_security_group.web.id]   # implicit dependency
+
+  user_data = &lt;&lt;-EOT
+    #!/bin/bash
+    apt-get update -y
+    apt-get install -y nginx
+    systemctl enable --now nginx
+  EOT
+
+  root_block_device {
+    volume_size = 20
+    encrypted   = true
+  }
+
+  metadata_options {
+    http_tokens = "required"    # enforce IMDSv2
+  }
+
+  tags = { Name = "web-1" }
+}</code></pre>
+
+<h3>outputs.tf</h3>
+<pre><code>output "public_ip" {
+  value = aws_instance.web.public_ip
+}
+
+output "url" {
+  value = "http://${aws_instance.web.public_dns}"
+}</code></pre>
+
+<h3>Run it</h3>
+<pre><code>export AWS_PROFILE=dev        # credentials come from the environment, never from .tf files
+terraform init
+terraform plan  -var 'ssh_allowed_cidr=203.0.113.7/32' -var 'key_name=my-key'
+terraform apply -var 'ssh_allowed_cidr=203.0.113.7/32' -var 'key_name=my-key'
+# ...
+# Outputs:
+# public_ip = "54.12.34.56"
+curl $(terraform output -raw public_ip)
+terraform destroy ...         # stop paying for it</code></pre>
+<p>Reading the plan: <code>+</code> create, <code>~</code> update in place, <code>-/+</code> destroy and recreate (some attribute changes force replacement, which for a database means data loss; always read for <code>-/+</code> and <code>must be replaced</code>).</p>
+
+<h2>Variables, locals and loops</h2>
+<pre><code># terraform.tfvars (auto-loaded) or prod.tfvars (-var-file=prod.tfvars)
+region           = "eu-west-1"
+ssh_allowed_cidr = "203.0.113.7/32"
+key_name         = "my-key"
+
+locals {
+  name = "web-${terraform.workspace}"
+  common_tags = { Owner = "platform" }
+}
+
+# several similar resources with for_each (prefer over count: stable keys)
+variable "buckets" { default = ["logs", "assets"] }
+resource "aws_s3_bucket" "b" {
+  for_each = toset(var.buckets)
+  bucket   = "acme-${each.key}-prod"
+}</code></pre>
+<p>Variable precedence (low to high): defaults, <code>terraform.tfvars</code>, <code>*.auto.tfvars</code>, <code>-var-file</code>, <code>-var</code>, and <code>TF_VAR_name</code> environment variables sit alongside these for CI. Mark secrets <code>sensitive = true</code> to hide them from output (they still end up in state).</p>
+
+<h2>Best practices</h2>
+<ul>
+<li>Always <code>plan</code>, read it, then apply; in CI save the plan file (<code>-out=tfplan</code>) and apply exactly that.</li>
+<li>Pin provider and Terraform versions; commit <code>.terraform.lock.hcl</code>.</li>
+<li>Do not commit <code>.terraform/</code>, <code>*.tfstate</code> or secret tfvars. Add them to <code>.gitignore</code>.</li>
+<li>Prefer <code>for_each</code> over <code>count</code> for collections; removing the middle item with <code>count</code> shifts indexes and destroys things.</li>
+<li>Tag everything; use <code>lifecycle { prevent_destroy = true }</code> on irreplaceable resources.</li>
+<li>Never hard-code credentials; use environment, profiles, or OIDC-based roles in CI.</li>
+<li>Run <code>terraform fmt</code>, <code>validate</code>, and a linter (tflint) and scanner (trivy, checkov) in CI.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Editing resources in the console, then running Terraform: it will revert your change (drift).</li>
+<li>Renaming a resource block in code means "destroy old, create new" unless you use a <code>moved</code> block.</li>
+<li>Ignoring the state file's importance: the next lesson is about it.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Apply the example in a sandbox account (a t3.micro costs pennies, or use the free tier), visit the nginx page, then run <code>terraform destroy</code>.</li>
+<li>Change <code>instance_type</code> and read the plan: is it an in-place update or a replace?</li>
+<li>Add an output for the security group ID and re-apply; note that only outputs change.</li>
+<li>No cloud account? Use the <code>hashicorp/local</code> or <code>hashicorp/docker</code> provider to practice the same workflow.</li>
+</ol></div>

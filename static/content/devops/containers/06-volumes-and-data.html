@@ -1,0 +1,139 @@
+<h1>Volumes and Data Persistence</h1>
+<p class="lead">A container's writable layer is born with the container and dies with it. Delete the container and every file it wrote is gone. That is perfect for stateless web apps and disastrous for databases. Volumes and mounts are how you attach durable storage to disposable containers.</p>
+
+<h2>The problem</h2>
+<pre><code>docker run -d --name db -e POSTGRES_PASSWORD=pw postgres:16
+# ... create tables, insert data ...
+docker rm -f db
+docker run -d --name db -e POSTGRES_PASSWORD=pw postgres:16
+# all your data is gone</code></pre>
+<p>Container filesystems are also slower (copy-on-write overlay) and cannot be shared easily between containers. Docker offers three ways to mount something from outside the writable layer into a container.</p>
+
+<pre class="diagram">
+              Docker host
+ ┌──────────────────────────────────────────────┐
+ │  Container                                   │
+ │   /var/lib/postgresql/data ◀── volume        │──▶ /var/lib/docker/volumes/pgdata/_data
+ │   /app (source code)       ◀── bind mount    │──▶ /home/you/project  (any host path)
+ │   /run/secrets, /tmp       ◀── tmpfs         │──▶ host RAM only (never on disk)
+ └──────────────────────────────────────────────┘
+</pre>
+
+<h2>The three mount types</h2>
+<table>
+<tr><th></th><th>Named volume</th><th>Bind mount</th><th>tmpfs</th></tr>
+<tr><td>Where data lives</td><td>Docker-managed dir (<code>/var/lib/docker/volumes</code>)</td><td>Any host path you choose</td><td>Host memory</td></tr>
+<tr><td>Managed by Docker</td><td>Yes (create, list, remove, drivers)</td><td>No</td><td>Yes</td></tr>
+<tr><td>Survives container removal</td><td>Yes</td><td>Yes (it is your files)</td><td>No</td></tr>
+<tr><td>Best for</td><td>Databases, production state</td><td>Local development (live code reload), config files</td><td>Scratch data, secrets, performance</td></tr>
+<tr><td>Pre-populated from image</td><td>Yes, copies image content on first use</td><td>No, host content hides the image's</td><td>No</td></tr>
+<tr><td>Portable / backup-friendly</td><td>Yes</td><td>Depends on host layout</td><td>n/a</td></tr>
+</table>
+
+<h2>Named volumes</h2>
+<pre><code>docker volume create pgdata
+docker run -d --name db \
+  -e POSTGRES_PASSWORD=pw \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16
+
+docker rm -f db                       # container gone...
+docker run -d --name db2 -e POSTGRES_PASSWORD=pw \
+  -v pgdata:/var/lib/postgresql/data postgres:16   # ...data is back
+
+docker volume ls
+docker volume inspect pgdata          # shows Mountpoint
+docker volume rm pgdata               # permanent delete
+docker volume prune                   # remove volumes not used by any container</code></pre>
+<p>The <code>-v name:/path</code> form creates the volume automatically if it does not exist. The modern, explicit syntax is <code>--mount</code>, which errors on typos rather than silently creating things:</p>
+<pre><code>docker run --mount type=volume,source=pgdata,target=/var/lib/postgresql/data postgres:16
+docker run --mount type=bind,source="$PWD",target=/app,readonly node:22-slim ls /app</code></pre>
+<div class="callout tip"><strong>-v pitfall</strong><p>If you write <code>-v ./data:/data</code> with a path, you get a bind mount. If you write <code>-v data:/data</code> with a bare name, you get a named volume. A missing <code>./</code> changes the semantics entirely, and with <code>-v</code> a mistyped host path is silently created as an empty directory owned by root. Prefer <code>--mount</code> in scripts.</p></div>
+
+<h2>Bind mounts for development</h2>
+<p>Mount your source directory into the container so edits on the host appear instantly, enabling hot reload without rebuilding:</p>
+<pre><code>docker run --rm -it -p 3000:3000 \
+  -v "$PWD":/app \
+  -v /app/node_modules \
+  node:22-slim sh -c "cd /app &amp;&amp; npm run dev"</code></pre>
+<p>The second <code>-v</code> creates an anonymous volume that masks the host <code>node_modules</code>. The trick of masking <code>/app/node_modules</code> stops your macOS-built native modules from overriding the Linux ones installed in the image.</p>
+<div class="callout warn"><strong>Bind mount gotchas</strong><ul>
+<li><strong>Permissions/ownership</strong>: files are owned by your host UID. A container running as a different UID may be unable to write. Match with <code>--user "$(id -u):$(id -g)"</code> or fix with <code>chown</code>.</li>
+<li><strong>Performance on Mac/Windows</strong>: file sharing across the VM boundary is slow for large trees (many small files such as <code>node_modules</code>). Use named volumes for dependency dirs; Docker Desktop's VirtioFS and Compose <code>watch</code> help.</li>
+<li><strong>Host content hides image content</strong>: mounting an empty dir over <code>/app</code> makes the code baked into the image invisible.</li>
+<li><strong>SELinux</strong> (Fedora/RHEL): add <code>:z</code> or <code>:Z</code> to the mount, e.g. <code>-v "$PWD":/app:z</code>.</li>
+<li>Use <code>:ro</code> for anything the container should not modify.</li>
+</ul></div>
+
+<h2>tmpfs</h2>
+<pre><code>docker run --rm --tmpfs /tmp:rw,size=64m,mode=1777 alpine df -h /tmp
+docker run --read-only --tmpfs /tmp --tmpfs /run myapp   # read-only root + writable scratch</code></pre>
+<p>tmpfs data lives in RAM and vanishes when the container stops. Use it for temp files that must never touch disk, and in tandem with <code>--read-only</code> for hardening.</p>
+
+<h2>Persisting a real database</h2>
+<pre><code>docker run -d --name pg \
+  --restart unless-stopped \
+  -e POSTGRES_USER=app \
+  -e POSTGRES_PASSWORD_FILE=/run/secrets/pgpass \
+  -e POSTGRES_DB=appdb \
+  -v pgdata:/var/lib/postgresql/data \
+  -p 127.0.0.1:5432:5432 \
+  postgres:16
+
+psql -h 127.0.0.1 -U app appdb      # connect from the host</code></pre>
+<p>Notes: bind published DB ports to <code>127.0.0.1</code> unless remote access is truly required (a plain <code>-p 5432:5432</code> exposes it on every interface, and Docker bypasses most host firewall rules). Pin the major version: pointing a newer Postgres at an older data directory fails, and upgrades require <code>pg_upgrade</code> or dump/restore.</p>
+
+<h2>Backup and restore</h2>
+<p>Volumes are just directories, so you can archive them with a throwaway container that mounts the volume plus a host directory:</p>
+<pre><code># Backup volume "pgdata" to ./backup/pgdata-2026-10-05.tgz
+docker run --rm \
+  -v pgdata:/source:ro \
+  -v "$PWD/backup":/backup \
+  alpine tar czf /backup/pgdata-$(date +%F).tgz -C /source .
+
+# Restore into a (new) volume
+docker volume create pgdata-restored
+docker run --rm \
+  -v pgdata-restored:/target \
+  -v "$PWD/backup":/backup:ro \
+  alpine tar xzf /backup/pgdata-2026-10-05.tgz -C /target</code></pre>
+<div class="callout key"><strong>File-level copies of live databases can be corrupt</strong><p>Tarring a running Postgres data directory may capture a half-written state. For databases prefer logical backups, which are consistent and portable across versions:</p></div>
+<pre><code>docker exec pg pg_dump -U app -Fc appdb &gt; appdb.dump          # backup
+docker exec -i pg pg_restore -U app -d appdb --clean &lt; appdb.dump   # restore
+# MySQL: docker exec db mysqldump -u root -p"$PW" --all-databases &gt; all.sql</code></pre>
+<p>Also test restores regularly. An untested backup is a hope, not a backup.</p>
+
+<h2>Sharing and copying data</h2>
+<pre><code>docker run -v shared:/data writer ...      # several containers can mount one volume
+docker run -v shared:/data:ro reader ...   # read-only for the consumer
+docker cp web:/etc/nginx/nginx.conf ./nginx.conf   # one-off copy out of a container
+docker cp ./index.html web:/usr/share/nginx/html/
+docker run --rm -v pgdata:/d alpine ls -la /d      # peek into a volume</code></pre>
+<p>Concurrent writers to the same volume need application-level coordination. Two Postgres instances on one data directory will destroy it.</p>
+
+<h2>Volumes in production</h2>
+<ul>
+<li><strong>Single host:</strong> named volumes on a fast local disk, with scheduled backups shipped off-host (S3, etc.).</li>
+<li><strong>Orchestrators:</strong> Kubernetes uses PersistentVolumes backed by cloud disks (EBS, GCE PD). The volume lives independently of any node.</li>
+<li><strong>Managed databases</strong> (RDS, Cloud SQL) are often the better answer: "databases in containers" in production means you own backups, upgrades, failover and tuning. Containerized databases shine in dev, CI and test.</li>
+<li><strong>Volume drivers</strong> (NFS, cloud storage) exist but network filesystems often have poor locking and latency characteristics for databases.</li>
+</ul>
+
+<h2>Design principle: keep containers stateless</h2>
+<p>Treat state as an external dependency: databases, object storage (S3), caches. A stateless container can be killed, rescheduled and scaled freely. Write logs to stdout, uploads to object storage, sessions to Redis. Where state must be local, make the volume explicit and documented.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><code>docker compose down -v</code> deletes your named volumes. Know before you type the <code>-v</code>.</li>
+<li><code>docker system prune --volumes</code> removes unused volumes, including a stopped DB's data.</li>
+<li>Anonymous volumes (from <code>VOLUME</code> in a Dockerfile or <code>-v /path</code>) pile up as random-hash names. Name your volumes.</li>
+<li>Changing <code>POSTGRES_PASSWORD</code> on an existing volume has no effect; init variables apply only when the data directory is empty.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run Postgres with a named volume, create a table, remove the container, start a new one on the same volume and confirm the table survived.</li>
+<li>Repeat without a volume and watch the data vanish.</li>
+<li>Bind-mount a folder with an <code>index.html</code> into nginx (<code>-v "$PWD/site":/usr/share/nginx/html:ro</code>), edit the file and refresh the browser.</li>
+<li>Back up the volume with the tar command and a <code>pg_dump</code>. Restore the dump into a fresh container.</li>
+</ol></div>

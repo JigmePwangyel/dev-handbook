@@ -1,0 +1,264 @@
+<h1>Manual Deploy to a VPS: Node.js, Postgres, nginx, HTTPS</h1>
+<p class="lead">This is the capstone of the first half of the handbook: take an Express app with a Postgres database from your laptop to a real domain over HTTPS on an Ubuntu server, by hand. Everything later (CI/CD, Docker, Terraform) automates exactly these steps, so doing them manually once is how you understand what the automation is doing.</p>
+
+<h2>What we will build</h2>
+<pre class="diagram">
+ Browser ──HTTPS 443──▶ nginx ──▶ Express (127.0.0.1:3000, systemd service, user "deploy")
+                          │                    │
+                    certbot cert           Postgres (127.0.0.1:5432)
+ DNS: app.example.com ──▶ VPS public IP        ufw: only 22, 80, 443 open
+</pre>
+<p>Assumptions: a fresh <strong>Ubuntu 24.04 LTS</strong> VPS (DigitalOcean, Hetzner, Linode, EC2...) with a public IP and root or sudo SSH access; a domain you control; an Express app in a Git repo with <code>package.json</code>, a start script, and a <code>/health</code> route. Replace <code>203.0.113.10</code>, <code>app.example.com</code>, <code>you</code> and the repo URL with yours.</p>
+
+<h2>Step 0: The sample app</h2>
+<p>Your app should read its configuration from the environment (see the config lesson), listen on <code>127.0.0.1</code> behind the proxy, and expose a health check:</p>
+<pre><code>// server.js
+const express = require('express');
+const { Pool } = require('pg');
+
+const app = express();
+app.set('trust proxy', 1);                       // we sit behind nginx
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+app.get('/health', async (req, res) =&gt; {
+  try { await pool.query('SELECT 1'); res.json({ status: 'ok' }); }
+  catch (e) { res.status(503).json({ status: 'db_unreachable' }); }
+});
+app.get('/', (req, res) =&gt; res.send('Hello from ' + (process.env.NODE_ENV || 'dev')));
+
+const port = process.env.PORT || 3000;
+const host = process.env.HOST || '127.0.0.1';
+const server = app.listen(port, host, () =&gt; console.log(`listening on ${host}:${port}`));
+
+process.on('SIGTERM', () =&gt; {                   // graceful shutdown (systemd sends SIGTERM)
+  server.close(() =&gt; pool.end().then(() =&gt; process.exit(0)));
+});</code></pre>
+<pre><code>// package.json (relevant part)
+{ "scripts": { "start": "node server.js" }, "engines": { "node": "&gt;=22" } }</code></pre>
+
+<h2>Step 1: Point DNS at the server</h2>
+<p>Do this first, because DNS takes time to be visible and certificates need it.</p>
+<ol>
+<li>At your DNS provider, create <code>A  app  203.0.113.10</code> with TTL 300 (and an <code>AAAA</code> record if the VPS has IPv6).</li>
+<li>Verify from your laptop: <code>dig +short app.example.com</code> should print the IP.</li>
+</ol>
+
+<h2>Step 2: First login and a non-root user</h2>
+<p>Running everything as root means any bug is a total compromise. Create two accounts: an admin (sudo) for you, and a service account that runs the app with minimal privileges.</p>
+<pre><code>ssh root@203.0.113.10
+
+apt update &amp;&amp; apt -y upgrade
+timedatectl set-timezone UTC
+
+# Admin user with sudo
+adduser --gecos "" you
+usermod -aG sudo you
+
+# Copy your SSH public key to the new user
+rsync --archive --chown=you:you ~/.ssh /home/you</code></pre>
+<p>In a new terminal, confirm <code>ssh you@203.0.113.10</code> works and <code>sudo whoami</code> prints <code>root</code>. Only then harden SSH:</p>
+<pre><code>sudo nano /etc/ssh/sshd_config.d/99-hardening.conf
+#   PermitRootLogin no
+#   PasswordAuthentication no
+#   KbdInteractiveAuthentication no
+
+sudo sshd -t &amp;&amp; sudo systemctl reload ssh      # (service is "ssh" on Ubuntu)</code></pre>
+<p>Keep your existing session open while testing a new login, so a typo cannot lock you out.</p>
+<p>Now the service user: no password, no login shell, home directory for the app:</p>
+<pre><code>sudo adduser --system --group --home /srv/myapp --shell /usr/sbin/nologin myapp
+sudo mkdir -p /srv/myapp
+sudo chown myapp:myapp /srv/myapp</code></pre>
+
+<h2>Step 3: Firewall</h2>
+<pre><code>sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status verbose</code></pre>
+<p>Postgres and Node are deliberately <em>not</em> opened. Only nginx is public. Optionally install <code>fail2ban</code> to ban IPs that brute-force SSH, and enable unattended security upgrades: <code>sudo apt install -y unattended-upgrades fail2ban</code>.</p>
+
+<h2>Step 4: Install Node.js</h2>
+<p>Ubuntu's packaged Node is often old. Use NodeSource (system-wide, good for servers) or a version manager. Install the current LTS (check nodejs.org for the active LTS line; 22.x or newer in 2026):</p>
+<pre><code>curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs build-essential git
+node -v &amp;&amp; npm -v</code></pre>
+<p>Piping a script from the internet into a root shell is trust-on-first-use. Read it first (<code>curl -fsSL URL | less</code>) or use the signed apt repository instructions from NodeSource's docs.</p>
+
+<h2>Step 5: Install and configure Postgres</h2>
+<pre><code>sudo apt install -y postgresql postgresql-contrib
+sudo systemctl status postgresql           # active (exited/running)
+sudo ss -tlnp | grep 5432                  # should show 127.0.0.1:5432 only</code></pre>
+<p>Create an application role with a strong generated password, and its database:</p>
+<pre><code>DBPASS=$(openssl rand -base64 24 | tr -d '/+=')
+echo "Save this password in your password manager: $DBPASS"
+
+sudo -u postgres psql &lt;&lt;SQL
+CREATE ROLE myapp LOGIN PASSWORD '$DBPASS';
+CREATE DATABASE myapp OWNER myapp;
+SQL
+
+# Test the TCP login the app will use
+PGPASSWORD="$DBPASS" psql -h 127.0.0.1 -U myapp -d myapp -c 'SELECT version();'</code></pre>
+<p>Default Ubuntu Postgres listens on localhost only: good, leave it. Do not change <code>listen_addresses</code> unless you have a specific reason. Backups come later in the production section, but at minimum plan <code>pg_dump</code> to somewhere off this machine.</p>
+
+<h2>Step 6: Get the code onto the server</h2>
+<p>Use a read-only <strong>deploy key</strong> so the server can clone a private repo without your personal credentials.</p>
+<pre><code># On the server, as the service user (use sudo -u, since it has no login shell)
+sudo -u myapp ssh-keygen -t ed25519 -f /srv/myapp/.ssh_deploy_key -N "" -C "myapp-deploy"
+sudo cat /srv/myapp/.ssh_deploy_key.pub     # paste into GitHub: Repo ▸ Settings ▸ Deploy keys (read-only)
+
+# Clone
+sudo -u myapp GIT_SSH_COMMAND='ssh -i /srv/myapp/.ssh_deploy_key -o IdentitiesOnly=yes' \
+     git clone git@github.com:you/myapp.git /srv/myapp/app
+
+cd /srv/myapp/app
+sudo -u myapp npm ci --omit=dev             # reproducible install from package-lock.json
+# If your app needs a build step (TypeScript, bundler): install dev deps, build, then prune
+#   sudo -u myapp npm ci &amp;&amp; sudo -u myapp npm run build &amp;&amp; sudo -u myapp npm prune --omit=dev</code></pre>
+<p><code>npm ci</code> installs exactly what the lockfile says and fails if it disagrees with <code>package.json</code>; <code>npm install</code> can drift. Use <code>ci</code> in deployments.</p>
+
+<h2>Step 7: Environment variables and secrets</h2>
+<p>Create an env file outside the repo, readable only by the service user. systemd will load it.</p>
+<pre><code>sudo mkdir -p /etc/myapp
+sudo tee /etc/myapp/myapp.env &gt;/dev/null &lt;&lt;EOF
+NODE_ENV=production
+HOST=127.0.0.1
+PORT=3000
+DATABASE_URL=postgres://myapp:${DBPASS}@127.0.0.1:5432/myapp
+SESSION_SECRET=$(openssl rand -hex 32)
+EOF
+
+sudo chown root:myapp /etc/myapp/myapp.env
+sudo chmod 640 /etc/myapp/myapp.env
+ls -l /etc/myapp/myapp.env       # -rw-r----- root myapp</code></pre>
+<p>Special characters in the password would need URL-encoding in a connection string; our <code>tr</code> removed the troublesome ones.</p>
+<p>If you have migrations, run them now (see the migrations lesson), for example <code>sudo -u myapp env $(cat /etc/myapp/myapp.env | xargs) npm run migrate</code>. A quick manual run to sanity check the app before involving systemd:</p>
+<pre><code>sudo -u myapp bash -c 'set -a; . /etc/myapp/myapp.env; set +a; cd /srv/myapp/app; timeout 5 node server.js'
+# expect: listening on 127.0.0.1:3000</code></pre>
+
+<h2>Step 8: systemd service</h2>
+<p>systemd starts the app at boot, restarts it on crash and collects logs.</p>
+<pre><code>sudo tee /etc/systemd/system/myapp.service &gt;/dev/null &lt;&lt;'EOF'
+[Unit]
+Description=My Express App
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myapp
+Group=myapp
+WorkingDirectory=/srv/myapp/app
+EnvironmentFile=/etc/myapp/myapp.env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Sandboxing: cheap, effective hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/myapp
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now myapp
+systemctl status myapp --no-pager
+journalctl -u myapp -f                      # live logs (Ctrl-C to stop)
+curl -i http://127.0.0.1:3000/health        # {"status":"ok"}</code></pre>
+<p>If it fails: <code>journalctl -u myapp -n 50 --no-pager</code> shows the error. Common causes: wrong <code>ExecStart</code> path (<code>which node</code>), file permissions, bad <code>DATABASE_URL</code>.</p>
+
+<h2>Step 9: nginx reverse proxy</h2>
+<pre><code>sudo apt install -y nginx
+sudo tee /etc/nginx/sites-available/myapp &gt;/dev/null &lt;&lt;'EOF'
+server {
+    listen 80;
+    listen [::]:80;
+    server_name app.example.com;
+
+    client_max_body_size 10m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        "upgrade";
+        proxy_read_timeout 60s;
+    }
+}
+EOF
+sudo ln -s /etc/nginx/sites-available/myapp /etc/nginx/sites-enabled/myapp
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t &amp;&amp; sudo systemctl reload nginx
+
+curl -i http://app.example.com/health        # from your laptop</code></pre>
+<p>If DNS has not propagated, test with <code>curl -i -H 'Host: app.example.com' http://203.0.113.10/health</code>.</p>
+
+<h2>Step 10: HTTPS with certbot</h2>
+<pre><code>sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d app.example.com --redirect --agree-tos -m you@example.com --no-eff-email
+sudo certbot renew --dry-run                 # confirm automatic renewal works
+systemctl list-timers | grep certbot</code></pre>
+<p>Certbot edits the nginx file to add the <code>listen 443 ssl</code> server block and certificate paths, plus the HTTP to HTTPS redirect. View the result with <code>sudo nginx -T | less</code> and add HSTS if you like:</p>
+<pre><code>add_header Strict-Transport-Security "max-age=31536000" always;</code></pre>
+<p>Verify from outside: <code>curl -I https://app.example.com/</code>, and run an SSL test in your browser. Check <code>http://</code> redirects to <code>https://</code>.</p>
+
+<h2>Step 11: Verify end to end</h2>
+<pre><code>curl -sS https://app.example.com/health          # {"status":"ok"}
+sudo systemctl restart myapp &amp;&amp; sleep 2 &amp;&amp; curl -s https://app.example.com/health
+sudo reboot                                      # after boot, the site must come back by itself
+# then:  curl -s https://app.example.com/health</code></pre>
+<p>The reboot test is the one that separates "it works" from "it will keep working". Everything should start on its own: Postgres, the app, nginx.</p>
+
+<h2>Step 12: How you deploy updates</h2>
+<p>This is the manual routine every later lesson improves on:</p>
+<pre><code>cd /srv/myapp/app
+sudo -u myapp GIT_SSH_COMMAND='ssh -i /srv/myapp/.ssh_deploy_key -o IdentitiesOnly=yes' git pull --ff-only
+sudo -u myapp npm ci --omit=dev
+# sudo -u myapp ...run migrations...
+sudo systemctl restart myapp
+sleep 2 &amp;&amp; curl -fsS https://app.example.com/health || echo "DEPLOY FAILED, ROLL BACK"</code></pre>
+<p>Rolling back: <code>git log --oneline</code>, <code>git checkout &lt;previous-sha&gt;</code> (or <code>git reset --hard</code>), <code>npm ci</code>, restart. Notice the weaknesses: <code>restart</code> drops in-flight requests; the code changes in place while running; a failed <code>npm ci</code> leaves a half-updated app; no history. The zero-downtime lesson fixes these with release directories and symlinks.</p>
+
+<h2>Troubleshooting map</h2>
+<table>
+<tr><th>Symptom</th><th>Where to look</th></tr>
+<tr><td>Site unreachable (timeout)</td><td>DNS (<code>dig</code>), <code>ufw status</code>, cloud firewall, nginx running?</td></tr>
+<tr><td>502 Bad Gateway</td><td><code>systemctl status myapp</code>, <code>journalctl -u myapp</code>, <code>/var/log/nginx/error.log</code></td></tr>
+<tr><td>App crashes at start</td><td>Env file path/permissions, <code>DATABASE_URL</code>, Node version</td></tr>
+<tr><td>"password authentication failed"</td><td>Role password differs from env file; recreate with <code>ALTER ROLE</code></td></tr>
+<tr><td>Certbot fails</td><td>DNS not pointing here yet, port 80 blocked, wrong <code>server_name</code></td></tr>
+<tr><td>Works until reboot</td><td>Forgot <code>systemctl enable</code></td></tr>
+<tr><td>Permission denied reading files</td><td>Owner is root from a previous sudo command; <code>chown -R myapp:myapp /srv/myapp</code></td></tr>
+</table>
+
+<h2>What is still missing (and where it is covered)</h2>
+<ul>
+<li>Backups of Postgres, tested restores (production readiness).</li>
+<li>Logs shipped off the box and monitoring/alerts (observability).</li>
+<li>Reproducibility: if this server dies, can you rebuild it in minutes? Today it took an hour of typing. Infrastructure as Code and containers fix that.</li>
+<li>Zero-downtime releases and fast rollbacks (this section, later lessons).</li>
+<li>CI: tests running before anything reaches the server.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Rent the cheapest Ubuntu VPS you can find (a few dollars a month; destroy it afterwards) and a domain or a free subdomain, and perform every step above with your own small Express + Postgres app.</li>
+<li>Kill the process with <code>sudo kill -9 $(systemctl show -p MainPID --value myapp)</code> and watch systemd restart it (<code>journalctl -u myapp</code>).</li>
+<li>Stop Postgres (<code>sudo systemctl stop postgresql</code>) and look at what <code>/health</code> returns and what nginx and the app log. Start it again.</li>
+<li>Run <code>nmap -Pn SERVER_IP</code> from your laptop. Confirm only 22, 80 and 443 are visible.</li>
+<li>Write the whole procedure as a single Bash script. Where does it get hard to make safe to re-run? (This is the motivation for idempotent tools such as Ansible.)</li>
+</ol></div>

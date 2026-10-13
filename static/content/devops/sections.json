@@ -1,0 +1,14 @@
+[
+{"id":"foundations","title":"Foundations","icon":"🧭","blurb":"The big picture: how code becomes a running product, environments, and why DevOps exists."},
+{"id":"linux","title":"Linux & Servers","icon":"🐧","blurb":"What a server really is: shell, filesystem, permissions, processes, systemd, SSH."},
+{"id":"networking","title":"Networking & the Web","icon":"🌐","blurb":"IPs, ports, DNS, HTTP, TLS, reverse proxies, load balancers, CDNs."},
+{"id":"deploy","title":"Deploying to a Server","icon":"🚀","blurb":"Ship an app by hand to a VPS, then learn strategies: blue-green, canary, rollbacks."},
+{"id":"cicd","title":"Git & CI/CD","icon":"🔁","blurb":"Why pipelines matter, and how to build them with GitHub Actions, GitLab CI and Jenkins."},
+{"id":"containers","title":"Containers & Docker","icon":"📦","blurb":"Images, layers, Dockerfiles, volumes, networks and Compose."},
+{"id":"kubernetes","title":"Kubernetes","icon":"☸️","blurb":"Orchestration: pods, deployments, services, ingress, scaling, Helm."},
+{"id":"iac","title":"Infrastructure as Code","icon":"🧱","blurb":"Terraform, Ansible, immutable infrastructure and GitOps."},
+{"id":"cloud","title":"Cloud Platforms","icon":"☁️","blurb":"IaaS/PaaS/serverless, AWS core services, scaling and high availability."},
+{"id":"observability","title":"Monitoring & Reliability","icon":"📈","blurb":"Logs, metrics, traces, alerting, SLOs, incidents and postmortems."},
+{"id":"production","title":"Production Readiness","icon":"🛡️","blurb":"Security, secrets, backups, databases, scaling patterns, the 12-factor app."},
+{"id":"practice","title":"Practice & Roadmap","icon":"🎯","blurb":"A capstone project, cheat sheets and a learning roadmap."}
+]

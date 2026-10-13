@@ -1,0 +1,146 @@
+<h1>Docker Architecture and Installation</h1>
+<p class="lead">"Docker" is really a stack of cooperating pieces: a CLI, a daemon, a high-level runtime (containerd), a low-level runtime (runc), and open standards that tie them together. Knowing which piece does what makes error messages, alternatives like Podman, and Kubernetes' move away from Docker all make sense.</p>
+
+<h2>The architecture</h2>
+<pre class="diagram">
+ ┌──────────────┐   REST API over    ┌─────────────────────────────┐
+ │ docker (CLI) │───unix socket─────▶│ dockerd (Docker Engine)     │
+ │ docker compose│  /var/run/docker.sock│ images, networks, volumes, │
+ └──────────────┘                    │ build (BuildKit), API       │
+                                     └──────────────┬──────────────┘
+                                                    │ gRPC
+                                     ┌──────────────▼──────────────┐
+                                     │ containerd                  │
+                                     │ image pull/store, lifecycle │
+                                     └──────────────┬──────────────┘
+                                                    │ spawns per container
+                                     ┌──────────────▼──────────────┐
+                                     │ containerd-shim + runc      │
+                                     │ sets up namespaces/cgroups, │
+                                     │ then exec()s your process   │
+                                     └──────────────┬──────────────┘
+                                                    ▼
+                                              Your app (PID 1)
+</pre>
+<table>
+<tr><th>Component</th><th>Role</th></tr>
+<tr><td><code>docker</code> CLI</td><td>Thin client. Turns commands into REST calls. Contains no container logic.</td></tr>
+<tr><td><code>dockerd</code></td><td>The daemon. Manages images, networks, volumes, the build system and the API. Runs as root.</td></tr>
+<tr><td><code>containerd</code></td><td>Industry-standard runtime manager (a CNCF graduated project). Pulls images, manages snapshots and container lifecycle. Kubernetes can talk to it directly.</td></tr>
+<tr><td><code>containerd-shim</code></td><td>A small per-container process that keeps the container alive and holds its stdio even if containerd or dockerd restarts.</td></tr>
+<tr><td><code>runc</code></td><td>The low-level runtime. Creates namespaces and cgroups, mounts the filesystem, then <code>exec</code>s your process and exits.</td></tr>
+</table>
+
+<div class="callout key"><strong>The socket is root</strong><p>The CLI talks to the daemon through <code>/var/run/docker.sock</code>. Anyone who can write to that socket can start a privileged container that mounts the host's <code>/</code>, which is effectively root on the host. Adding a user to the <code>docker</code> group is therefore equivalent to giving them passwordless root. Never mount the socket into a container unless you truly understand why.</p></div>
+
+<h2>The OCI standards</h2>
+<p>The Open Container Initiative defines vendor-neutral specifications so the ecosystem is not locked to Docker:</p>
+<ul>
+<li><strong>Image spec</strong>: the format of an image (manifest, config, layer tarballs).</li>
+<li><strong>Runtime spec</strong>: how to run an unpacked filesystem bundle (<code>runc</code> implements it).</li>
+<li><strong>Distribution spec</strong>: the HTTP API registries speak for push and pull.</li>
+</ul>
+<p>Because of these, an image built with Docker runs on Podman, containerd, CRI-O, Kubernetes, AWS ECS and Cloud Run without changes.</p>
+
+<h2>Installing Docker</h2>
+<h3>Mac and Windows: Docker Desktop (or alternatives)</h3>
+<p>Docker Desktop bundles the engine, CLI, Compose, BuildKit and a Linux VM with a GUI. Download it from docker.com. Note the licensing: it is free for personal use, education and small businesses, but larger companies need a paid subscription. Free alternatives include Colima (<code>brew install colima docker</code>, then <code>colima start</code>), Rancher Desktop and OrbStack.</p>
+<h3>Linux: Docker Engine</h3>
+<p>On Ubuntu or Debian, use Docker's official apt repository rather than the distribution's often outdated <code>docker.io</code> package. Follow the current steps at docs.docker.com/engine/install, which boil down to:</p>
+<pre><code># Convenience script (fine for dev machines, review before running)
+curl -fsSL https://get.docker.com -o get-docker.sh
+less get-docker.sh
+sudo sh get-docker.sh
+
+# Run docker without sudo (log out and back in afterwards)
+sudo usermod -aG docker $USER
+
+# Start at boot
+sudo systemctl enable --now docker</code></pre>
+<p>For production servers prefer the explicit apt repository setup so versions are pinned and auditable.</p>
+
+<h3>Verify</h3>
+<pre><code>docker version        # client AND server sections; if server is missing the daemon is down
+docker info           # storage driver (overlay2), cgroup version, runtimes
+docker run --rm hello-world</code></pre>
+<p><code>hello-world</code> exercises the full chain: CLI to daemon, daemon pulls the image from Docker Hub, containerd and runc run it, output streams back.</p>
+
+<h2>The core commands</h2>
+<h3>Run</h3>
+<pre><code>docker run nginx:1.27                      # foreground; Ctrl+C stops it
+docker run -d --name web -p 8080:80 nginx:1.27   # detached, named, publish port
+docker run -it --rm ubuntu:24.04 bash      # interactive shell, auto-remove on exit
+docker run -e APP_ENV=dev -v "$PWD":/app alpine ls /app</code></pre>
+<table>
+<tr><th>Flag</th><th>Meaning</th></tr>
+<tr><td><code>-d</code></td><td>Detached: run in background and print the container ID</td></tr>
+<tr><td><code>-it</code></td><td><code>-i</code> keep stdin open, <code>-t</code> allocate a terminal. Needed for interactive shells</td></tr>
+<tr><td><code>--name</code></td><td>Human name instead of a random one such as <code>quirky_turing</code></td></tr>
+<tr><td><code>-p host:container</code></td><td>Publish a port (see networking lesson)</td></tr>
+<tr><td><code>-e KEY=val</code></td><td>Set environment variable</td></tr>
+<tr><td><code>-v</code></td><td>Mount a volume or bind mount</td></tr>
+<tr><td><code>--rm</code></td><td>Delete the container when it exits; use for throwaway runs</td></tr>
+<tr><td><code>--restart unless-stopped</code></td><td>Restart policy after crashes or daemon restarts</td></tr>
+</table>
+
+<h3>Inspect and manage</h3>
+<pre><code>docker ps                 # running containers
+docker ps -a              # include stopped ones
+docker logs web           # stdout/stderr of the main process
+docker logs -f --tail 100 web   # follow, last 100 lines
+docker exec -it web sh    # open a shell in a running container
+docker exec web nginx -t  # run a one-off command
+docker stop web           # SIGTERM, then SIGKILL after 10s
+docker start web          # restart a stopped container (same filesystem state)
+docker restart web
+docker rm web             # delete a stopped container (-f to force a running one)
+docker images             # local images
+docker rmi nginx:1.27     # delete an image
+docker pull postgres:16   # download without running
+docker system df          # disk usage
+docker system prune       # remove stopped containers, dangling images, unused networks</code></pre>
+
+<div class="callout warn"><strong>stop vs. kill</strong><p><code>docker stop</code> sends SIGTERM and waits (default 10 seconds) so your app can shut down gracefully, then sends SIGKILL. If your container always takes exactly 10 seconds to stop, your process is ignoring SIGTERM, a classic sign that it is not PID 1-aware or that the shell form of CMD swallowed the signal. We fix that in the Dockerfile lesson.</p></div>
+
+<h3>The lifecycle</h3>
+<pre class="diagram">
+ image ──create──▶ Created ──start──▶ Running ──stop/exit──▶ Exited ──rm──▶ (gone)
+                                        │  ▲                  │
+                                        │  └─────start────────┘
+                                        └─pause/unpause─▶ Paused
+</pre>
+<p>Stopping does not delete. A stopped container keeps its writable layer until <code>docker rm</code>, which is why <code>docker ps -a</code> accumulates clutter if you forget <code>--rm</code>.</p>
+
+<h2>A first real example</h2>
+<pre><code>docker run -d --name web -p 8080:80 nginx:1.27
+curl -i http://localhost:8080          # nginx welcome page
+docker exec web cat /etc/nginx/nginx.conf | head
+docker logs web                        # see your curl request logged
+docker stop web &amp;&amp; docker rm web</code></pre>
+
+<h2>Alternatives to Docker</h2>
+<table>
+<tr><th>Tool</th><th>What it is</th><th>Notes</th></tr>
+<tr><td><strong>Podman</strong></td><td>Daemonless, rootless-by-default engine from Red Hat. Docker-compatible CLI.</td><td><code>alias docker=podman</code> works for most commands. Each container is a child of your shell, not a daemon. Supports pods and <code>podman compose</code>. Popular on RHEL/Fedora.</td></tr>
+<tr><td><strong>containerd + nerdctl</strong></td><td>containerd's own Docker-like CLI</td><td>Used in Kubernetes nodes; <code>nerdctl</code> gives a familiar UX.</td></tr>
+<tr><td><strong>CRI-O</strong></td><td>Minimal runtime built only for Kubernetes</td><td>Default in OpenShift.</td></tr>
+<tr><td><strong>Buildah / Kaniko / BuildKit</strong></td><td>Image builders</td><td>Build images without a privileged daemon, useful in CI.</td></tr>
+<tr><td><strong>Colima, OrbStack, Rancher Desktop</strong></td><td>Docker Desktop replacements on Mac</td><td>Provide the Linux VM and a Docker-compatible socket.</td></tr>
+</table>
+<div class="callout info"><strong>Kubernetes and Docker</strong><p>Kubernetes removed its built-in "dockershim" in v1.24. Clusters now talk to containerd or CRI-O directly. Your Docker-built images still run perfectly, because they are OCI images. Only the node-level runtime changed.</p></div>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>"Cannot connect to the Docker daemon"</strong>: daemon not running, or your user lacks socket permission.</li>
+<li><strong>Disk full</strong>: images and stopped containers pile up. Schedule <code>docker system prune</code> (with care; <code>-a</code> also deletes unused images).</li>
+<li><strong>Using <code>latest</code></strong>: unpredictable. Pin versions like <code>nginx:1.27</code>.</li>
+<li><strong>Apple Silicon surprises</strong>: pulling <code>amd64</code>-only images runs under slow emulation. Use <code>--platform linux/amd64</code> deliberately.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Install Docker and run <code>docker run --rm hello-world</code>. Read the explanatory output line by line.</li>
+<li>Start nginx as shown above on port 8080, curl it, view logs, then stop and remove it.</li>
+<li>Run <code>docker run -d --name t alpine sleep 300</code> then <code>time docker stop t</code>. Why did it take about 10 seconds? Repeat with <code>docker kill t</code>.</li>
+<li>Run <code>docker info | grep -i -E 'storage|cgroup|runtime'</code> and identify the pieces from the diagram.</li>
+</ol></div>

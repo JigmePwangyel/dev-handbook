@@ -1,0 +1,139 @@
+<h1>Filesystem and Permissions</h1>
+<p class="lead">Linux treats almost everything as a file and controls access with a simple owner/group/other permission model. Most "permission denied" errors, and a large share of security incidents, trace back to this lesson.</p>
+
+<h2>The filesystem hierarchy</h2>
+<p>Linux has one tree rooted at <code>/</code> (no drive letters). The Filesystem Hierarchy Standard (FHS) says what lives where, so you always know where to look.</p>
+<pre class="diagram">
+ /
+ ├── bin, sbin, lib  ─ essential programs/libs (often symlinks into /usr)
+ ├── etc/            ─ system-wide configuration (text files)
+ ├── home/alice      ─ users' personal files
+ ├── root/           ─ root's home
+ ├── var/
+ │   ├── log/        ─ logs
+ │   ├── lib/        ─ persistent app state (databases, docker)
+ │   └── www/        ─ conventional web content
+ ├── opt/            ─ self-contained third-party software
+ ├── srv/            ─ data served by this host
+ ├── usr/            ─ installed programs (usr/bin, usr/local)
+ ├── tmp/            ─ temporary files (cleared on reboot)
+ ├── dev/            ─ device files (/dev/null, /dev/sda)
+ ├── proc, sys/      ─ virtual: kernel and process info
+ └── run/            ─ runtime data (PID files, sockets)
+</pre>
+<table>
+<tr><th>Path</th><th>What you do there</th></tr>
+<tr><td><code>/etc</code></td><td>Edit configs: <code>/etc/nginx/</code>, <code>/etc/ssh/sshd_config</code>, <code>/etc/systemd/system/</code></td></tr>
+<tr><td><code>/var/log</code></td><td>Read logs</td></tr>
+<tr><td><code>/var/lib</code></td><td>Data that must survive (back it up)</td></tr>
+<tr><td><code>/opt</code> or <code>/srv</code></td><td>Put your deployed app, e.g. <code>/opt/myapp</code></td></tr>
+<tr><td><code>/tmp</code></td><td>Scratch; never store anything important</td></tr>
+<tr><td><code>/proc</code></td><td><code>cat /proc/cpuinfo</code>, <code>/proc/meminfo</code>: live kernel info</td></tr>
+</table>
+
+<h3>Disks and mounts</h3>
+<pre><code>df -h              # free space per mounted filesystem
+lsblk              # block devices and mount points
+mount | column -t  # what is mounted where
+du -sh /var/*      # size of each directory
+cat /etc/fstab     # filesystems mounted at boot</code></pre>
+<p>Adding a disk means formatting (<code>mkfs.ext4</code>), mounting it at a directory (<code>mount /dev/sdb1 /data</code>) and adding it to <code>/etc/fstab</code> (use the UUID from <code>blkid</code>) to persist across reboots. Running out of space, or of <em>inodes</em> (<code>df -i</code>), is a classic outage.</p>
+
+<h2>Users and groups</h2>
+<p>Every process and file belongs to a user (a number, the UID) and a group (GID). <strong>root</strong> (UID 0) bypasses all permission checks. Service accounts (<code>www-data</code>, <code>postgres</code>) exist so each daemon runs with minimal privileges: if nginx is compromised, the attacker is not root.</p>
+<pre><code>whoami; id               # uid=1000(deploy) gid=1000(deploy) groups=1000(deploy),27(sudo)
+cat /etc/passwd          # user list (name:x:uid:gid:comment:home:shell)
+cat /etc/group           # groups
+getent passwd deploy
+
+sudo adduser alice                  # interactive, creates home (Debian/Ubuntu)
+sudo useradd -m -s /bin/bash bob    # low-level, portable
+sudo usermod -aG docker alice       # ADD to group (-a is crucial; without it groups are replaced)
+sudo passwd -l bob                  # lock the password
+sudo userdel -r bob                 # delete user and home
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin myapp   # service account</code></pre>
+<div class="callout warn"><strong>Group membership needs a new login</strong><p>After <code>usermod -aG docker alice</code>, alice must log out and in (or <code>newgrp docker</code>). Also note: membership in <code>docker</code> is effectively root access.</p></div>
+
+<h2>Reading permissions</h2>
+<pre><code>$ ls -l
+-rwxr-xr--  1 deploy www-data  4096 Oct  5 10:12 deploy.sh
+drwxr-x---  2 deploy deploy    4096 Oct  5 10:10 secrets
+lrwxrwxrwx  1 deploy deploy      18 Oct  5 10:11 current -&gt; releases/v2</code></pre>
+<pre class="diagram">
+  - rwx r-x r--   deploy   www-data
+  │ │   │   │      │         └─ group owner
+  │ │   │   │      └─ user owner
+  │ │   │   └─ other (everyone else): r--
+  │ │   └─ group: r-x
+  │ └─ user (owner): rwx
+  └─ type: - file, d directory, l symlink
+</pre>
+<table>
+<tr><th>Bit</th><th>On a file</th><th>On a directory</th><th>Octal</th></tr>
+<tr><td><code>r</code></td><td>read contents</td><td>list names</td><td>4</td></tr>
+<tr><td><code>w</code></td><td>modify</td><td>create/delete/rename entries</td><td>2</td></tr>
+<tr><td><code>x</code></td><td>execute</td><td>enter (<code>cd</code>) and access items</td><td>1</td></tr>
+</table>
+<p>Add digits per class: <code>rwx</code> = 7, <code>r-x</code> = 5, <code>r--</code> = 4. So <code>rwxr-xr--</code> is <strong>754</strong>.</p>
+
+<h2>Changing permissions and ownership</h2>
+<pre><code>chmod 755 deploy.sh        # rwxr-xr-x   scripts, directories
+chmod 644 index.html       # rw-r--r--   normal files
+chmod 600 ~/.ssh/id_ed25519  # rw-------  private keys (ssh insists)
+chmod 700 ~/.ssh           # rwx------
+chmod +x script.sh         # symbolic: add execute
+chmod u+w,g-w,o-rwx file   # user add write, group remove write, other remove all
+chmod -R 750 /opt/myapp    # recursive (careful!)
+
+sudo chown deploy:www-data /opt/myapp -R   # owner and group
+sudo chgrp www-data /var/www/site</code></pre>
+<table>
+<tr><th>Mode</th><th>Typical use</th></tr>
+<tr><td>600</td><td>Private keys, secret env files</td></tr>
+<tr><td>640</td><td>Config readable by a service group</td></tr>
+<tr><td>644</td><td>Public files, most configs</td></tr>
+<tr><td>700 / 750</td><td>Private / group-shared directories</td></tr>
+<tr><td>755</td><td>Executables, public dirs</td></tr>
+<tr><td>777</td><td><strong>Almost never.</strong> Anyone can modify. A symptom of not understanding the real problem.</td></tr>
+</table>
+<div class="callout warn"><strong>Never chmod 777 to "fix" it</strong><p>When you hit "permission denied", find out <em>who</em> is running the process (<code>ps -o user,cmd -p PID</code>) and give that user or its group the minimal access needed. Check every directory on the path: you need <code>x</code> on each parent. <code>namei -l /path/to/file</code> shows the permissions along the entire path.</p></div>
+
+<h3>Special bits and umask</h3>
+<ul>
+<li><strong>setuid</strong> (<code>4755</code>): executable runs as its owner (how <code>sudo</code> and <code>passwd</code> work). Audit with <code>find / -perm -4000 2&gt;/dev/null</code>.</li>
+<li><strong>setgid on a directory</strong> (<code>2775</code>): new files inherit the directory's group; great for shared project folders.</li>
+<li><strong>sticky bit</strong> (<code>1777</code>, as on <code>/tmp</code>): users can delete only their own files.</li>
+<li><strong>umask</strong>: default mask subtracted from new files; <code>022</code> gives 644 files / 755 dirs, <code>077</code> gives private.</li>
+<li>ACLs (<code>setfacl -m u:alice:rx dir</code>) provide per-user rules beyond owner/group/other.</li>
+</ul>
+
+<h2>sudo: controlled root</h2>
+<p>Logging in as root is dangerous: no audit trail of who did what, and a typo has no guardrail. <code>sudo</code> runs one command with root rights, after your own password, and logs it (<code>/var/log/auth.log</code> or the journal).</p>
+<pre><code>sudo apt update           # one command as root
+sudo -i                   # root shell (use sparingly)
+sudo -u postgres psql     # run as another user
+sudo -l                   # what may I run?
+sudo visudo               # safely edit /etc/sudoers (syntax-checked)
+sudo visudo -f /etc/sudoers.d/deploy
+
+# /etc/sudoers.d/deploy : let the deploy user restart only one service, no password
+deploy ALL=(root) NOPASSWD: /bin/systemctl restart myapp, /bin/systemctl status myapp</code></pre>
+<p>Principle of least privilege: give people and services only what they need. Automation users get narrow sudo rules, not blanket <code>NOPASSWD: ALL</code>.</p>
+
+<h2>Putting it together: a deploy directory</h2>
+<pre><code>sudo useradd --system --home /opt/myapp --shell /usr/sbin/nologin myapp
+sudo mkdir -p /opt/myapp/releases /etc/myapp
+sudo chown -R deploy:myapp /opt/myapp      # deployer owns, app group reads
+sudo chmod -R 750 /opt/myapp
+sudo chmod 2770 /opt/myapp/releases        # setgid: new releases keep group myapp
+echo 'DATABASE_URL=...' | sudo tee /etc/myapp/env &gt;/dev/null
+sudo chown root:myapp /etc/myapp/env
+sudo chmod 640 /etc/myapp/env              # app can read secrets, others cannot</code></pre>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a user <code>alice</code>. As alice, try to read a file you made with mode 600 owned by you. Observe the error, then fix with a <em>group</em> and mode 640.</li>
+<li>Run <code>namei -l /etc/ssh/sshd_config</code> and explain each permission on the path.</li>
+<li>Make a shared directory <code>/srv/team</code> with setgid so files created by any member are group-writable by the group.</li>
+<li>Find the biggest consumer of disk in <code>/var</code> and check <code>df -i</code> for inode usage.</li>
+</ol></div>

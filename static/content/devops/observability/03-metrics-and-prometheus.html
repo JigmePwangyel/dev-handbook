@@ -1,0 +1,177 @@
+<h1>Metrics and Prometheus</h1>
+<p class="lead">Metrics are numbers sampled over time: requests per second, error ratio, memory in use, queue depth. They are tiny and cheap to store, which makes them the best signal for dashboards and alerts. Prometheus is the de facto open-source system for collecting and querying them.</p>
+
+<h2>Why metrics</h2>
+<p>Logs tell you about individual events; at 10,000 requests per second you cannot read them. Metrics <em>aggregate</em> at the source: the app keeps a counter and the monitoring system samples it every 15 seconds, so storage cost does not grow with traffic. Metrics answer "how is the system behaving overall, and is it changing?" Trends, comparisons with last week and thresholds all come naturally.</p>
+
+<h2>Metric types</h2>
+<table>
+<tr><th>Type</th><th>Behaviour</th><th>Examples</th><th>How you use it</th></tr>
+<tr><td><strong>Counter</strong></td><td>Only goes up (resets on restart)</td><td><code>http_requests_total</code>, <code>errors_total</code>, <code>bytes_sent_total</code></td><td>Always apply <code>rate()</code> to get per-second change</td></tr>
+<tr><td><strong>Gauge</strong></td><td>Goes up and down</td><td>memory in use, queue length, active connections, temperature</td><td>Graph directly; use <code>avg</code>, <code>max</code>, <code>delta</code></td></tr>
+<tr><td><strong>Histogram</strong></td><td>Counts observations in buckets (+ sum and count)</td><td><code>http_request_duration_seconds_bucket</code></td><td><code>histogram_quantile()</code> for percentiles, aggregatable across instances</td></tr>
+<tr><td><strong>Summary</strong></td><td>Client-side computed quantiles</td><td>rarely preferred</td><td>Cannot be aggregated across instances; prefer histograms</td></tr>
+</table>
+<div class="callout key"><strong>Averages lie, percentiles tell the truth</strong><p>If 99 requests take 100 ms and one takes 10 s, the mean is ~200 ms and looks fine, while 1% of users suffer. Track p50, p95, p99 using histograms. Choose bucket boundaries around your SLO thresholds (e.g. 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5 s).</p></div>
+
+<h2>Two methods: RED and USE</h2>
+<p>Do not invent metrics at random. Use proven checklists.</p>
+<h3>RED: for request-driven services (APIs, web apps)</h3>
+<ul>
+<li><strong>R</strong>ate: requests per second.</li>
+<li><strong>E</strong>rrors: failed requests per second (or ratio).</li>
+<li><strong>D</strong>uration: latency distribution (p50/p95/p99).</li>
+</ul>
+<h3>USE: for resources (CPU, memory, disk, network, connection pools)</h3>
+<ul>
+<li><strong>U</strong>tilisation: percent of time busy / capacity used.</li>
+<li><strong>S</strong>aturation: work waiting (run queue length, swap, queue depth).</li>
+<li><strong>E</strong>rrors: error counts (disk errors, packet drops).</li>
+</ul>
+<p>Google's variant for user-facing systems is the <strong>four golden signals</strong>: latency, traffic, errors and saturation. RED for services, USE for infrastructure, covers almost everything.</p>
+
+<h2>How Prometheus works</h2>
+<p>Prometheus uses a <strong>pull model</strong>: apps expose their current metric values over HTTP at <code>/metrics</code> in a simple text format, and the Prometheus server <em>scrapes</em> every target on an interval and stores the samples in its time-series database.</p>
+<pre class="diagram">
+  ┌────────────┐  GET /metrics   ┌──────────────────┐   ┌──────────────┐
+  │ your app   │◀────────────────│                  │──▶│ Grafana      │
+  └────────────┘                 │   Prometheus     │   │ (dashboards) │
+  ┌────────────┐                 │   server         │   └──────────────┘
+  │ node_exporter│◀──────────────│  scrape + TSDB   │   ┌──────────────┐
+  └────────────┘                 │  + rules         │──▶│ Alertmanager │──▶ Slack/PagerDuty
+  ┌────────────┐                 │                  │   └──────────────┘
+  │ postgres_exp│◀───────────────│                  │
+  └────────────┘                 └────────▲─────────┘
+        service discovery (K8s, EC2, Consul, static) ─┘
+</pre>
+<p>Why pull? Prometheus knows what targets <em>should</em> exist (service discovery), so a missing target is itself an alert (<code>up == 0</code>). You can scrape from your laptop to debug, and apps do no buffering or delivery logic. For short-lived batch jobs that cannot be scraped, there is the Pushgateway (use sparingly).</p>
+<p>The exposition format:</p>
+<pre><code># HELP http_requests_total Total HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/orders",status="200"} 10482
+http_requests_total{method="POST",route="/orders",status="500"} 17
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{route="/orders",le="0.1"} 9500
+http_request_duration_seconds_bucket{route="/orders",le="0.5"} 10300
+http_request_duration_seconds_bucket{route="/orders",le="+Inf"} 10482
+http_request_duration_seconds_sum{route="/orders"} 842.1
+http_request_duration_seconds_count{route="/orders"} 10482</code></pre>
+<p>Each unique combination of metric name plus labels is its own <strong>time series</strong>.</p>
+
+<h3>Instrumenting an app</h3>
+<pre><code># Python, prometheus_client
+from prometheus_client import Counter, Histogram, start_http_server
+REQS = Counter("http_requests_total", "Total requests", ["method", "route", "status"])
+LAT  = Histogram("http_request_duration_seconds", "Latency", ["route"],
+                 buckets=(.05, .1, .25, .5, 1, 2.5, 5))
+
+@app.route("/orders")
+def orders():
+    with LAT.labels("/orders").time():
+        ...
+    REQS.labels("GET", "/orders", "200").inc()
+
+start_http_server(9100)   # exposes /metrics</code></pre>
+
+<h3>Configuring the server</h3>
+<pre><code># prometheus.yml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files: ["alerts.yml"]
+alerting:
+  alertmanagers:
+    - static_configs: [{ targets: ["alertmanager:9093"] }]
+
+scrape_configs:
+  - job_name: web
+    static_configs:
+      - targets: ["web-1:9100", "web-2:9100"]
+  - job_name: node
+    static_configs:
+      - targets: ["web-1:9100", "db-1:9100"]
+  - job_name: k8s-pods            # discover pods annotated prometheus.io/scrape=true
+    kubernetes_sd_configs: [{ role: pod }]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"</code></pre>
+
+<h2>Exporters</h2>
+<p>Software you cannot modify (Linux, Postgres, Redis, nginx) is monitored by an <strong>exporter</strong>: a small sidecar process that queries the thing and exposes <code>/metrics</code>.</p>
+<table>
+<tr><th>Exporter</th><th>Gives you</th></tr>
+<tr><td><code>node_exporter</code></td><td>Host CPU, memory, disk, network, filesystem</td></tr>
+<tr><td><code>cAdvisor</code> / kubelet</td><td>Per-container resource usage</td></tr>
+<tr><td><code>kube-state-metrics</code></td><td>Kubernetes object state (pods pending, deployments unavailable)</td></tr>
+<tr><td><code>postgres_exporter</code>, <code>redis_exporter</code>, <code>mysqld_exporter</code></td><td>Database internals</td></tr>
+<tr><td><code>blackbox_exporter</code></td><td>Probe HTTP/TCP/ICMP endpoints from outside</td></tr>
+<tr><td><code>cloudwatch_exporter</code></td><td>Bring AWS metrics into Prometheus</td></tr>
+</table>
+
+<h2>PromQL by example</h2>
+<p>PromQL is the query language. Selectors use labels; range vectors like <code>[5m]</code> feed functions such as <code>rate()</code>.</p>
+<pre><code># Requests per second, per route, averaged over 5 minutes
+sum by (route) (rate(http_requests_total[5m]))
+
+# Error ratio (RED: errors) for the whole service
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+  /
+sum(rate(http_requests_total[5m]))
+
+# p95 latency per route (RED: duration) from a histogram
+histogram_quantile(0.95,
+  sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
+
+# Memory used % per host (USE: utilisation)
+100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+# CPU busy % per host
+100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100
+
+# Disk full in 4 hours? (linear prediction)
+predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[1h], 4*3600) &lt; 0
+
+# Which targets are down?
+up == 0
+
+# Top 5 busiest routes
+topk(5, sum by (route) (rate(http_requests_total[5m])))</code></pre>
+<p>Tip: always <code>rate()</code> a counter before aggregating, and <code>sum</code> <em>before</em> <code>histogram_quantile</code> (keeping the <code>le</code> label).</p>
+
+<h2>Dashboards with Grafana</h2>
+<p>Grafana queries Prometheus (and Loki, Tempo, CloudWatch, SQL...) and draws panels. Good dashboards are layered:</p>
+<ol>
+<li><strong>Service overview</strong>: RED panels at the top (rate, error %, p95/p99), then saturation (CPU, memory, pool usage), then dependencies. Deploy annotations overlaid.</li>
+<li><strong>Drill-down</strong>: per-instance, per-route, per-endpoint views using dashboard variables (<code>$service</code>, <code>$env</code>).</li>
+<li><strong>Infrastructure</strong>: node/K8s dashboards (import community dashboards, e.g. ID 1860 for Node Exporter Full).</li>
+</ol>
+<p>Store dashboards as code (JSON in git, Grafonnet, or Terraform's Grafana provider) so they are reviewed and reproducible. Put the most important graph top-left; label axes with units; avoid walls of 50 panels.</p>
+
+<h2>Cardinality: the cost trap</h2>
+<p>Each distinct label combination is a series held in memory. Label by <code>route</code>, <code>status</code> and <code>method</code> (dozens of values), never by <code>user_id</code>, <code>email</code>, full URLs with IDs, or request IDs (millions of values) — that will crash or bankrupt your Prometheus. Normalise paths (<code>/users/:id</code>, not <code>/users/12345</code>). Use logs/traces for high-cardinality detail.</p>
+
+<h2>Scaling and long-term storage</h2>
+<ul>
+<li>A single Prometheus handles millions of series and keeps ~15 days by default, on local disk. It is not clustered.</li>
+<li>For HA run two identical replicas scraping the same targets; for long-term storage and global views add <strong>Thanos</strong>, <strong>Grafana Mimir</strong>, <strong>Cortex</strong> or <strong>VictoriaMetrics</strong> via <code>remote_write</code>. Managed options: Amazon Managed Prometheus, Grafana Cloud.</li>
+<li>Use recording rules to precompute expensive queries used in dashboards and SLOs.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Graphing raw counters (they just climb); forgetting <code>rate()</code>.</li>
+<li>Using averages instead of histogram percentiles.</li>
+<li>Unbounded label values (cardinality explosions).</li>
+<li>Rate window shorter than 4x the scrape interval, causing gaps.</li>
+<li>Counting only successes: if failed requests never increment a metric because the code path threw before the instrumentation ran, your error rate is a lie. Instrument in middleware.</li>
+<li>Exposing <code>/metrics</code> publicly. Keep it internal.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run Prometheus + Grafana + node_exporter with Docker Compose. Build a "USE" dashboard for the host.</li>
+<li>Instrument a small HTTP service with a counter and histogram (use your language's Prometheus client or OpenTelemetry). Generate load with <code>hey</code> and write PromQL for request rate, error ratio and p95.</li>
+<li>Deliberately add a <code>user_id</code> label and watch the series count (<code>prometheus_tsdb_head_series</code>) explode, then remove it.</li>
+</ol></div>

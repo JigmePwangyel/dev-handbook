@@ -1,0 +1,123 @@
+<h1>Static vs Dynamic Hosting: What Goes Where</h1>
+<p class="lead">Before choosing tools, decide what kind of thing you are deploying. A pile of HTML and JavaScript files and a long-running server process have very different needs, costs and failure modes. Picking the simplest hosting that fits is the cheapest optimisation in DevOps.</p>
+
+<h2>Why this decision comes first</h2>
+<p>Many teams run a full server (OS patches, process manager, nginx, monitoring) to serve files that could be uploaded to a CDN for pennies with no servers to maintain. Others try to run a stateful, long-lived backend on a platform built only for static files and hit a wall. Match the hosting model to the workload.</p>
+
+<h2>Static content</h2>
+<p><strong>Static</strong> means the bytes served are the same for every user and exist before the request arrives: HTML, CSS, JS, images, PDFs. A server (if any) only reads files and returns them.</p>
+<p>Examples: a marketing site, documentation (like this one), a blog built with a static site generator (Hugo, Astro, Jekyll, Eleventy), and a single-page app (React, Vue, Angular) compiled to a <code>dist/</code> folder. An SPA is static hosting <em>plus</em> a separate API: the browser downloads files, then JavaScript calls the backend.</p>
+<pre class="diagram">
+ npm run build  ──▶  dist/  (index.html, assets/app.3f9c.js, ...)
+                       │ upload
+                       ▼
+                Object storage + CDN  (S3+CloudFront, Cloudflare Pages, Netlify, Vercel, GitHub Pages)
+                       ▲
+ Users ───────────────┘   served from the nearest edge. No server of yours is involved.
+</pre>
+<p>Why it is great: no servers to patch, nothing to crash, virtually infinite scale, global speed, very low cost (often free), and a tiny attack surface (no code executing on the server means nothing to exploit there).</p>
+
+<h2>Dynamic content</h2>
+<p><strong>Dynamic</strong> means code runs per request: reads a database, checks a session, calls other services, builds a response. REST/GraphQL APIs, server-rendered pages (Rails, Django, Laravel, Express with templates), WebSockets, background workers, cron jobs.</p>
+<p>Why it needs more: it needs a runtime, a process that stays up, secrets, a database, scaling for CPU/memory, deployments that do not drop requests, logging and monitoring. It is where most DevOps work lives.</p>
+
+<h2>The spectrum</h2>
+<p>Many sites live in between:</p>
+<table>
+<tr><th>Model</th><th>What it means</th><th>Example</th></tr>
+<tr><td>Pure static</td><td>Built once, files served as-is</td><td>Docs site, blog</td></tr>
+<tr><td>Static + API (JAMstack)</td><td>Static front-end calls APIs / third-party services</td><td>React SPA + Stripe + a backend</td></tr>
+<tr><td>Static generation with revalidation (ISR)</td><td>Pages pre-built, regenerated in the background</td><td>Next.js product catalogue</td></tr>
+<tr><td>Server-side rendering (SSR)</td><td>HTML produced on demand per request</td><td>Next.js/Nuxt/Remix app with personalised pages</td></tr>
+<tr><td>Classic dynamic app</td><td>Server + database process</td><td>Django, Rails, Express + Postgres</td></tr>
+<tr><td>Real-time / stateful</td><td>Persistent connections</td><td>Chat, multiplayer, collaboration</td></tr>
+<tr><td>Batch / event-driven</td><td>No HTTP; jobs on a schedule or queue</td><td>Image processing, emails, ETL</td></tr>
+</table>
+<p>A useful trick: <strong>make as much static as possible</strong>. A product page that changes hourly can be a cached or pre-rendered file, not a database query per visitor.</p>
+
+<h2>Where to host: the options</h2>
+<table>
+<tr><th>Option</th><th>Best for</th><th>You manage</th><th>Typical cost</th></tr>
+<tr><td><strong>Static hosts</strong>: GitHub Pages, Cloudflare Pages, Netlify, Vercel, S3+CloudFront, Firebase Hosting</td><td>Static sites and SPAs</td><td>Just your build output</td><td>Free to a few dollars</td></tr>
+<tr><td><strong>PaaS</strong>: Heroku, Render, Railway, Fly.io, DigitalOcean App Platform, Google Cloud Run, Azure App Service, AWS Elastic Beanstalk</td><td>Dynamic apps when you want to push code, not run servers</td><td>App + config; platform handles OS, TLS, scaling, rollouts</td><td>$5 to hundreds / month</td></tr>
+<tr><td><strong>Serverless functions</strong>: AWS Lambda, Cloudflare Workers, Vercel/Netlify Functions</td><td>Spiky, event-driven, small APIs</td><td>Function code; limits on runtime, cold starts</td><td>Pay per invocation; often tiny</td></tr>
+<tr><td><strong>VPS</strong> (virtual private server): DigitalOcean Droplet, Hetzner, Linode, Lightsail, EC2</td><td>Full control; predictable cost; learning</td><td>Everything: OS, patches, nginx, backups, monitoring</td><td>$4 to $40 / month for typical small apps</td></tr>
+<tr><td><strong>Containers on managed orchestration</strong>: ECS/Fargate, GKE, EKS, AKS</td><td>Many services, teams, scale</td><td>Images, cluster config</td><td>Higher; needs expertise</td></tr>
+<tr><td><strong>Bare metal / on-prem</strong></td><td>Special hardware, compliance, huge steady load</td><td>Everything, including hardware</td><td>Capex / colocation</td></tr>
+</table>
+
+<h3>Decision flow</h3>
+<pre class="diagram">
+ Does any code need to run on a server per request?
+   │
+   ├─ No ──▶ Static host + CDN.  Done.
+   │
+   └─ Yes ─▶ Need persistent connections, long jobs, or local state?
+               │
+               ├─ No, small/spiky  ──▶ Serverless functions (+ managed DB)
+               │
+               └─ Yes / typical web app
+                    │
+                    ├─ Small team, want speed of shipping ──▶ PaaS (Render, Fly, Cloud Run, Heroku)
+                    ├─ Want control / cheap / to learn    ──▶ VPS + nginx + systemd  (next lesson)
+                    └─ Many services, scale, platform team ──▶ Containers + Kubernetes/ECS
+</pre>
+
+<h2>Trade-offs in depth</h2>
+<h3>PaaS versus VPS</h3>
+<table>
+<tr><th></th><th>PaaS</th><th>VPS</th></tr>
+<tr><td>Time to first deploy</td><td>Minutes (<code>git push</code>)</td><td>An hour or more first time</td></tr>
+<tr><td>Ops burden</td><td>Low: patching, TLS, restarts handled</td><td>High: all yours</td></tr>
+<tr><td>Cost at small scale</td><td>Higher per unit of compute</td><td>Cheapest</td></tr>
+<tr><td>Cost at large scale</td><td>Can become very expensive</td><td>Cheaper, but engineer time counts</td></tr>
+<tr><td>Flexibility</td><td>Constrained by platform</td><td>Anything</td></tr>
+<tr><td>Lock-in</td><td>Some (platform-specific features); less if you use containers</td><td>Low</td></tr>
+<tr><td>Learning value</td><td>Hides the fundamentals</td><td>Teaches everything in this handbook</td></tr>
+</table>
+<p>Neither is "better". A common path: start on a PaaS, move to containers when you outgrow it. Learning on a VPS first makes every later abstraction understandable, which is why the next lesson is a full manual deployment.</p>
+
+<h3>Serverless</h3>
+<p>Pros: no idle cost, automatic scaling to zero and to thousands, no servers. Cons: cold-start latency, execution time limits, awkward with persistent database connections (use a pooler/proxy), harder local debugging, vendor-specific APIs, costs that can spike unpredictably under sustained high load.</p>
+
+<h2>Don't forget the supporting pieces</h2>
+<p>Whatever hosts the app, you also need decisions for:</p>
+<ul>
+<li><strong>Database</strong>: managed (RDS, Cloud SQL, Neon, Supabase, PlanetScale) versus self-run on the VPS. Managed gives backups and failover for a fee. Self-run is cheap but you own backups and recovery.</li>
+<li><strong>File uploads</strong>: object storage (S3), never the app server's local disk if you may ever run two servers.</li>
+<li><strong>Background jobs and cron</strong>: where does the worker run?</li>
+<li><strong>DNS, TLS, email sending, monitoring</strong>: each a separate service or setup.</li>
+</ul>
+
+<div class="callout tip"><strong>Rule of thumb</strong><p>Use the highest-level thing that meets your needs. Static host before PaaS, PaaS before VPS, VPS before Kubernetes, unless you have a concrete reason (cost, control, compliance, learning). Complexity is a cost you pay every day, not once.</p></div>
+
+<h2>Worked example: one product, three hosting choices</h2>
+<p>A SaaS has a marketing site, a React dashboard, a REST API with Postgres, and nightly report generation.</p>
+<table>
+<tr><th>Part</th><th>Hosting</th><th>Why</th></tr>
+<tr><td>Marketing site (Astro)</td><td>Cloudflare Pages</td><td>Static; free; global</td></tr>
+<tr><td>Dashboard (React SPA)</td><td>S3 + CloudFront or Netlify</td><td>Static files; calls the API</td></tr>
+<tr><td>API (Node/Express)</td><td>VPS or Cloud Run/Fly.io</td><td>Dynamic; needs process, secrets, DB access</td></tr>
+<tr><td>Postgres</td><td>Managed Postgres</td><td>Backups and failover handled</td></tr>
+<tr><td>Nightly reports</td><td>Scheduled job (cron on the VPS, or a Cloud Run job)</td><td>No HTTP needed</td></tr>
+</table>
+<p>Three kinds of hosting in one product is normal. The DNS records tie them together: <code>www</code> to the CDN, <code>app</code> to the SPA host, <code>api</code> to the server.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Running an SSR framework in "static export" mode and wondering why dynamic routes 404, or the reverse.</li>
+<li>SPA deep links returning 404 on refresh: static hosts need a rewrite of unknown paths to <code>index.html</code> (nginx <code>try_files</code>, Netlify <code>_redirects</code>, CloudFront custom error response).</li>
+<li>CORS: API and SPA on different origins need explicit CORS headers on the API.</li>
+<li>Putting secrets in front-end bundles. Anything shipped to the browser is public. API keys that must stay secret belong on a server or function.</li>
+<li>Running state (uploads, sessions, SQLite files) on ephemeral PaaS or serverless filesystems; it vanishes on restart.</li>
+<li>Choosing Kubernetes for a single app with ten users.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Take an existing project (or <code>npm create vite@latest</code>) and run the build. Look at the output folder: could any web server serve it as-is? That is a static deploy.</li>
+<li>Deploy that folder for free to GitHub Pages, Cloudflare Pages or Netlify. Note the URL, the TLS certificate and the response headers (<code>curl -I</code>).</li>
+<li>Test the SPA refresh problem: open a deep link, refresh, and add the rewrite rule your host needs.</li>
+<li>List the components of an app you work on. For each, classify static / dynamic / job / data and name the simplest hosting that could work.</li>
+<li>Compare the monthly cost of a $6 VPS, a PaaS tier running one small container, and a serverless function at 1 million requests. Which is cheapest at your real traffic?</li>
+</ol></div>

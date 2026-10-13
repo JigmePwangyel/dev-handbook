@@ -1,0 +1,143 @@
+<h1>Firewalls and Security Groups</h1>
+<p class="lead">The moment a server gets a public IP, automated scanners find it, usually within minutes. A firewall decides which network traffic is allowed in and out. The guiding principle is simple: expose only what must be exposed.</p>
+
+<h2>The problem</h2>
+<p>A default server may run SSH, a database, a metrics endpoint, and a debug port, all listening on every interface. Each open port is attack surface. Real incidents: Redis or MongoDB listening publicly with no password (instantly ransomed), Elasticsearch dumps leaking millions of records, SSH brute force. Many are not software bugs, only things that should never have been reachable.</p>
+<p>Firewalls enforce <strong>least exposure</strong>: deny everything by default, then allow specific ports from specific sources.</p>
+
+<h2>How packet filtering works</h2>
+<p>A firewall matches each packet (or connection) against an ordered rule list using source/destination IP, port and protocol, then ACCEPTs, DROPs (silently discard; scanner sees a timeout) or REJECTs (reply with an error; sees "refused").</p>
+<ul>
+<li><strong>Stateful</strong> firewalls track connections. If you allowed an outbound request, the reply is automatically allowed back in. Almost everything today (iptables conntrack, nftables, security groups) is stateful.</li>
+<li><strong>Stateless</strong> filters (AWS Network ACLs) evaluate each packet in isolation, so you must allow both directions including ephemeral return ports.</li>
+</ul>
+<p>Default policy matters most: <strong>default deny inbound, allow outbound</strong>.</p>
+
+<h2>Layers of defence</h2>
+<pre class="diagram">
+ Internet
+    │
+    ▼
+ [ CDN / WAF ]            filters HTTP attacks, absorbs DDoS
+    │
+ [ Cloud firewall ]       security groups / NACLs: outside the VM, cannot be disabled by an intruder on the box
+    │
+ [ Host firewall ]        ufw / nftables on the server itself
+    │
+ [ Service binding ]      app listens on 127.0.0.1 or private IP only
+    │
+ [ App authn/authz ]
+</pre>
+<p>Defence in depth: any single layer may be misconfigured; several rarely fail together.</p>
+
+<h2>ufw: the simple host firewall (Ubuntu)</h2>
+<p>ufw ("uncomplicated firewall") is a friendly front-end for the kernel's netfilter. Critical: <strong>allow SSH before enabling</strong>, or you lock yourself out of a remote machine.</p>
+<pre><code>sudo ufw status verbose
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+sudo ufw allow OpenSSH              # or: sudo ufw allow 22/tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw allow 443/udp              # HTTP/3
+
+# Restrict SSH to your office/home IP (better) and rate-limit brute force
+sudo ufw allow from 203.0.113.7 to any port 22 proto tcp
+sudo ufw limit 22/tcp               # alternative: throttle repeated connection attempts
+
+# Allow DB only from the app server's private IP
+sudo ufw allow from 10.0.1.11 to any port 5432 proto tcp
+
+sudo ufw enable
+sudo ufw status numbered
+sudo ufw delete 3                   # delete rule number 3</code></pre>
+<div class="callout warn"><strong>Docker bypasses ufw</strong><p>Docker inserts its own iptables rules for published ports (<code>-p 8080:80</code>), and they are evaluated before ufw's. A container published like that is reachable from the internet even though <code>ufw status</code> shows it denied. Bind to loopback instead (<code>-p 127.0.0.1:8080:80</code>), put a cloud security group in front, or manage rules in the <code>DOCKER-USER</code> chain.</p></div>
+
+<h2>iptables and nftables: the concept</h2>
+<p>Underneath ufw is the kernel's netfilter. iptables (older) and nftables (current default on modern distros; <code>iptables</code> is often a compatibility shim) organise rules into <strong>tables</strong> and <strong>chains</strong>. The main chains for a host: <code>INPUT</code> (to this machine), <code>OUTPUT</code> (from it), <code>FORWARD</code> (routed through it, e.g. container traffic). Rules are checked top to bottom; first match wins; then the chain's default policy applies.</p>
+<pre><code># Show rules
+sudo iptables -L -n -v --line-numbers
+
+# A minimal stateful ruleset (conceptual)
+sudo iptables -A INPUT -i lo -j ACCEPT
+sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 22  -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+sudo iptables -P INPUT DROP          # default policy: drop everything else</code></pre>
+<pre><code># nftables equivalent
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    iif lo accept
+    ct state established,related accept
+    tcp dport { 22, 80, 443 } accept
+  }
+}</code></pre>
+<p>Rules set with these commands vanish on reboot unless persisted (<code>netfilter-persistent</code>, or <code>/etc/nftables.conf</code>). Most people should use ufw/firewalld or cloud security groups and learn raw iptables only for debugging.</p>
+
+<h2>Cloud security groups</h2>
+<p>A <strong>security group</strong> (AWS; GCP calls them firewall rules, Azure NSGs) is a stateful firewall enforced by the hypervisor around each instance's network interface. You only write <em>allow</em> rules; anything not allowed is denied. Rules specify protocol, port range and a source: a CIDR <em>or another security group</em>.</p>
+<p>The security-group-as-source feature is the key to clean architecture:</p>
+<pre class="diagram">
+  0.0.0.0/0 ──443──▶ [ sg-alb ]
+                          │ 3000 (source: sg-alb)
+                          ▼
+                     [ sg-app ]
+                          │ 5432 (source: sg-app)
+                          ▼
+                     [ sg-db ]       no public IP at all, private subnet
+  Your IP/32 ──22──▶ bastion/SSM    (or use SSM Session Manager and open no SSH at all)
+</pre>
+<table>
+<tr><th>Group</th><th>Inbound rules</th></tr>
+<tr><td>sg-alb</td><td>TCP 80, 443 from 0.0.0.0/0 and ::/0</td></tr>
+<tr><td>sg-app</td><td>TCP 3000 from <code>sg-alb</code>; TCP 22 from your admin IP only</td></tr>
+<tr><td>sg-db</td><td>TCP 5432 from <code>sg-app</code>. Nothing else.</td></tr>
+</table>
+<p>Even if someone learns the database IP, the network will not let them connect. AWS CLI example:</p>
+<pre><code>aws ec2 authorize-security-group-ingress --group-id sg-0app \
+    --protocol tcp --port 3000 --source-group sg-0alb
+aws ec2 authorize-security-group-ingress --group-id sg-0app \
+    --protocol tcp --port 22 --cidr 203.0.113.7/32</code></pre>
+<p>Compare with <strong>Network ACLs</strong>: stateless, subnet-level, allow and deny rules, evaluated in numeric order. Use as a coarse second layer (for example to block a hostile CIDR); do most work in security groups.</p>
+
+<h2>Least exposure checklist</h2>
+<ol>
+<li><strong>Inventory</strong>: <code>sudo ss -tlnp</code> on every server. For each listener ask "does it need to exist, and for whom?"</li>
+<li><strong>Bind to localhost or a private IP</strong> when the only client is local or internal. Databases: <code>listen_addresses = 'localhost'</code> in Postgres unless remote access is required; Redis <code>bind 127.0.0.1</code> and <code>requirepass</code>.</li>
+<li><strong>Public ports: 80 and 443 only.</strong> Not 3000, not 5432, not 6379, not 9090 (Prometheus), not 2375 (Docker API, equivalent to root).</li>
+<li><strong>SSH</strong>: keys only, <code>PasswordAuthentication no</code>, <code>PermitRootLogin no</code>, restrict by source IP or use a VPN/bastion/SSM; optionally fail2ban.</li>
+<li><strong>Egress</strong>: allow outbound by default, but sensitive environments restrict it to limit data exfiltration and malware calling home.</li>
+<li><strong>Use private subnets</strong> for databases and internal services; use a NAT gateway for their outbound needs.</li>
+<li><strong>Audit regularly</strong>: security groups with <code>0.0.0.0/0</code> on anything but 80/443 deserve a ticket. Tools: AWS Config rules, Security Hub, Trivy/Prowler, <code>nmap</code>.</li>
+</ol>
+
+<h2>Verifying from the outside</h2>
+<pre><code># From a machine OUTSIDE your network: what does the world see?
+nmap -Pn -p 1-1000 your.server.ip           # scan only systems you own or are authorised to test
+nmap -Pn -p 22,80,443,3000,5432,6379 your.server.ip
+nc -zv -w 3 your.server.ip 5432             # expect timeout (dropped), not open
+
+# On the server: what is actually listening, and which rules are active?
+sudo ss -tlnp
+sudo ufw status verbose</code></pre>
+<p>Interpreting nmap states: <code>open</code> (something answered), <code>closed</code> (reachable host, nothing listening: RST), <code>filtered</code> (packets dropped by a firewall). A DROP policy yields <code>filtered</code>, which also slows scanners down.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Locking yourself out</strong> by enabling a firewall without an SSH rule. Cloud consoles can fix it; bare VPSs often need a recovery console. Keep a second session open while testing.</li>
+<li><strong>"Temporary" 0.0.0.0/0 rules</strong> that become permanent. Add a description and an owner to every rule.</li>
+<li><strong>Dynamic home IPs</strong> in SSH allow-lists: you get locked out when it changes. Use a VPN with a fixed address or SSM.</li>
+<li><strong>Forgetting IPv6</strong>: a rule for <code>0.0.0.0/0</code> but none for <code>::/0</code> (or vice versa), or ufw IPv6 disabled while the service listens on <code>::</code>.</li>
+<li><strong>Firewall as the only protection</strong>: services should still authenticate. Internal networks get breached too.</li>
+<li><strong>Debugging blind</strong>: dropped packets produce timeouts and no log. Enable VPC Flow Logs or <code>ufw logging on</code> to see rejects.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>On a throwaway Ubuntu VM or VPS, keep one SSH session open, then apply: <code>ufw default deny incoming</code>, <code>ufw allow OpenSSH</code>, <code>ufw allow 80,443/tcp</code>, <code>ufw enable</code>. Open a second SSH session to confirm you can still get in.</li>
+<li>Run <code>python3 -m http.server 8000</code> on the box. From your laptop, <code>curl</code> it: it should time out. Then <code>sudo ufw allow 8000/tcp</code> and retry. Remove the rule afterwards.</li>
+<li>From your laptop, run <code>nmap -Pn -p 22,80,443,8000,5432 SERVER_IP</code> before and after. Note the open/filtered states.</li>
+<li>In a cloud account, sketch the three security groups from this lesson and write the exact inbound rules. Which instances need a public IP? (Answer: only the load balancer, and possibly none other.)</li>
+<li>Run <code>sudo ss -tlnp</code> on a server you own and justify each listening port or close it.</li>
+</ol></div>

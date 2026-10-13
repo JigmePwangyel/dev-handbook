@@ -1,0 +1,155 @@
+<h1>Distributed Tracing</h1>
+<p class="lead">In a microservice system one user click may touch ten services. Metrics tell you the checkout is slow; logs from ten services are a haystack. A <strong>trace</strong> shows the whole journey of one request as a timeline, revealing exactly which hop spent the time or failed.</p>
+
+<h2>The problem tracing solves</h2>
+<p>Imagine <code>POST /checkout</code> takes 3 seconds. It calls Auth, Cart, Inventory, Pricing and Payments, which call databases and caches. Which one is slow? Without tracing you guess, add timing logs, redeploy, and repeat. With tracing you open one request and see:</p>
+<pre class="diagram">
+ trace_id = 4bf92f35...                                   total 1,240 ms
+ ├─ gateway  POST /checkout ███████████████████████████████████████ 1240
+ │  ├─ auth-svc  verify token  ██ 35
+ │  ├─ cart-svc  GET /cart     ████ 80
+ │  │   └─ redis GET cart:42   █ 3
+ │  ├─ inventory-svc reserve   ████████████████████████ 780   ◀── slow
+ │  │   ├─ postgres SELECT ... ███████████████████ 700           (missing index)
+ │  │   └─ postgres UPDATE ...  ██ 60
+ │  └─ payment-svc  charge     ███████ 290
+ │      └─ HTTPS stripe.com    ██████ 250
+</pre>
+<p>Instantly: the inventory query takes 700 ms. That is the value of tracing: causality and latency breakdown across process boundaries.</p>
+
+<h2>Core concepts</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><strong>Trace</strong></td><td>The complete path of one request through the system. Identified by a <code>trace_id</code>.</td></tr>
+<tr><td><strong>Span</strong></td><td>One timed unit of work (an HTTP handler, a DB query, an outgoing call). Has a <code>span_id</code>, a <code>parent_span_id</code>, start time, duration, status, name.</td></tr>
+<tr><td><strong>Attributes</strong></td><td>Key-value metadata on a span: <code>http.route</code>, <code>db.statement</code>, <code>user.tier</code>, <code>order.id</code>.</td></tr>
+<tr><td><strong>Events</strong></td><td>Timestamped notes inside a span (exceptions, "cache miss").</td></tr>
+<tr><td><strong>Span kind</strong></td><td>server, client, producer, consumer, internal.</td></tr>
+<tr><td><strong>Context propagation</strong></td><td>Passing trace identity across process boundaries so child spans join the same trace.</td></tr>
+<tr><td><strong>Sampling</strong></td><td>Deciding which traces to keep (full capture is expensive).</td></tr>
+</table>
+
+<h2>Context propagation: the magic ingredient</h2>
+<p>Spans in different services are linked only because the caller sends the trace identity to the callee, usually in an HTTP header. The W3C standard is <code>traceparent</code>:</p>
+<pre><code>traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  └──────── trace_id (16 bytes) ─┘ └─ parent span id ─┘ └ flags (01 = sampled)
+             version</code></pre>
+<pre class="diagram">
+ Service A                         Service B
+ start span A (id=a1)
+   │  outgoing HTTP call: adds header traceparent: ...trace=T...parent=a1
+   ├────────────────────────────▶ extract header ⇒ start span B with
+                                   trace=T, parent=a1
+                                   ... work ...
+   ◀──────────── response ───────  end span B
+ end span A
+ Both spans carry trace=T, so the backend assembles one tree.
+</pre>
+<p>Propagation must also cross <strong>async boundaries</strong>: put the context in message headers when publishing to Kafka/SQS/RabbitMQ and extract it in the consumer. Inside a process, instrumentation libraries carry context across threads/async tasks (Node's AsyncLocalStorage, Python contextvars, Go's <code>context.Context</code>). Any hop that drops the header breaks the trace into disconnected fragments.</p>
+
+<h2>OpenTelemetry (OTel)</h2>
+<p>OpenTelemetry is the CNCF standard for generating and shipping telemetry (traces, metrics, logs), with SDKs for every major language and a vendor-neutral wire protocol, <strong>OTLP</strong>. Instrument once; send to Jaeger, Tempo, Honeycomb, Datadog or anything else by changing config.</p>
+<pre class="diagram">
+ app + OTel SDK ──OTLP──▶ OTel Collector ──▶ Tempo / Jaeger  (traces)
+ (auto + manual           (receive, batch,  ├▶ Prometheus/Mimir (metrics)
+  instrumentation)         sample, enrich,  └▶ Loki (logs)
+                           route)
+</pre>
+<h3>Auto-instrumentation</h3>
+<p>Often you get 80% of the value with zero code: agents/libraries wrap popular frameworks and clients (HTTP servers, Express/Django/Spring, database drivers, gRPC, Redis) and create spans automatically.</p>
+<pre><code># Node.js
+npm i @opentelemetry/api @opentelemetry/auto-instrumentations-node
+export OTEL_SERVICE_NAME=checkout
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+export OTEL_TRACES_SAMPLER=parentbased_traceidratio
+export OTEL_TRACES_SAMPLER_ARG=0.1
+node --require @opentelemetry/auto-instrumentations-node/register server.js
+
+# Python
+pip install opentelemetry-distro opentelemetry-exporter-otlp
+opentelemetry-bootstrap -a install
+opentelemetry-instrument --service_name checkout python app.py
+
+# Java: attach the agent, no code changes
+java -javaagent:opentelemetry-javaagent.jar -Dotel.service.name=checkout -jar app.jar</code></pre>
+<h3>Manual spans for business logic</h3>
+<pre><code>import { trace, SpanStatusCode } from "@opentelemetry/api";
+const tracer = trace.getTracer("checkout");
+
+async function applyDiscounts(order) {
+  return tracer.startActiveSpan("applyDiscounts", async (span) =&gt; {
+    try {
+      span.setAttribute("order.id", order.id);
+      span.setAttribute("order.items", order.items.length);
+      const result = await pricing.compute(order);
+      span.addEvent("discounts computed", { count: result.length });
+      return result;
+    } catch (err) {
+      span.recordException(err);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}</code></pre>
+<p>Follow the <strong>semantic conventions</strong> for attribute names (<code>http.request.method</code>, <code>db.system</code>, <code>server.address</code>) so backends and dashboards understand your data.</p>
+
+<h3>The Collector</h3>
+<pre><code># otel-collector.yaml
+receivers:
+  otlp: { protocols: { grpc: {}, http: {} } }
+processors:
+  batch: {}
+  memory_limiter: { check_interval: 1s, limit_mib: 400 }
+exporters:
+  otlp/tempo: { endpoint: tempo:4317, tls: { insecure: true } }
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]</code></pre>
+<p>Running a Collector (as a sidecar, DaemonSet or gateway) decouples apps from backends and gives one place to batch, filter, redact and sample.</p>
+
+<h2>Backends</h2>
+<table>
+<tr><th>Backend</th><th>Notes</th></tr>
+<tr><td><strong>Jaeger</strong></td><td>CNCF project originally from Uber; mature UI for searching traces and dependency graph. Stores in Elasticsearch/Cassandra/ClickHouse (v2 is built on the OTel Collector).</td></tr>
+<tr><td><strong>Grafana Tempo</strong></td><td>Cheap object-storage backend, looks up by trace ID, queries with TraceQL, integrates tightly with Grafana, Loki and Prometheus (jump from metric exemplar or log line to trace).</td></tr>
+<tr><td><strong>Zipkin</strong></td><td>Older, simple; still common.</td></tr>
+<tr><td><strong>Hosted (Honeycomb, Datadog, New Relic, AWS X-Ray, Google Cloud Trace)</strong></td><td>Rich analysis and zero ops; usage-based pricing.</td></tr>
+</table>
+
+<h2>Sampling</h2>
+<p>Tracing every request at scale is costly in CPU, network and storage. Strategies:</p>
+<ul>
+<li><strong>Head sampling</strong>: decide at the start of the trace (e.g. keep 5%). Cheap and simple; but you may discard the rare slow or failing traces you most want. Use <em>parent-based</em> sampling so all services honour the root decision.</li>
+<li><strong>Tail sampling</strong>: the Collector buffers whole traces, then keeps 100% of errors and slow traces and a small percentage of the rest. Better data, more infrastructure.</li>
+<li><strong>Always sample</strong> low-volume critical flows (checkout).</li>
+</ul>
+
+<h2>Tying the pillars together</h2>
+<ul>
+<li>Inject <code>trace_id</code> and <code>span_id</code> into every log line, so from a trace you click to its logs (and the reverse).</li>
+<li>Attach <strong>exemplars</strong> (sample trace IDs) to histogram metrics, so from a latency spike on a graph you jump to a representative slow trace.</li>
+<li>Add the service <em>version</em> and deploy marker as attributes to spot regressions.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Broken propagation</strong>: a gateway, message queue or custom HTTP client that strips headers fragments traces. Test end to end.</li>
+<li><strong>Too many spans</strong> (a span per loop iteration) bloats cost and hides the signal. Span meaningful operations.</li>
+<li><strong>Sensitive data in attributes</strong>: SQL with values, request bodies, tokens. Scrub in the SDK or Collector.</li>
+<li><strong>High overhead from 100% sampling</strong> on hot paths.</li>
+<li><strong>Clock skew</strong> between hosts producing odd-looking timelines: run NTP/chrony.</li>
+<li><strong>Treating tracing as optional until an outage</strong>: roll it out gradually but early, starting with the edge services and the databases they call.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>docker run -p 16686:16686 -p 4317:4317 -p 4318:4318 jaegertracing/jaeger:latest</code> (or the <code>grafana/otel-lgtm</code> image).</li>
+<li>Auto-instrument two small services where A calls B over HTTP. Make B sleep 500 ms. Find the slow span in the UI.</li>
+<li>Confirm the <code>traceparent</code> header is sent by inspecting B's incoming request headers.</li>
+<li>Add <code>trace_id</code> to your structured logs and find a log line from a trace.</li>
+</ol></div>

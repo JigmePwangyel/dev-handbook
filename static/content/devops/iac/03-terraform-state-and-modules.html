@@ -1,0 +1,146 @@
+<h1>Terraform State, Modules and Environments</h1>
+<p class="lead">State is Terraform's memory: the map between your code and real cloud resources. Understanding it, storing it safely, splitting code into reusable modules and organising environments are what separate a demo from a team-ready setup.</p>
+
+<h2>What state is and why it exists</h2>
+<p>When you declare <code>aws_instance.web</code>, Terraform must know which actual instance (<code>i-0abc123</code>) that refers to, otherwise it cannot tell "update" from "create a second one". That mapping, plus a cache of attributes, lives in the <strong>state file</strong> (<code>terraform.tfstate</code>, JSON). Each plan: read config, read state, query the real world (refresh), diff.</p>
+<div class="callout warn"><strong>State is sensitive and precious</strong><p>It contains resource attributes in plain text, including database passwords and generated keys. Treat it like a secret. If it is lost, Terraform believes nothing exists and will try to create duplicates. Never commit it to git, never edit by hand (use <code>terraform state</code> commands), and never run two applies at once.</p></div>
+
+<h2>Remote backends and locking</h2>
+<p>A local state file works for one person. For a team you need shared state with <strong>locking</strong> (so two applies cannot collide), encryption and versioning. Configure a remote backend:</p>
+<pre><code>terraform {
+  backend "s3" {
+    bucket       = "acme-tf-state"
+    key          = "prod/network/terraform.tfstate"
+    region       = "eu-west-1"
+    encrypt      = true
+    use_lockfile = true          # native S3 locking (Terraform 1.10+); older setups used a DynamoDB table
+  }
+}</code></pre>
+<p>Create the bucket beforehand (turn on versioning so you can recover prior states, block public access, restrict IAM). Other backends: GCS, Azure Blob, Terraform Cloud / HCP Terraform, GitLab-managed state, Postgres. Run <code>terraform init -migrate-state</code> to move existing state to a new backend.</p>
+<p>Because state holds secrets, restrict who can read the bucket, and keep state per <em>component</em> (network, database, app) rather than one giant file, which limits blast radius and speeds up plans.</p>
+
+<h2>Inspecting and fixing state</h2>
+<pre><code>terraform state list
+terraform state show aws_instance.web
+terraform state mv aws_instance.web aws_instance.app     # rename without recreating
+terraform state rm aws_instance.legacy                   # stop managing, don't delete
+terraform force-unlock LOCK_ID                           # only if a crashed run left a lock
+
+# declarative rename in code (preferred, reviewable)
+moved {
+  from = aws_instance.web
+  to   = aws_instance.app
+}</code></pre>
+
+<h2>Importing existing infrastructure</h2>
+<p>For resources created by hand, bring them under management without recreating them. Modern syntax is an <code>import</code> block, which participates in plan:</p>
+<pre><code>import {
+  to = aws_s3_bucket.assets
+  id = "acme-assets-prod"
+}
+
+resource "aws_s3_bucket" "assets" {
+  bucket = "acme-assets-prod"
+}</code></pre>
+<pre><code>terraform plan -generate-config-out=generated.tf   # draft HCL for the imported resource
+terraform plan    # should end with "No changes" once your config matches reality
+terraform apply</code></pre>
+<p>Iterate until the plan shows no diff. Tools such as Terraformer or cloud-specific exporters help for large estates.</p>
+
+<h2>Drift</h2>
+<p><strong>Drift</strong> is when real infrastructure differs from state or code because someone changed it outside Terraform.</p>
+<pre><code>terraform plan -refresh-only      # show drift without proposing code changes
+terraform apply -refresh-only     # accept the real values into state
+terraform plan                    # normal plan: will propose reverting drift to match code</code></pre>
+<p>Run a scheduled plan in CI (nightly) and alert if the exit code with <code>-detailed-exitcode</code> is 2. Decide per case: revert (code wins) or back-port the manual change into code.</p>
+
+<h2>Modules</h2>
+<p>A module is a folder of <code>.tf</code> files with inputs (variables) and outputs. Every Terraform configuration is already a "root module"; you call child modules to avoid copy-paste: a VPC pattern, a "service with load balancer and DNS" pattern.</p>
+<pre class="diagram">
+ modules/
+ └── web_server/
+     ├── main.tf        resources
+     ├── variables.tf   inputs
+     └── outputs.tf     outputs
+ envs/prod/main.tf  ──calls──▶ module "web" { source = "../../modules/web_server" ... }
+</pre>
+<pre><code># modules/web_server/variables.tf
+variable "name"          { type = string }
+variable "instance_type" {
+  type    = string
+  default = "t3.micro"
+}
+variable "vpc_id"        { type = string }
+
+# modules/web_server/main.tf  (uses var.name etc; resources as in the previous lesson)
+resource "aws_instance" "this" { /* ... */ }
+
+# modules/web_server/outputs.tf
+output "public_ip" { value = aws_instance.this.public_ip }
+
+# caller
+module "web" {
+  source        = "../../modules/web_server"
+  name          = "shop-prod"
+  instance_type = "t3.large"
+  vpc_id        = module.network.vpc_id
+}
+
+output "web_ip" { value = module.web.public_ip }</code></pre>
+<p>Sources: local paths, git URLs with a version ref (<code>git::https://github.com/acme/tf-modules.git//web?ref=v1.4.0</code>), or the public registry (<code>source = "terraform-aws-modules/vpc/aws"</code>, <code>version = "~&gt; 5.0"</code>). Always version-pin remote modules.</p>
+<p>Good module design: small, focused, few required inputs with sensible defaults, outputs for everything callers might need, no provider configuration inside (pass providers in). Avoid wrapping a single resource in a module "just because"; the registry's community modules (VPC, EKS) are well tested and worth reusing.</p>
+
+<h2>Environments: workspaces vs directories</h2>
+<h3>Workspaces</h3>
+<pre><code>terraform workspace new staging
+terraform workspace select prod
+terraform workspace list
+# in code: terraform.workspace gives the name</code></pre>
+<p>Workspaces keep multiple state files for the <em>same</em> code and backend. They are easy but hide which environment you are in (a classic way to destroy production), and encourage environments that must be identical. Many teams avoid them for dev/staging/prod.</p>
+
+<h3>Directory per environment (common recommendation)</h3>
+<pre class="diagram">
+ infra/
+ ├── modules/                 reusable building blocks (versioned)
+ │   ├── network/
+ │   ├── database/
+ │   └── service/
+ └── live/
+     ├── dev/
+     │   ├── network/    main.tf, backend.tf, terraform.tfvars
+     │   └── app/
+     ├── staging/
+     │   ├── network/
+     │   └── app/
+     └── prod/
+         ├── network/
+         └── app/
+</pre>
+<p>Each folder has its own backend key and state, so a mistake in <code>dev/app</code> cannot touch <code>prod/network</code>. Modules carry the logic; environment folders contain only configuration (sizes, counts, names). Tools like Terragrunt reduce boilerplate by generating backend config and wiring dependencies between folders. Use separate cloud accounts or projects per environment for real isolation.</p>
+<table>
+<tr><th></th><th>Workspaces</th><th>Directories + modules</th></tr>
+<tr><td>Duplication</td><td>None</td><td>Some config repetition</td></tr>
+<tr><td>Safety</td><td>Easy to apply to wrong env</td><td>Explicit, path shows env</td></tr>
+<tr><td>Env differences</td><td>Awkward (conditionals)</td><td>Natural</td></tr>
+<tr><td>Blast radius</td><td>Shared code and backend</td><td>Isolated states</td></tr>
+</table>
+
+<h2>Sharing data between states</h2>
+<p>Components need each other's outputs (the app needs the VPC ID). Options: <code>terraform_remote_state</code> data source (reads another state's outputs, couples you to that backend), or look values up with provider data sources (<code>data "aws_vpc"</code> with tags), or publish values to a parameter store (SSM, Consul) for loose coupling. Prefer data sources and tags.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Committing <code>terraform.tfstate</code> to git, or storing it unencrypted.</li>
+<li>One giant state: plans take minutes and an error can block everyone.</li>
+<li>Manual <code>terraform state rm</code> followed by apply creates duplicates; understand what you are doing.</li>
+<li>Deleting the state bucket with <code>destroy</code> if the backend resource is in the same configuration. Bootstrap backends separately.</li>
+<li>Unpinned module versions, so an upstream change surprises you.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Move your example from the previous lesson to an S3 (or any) remote backend with <code>terraform init -migrate-state</code>.</li>
+<li>Extract the VM and security group into <code>modules/web_server</code> and call it twice with different names; use <code>moved</code> blocks to avoid recreating existing resources.</li>
+<li>Create a resource manually in the console, import it with an <code>import</code> block, and reach a clean plan.</li>
+<li>Change a tag in the console and observe it in <code>terraform plan -refresh-only</code>.</li>
+</ol></div>

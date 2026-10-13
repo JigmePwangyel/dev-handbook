@@ -1,0 +1,126 @@
+<h1>VPC and Cloud Networking</h1>
+<p class="lead">A Virtual Private Cloud is your own isolated slice of the provider's network. You decide the IP ranges, which machines face the internet, and which are hidden. Getting this layer right is the single biggest security and reliability decision in your cloud design.</p>
+
+<h2>Why networks matter</h2>
+<p>Without network isolation, every server would have a public IP and be reachable by anyone on the internet. Your database would be exposed to password-guessing bots within minutes. A VPC lets you build <strong>layers</strong>: only a load balancer is public; app servers accept traffic only from the load balancer; the database accepts traffic only from app servers. This is "defence in depth".</p>
+
+<h2>The building blocks</h2>
+<table>
+<tr><th>Component</th><th>What it is</th></tr>
+<tr><td><strong>VPC</strong></td><td>A private network defined by a CIDR block, e.g. <code>10.0.0.0/16</code> (65,536 addresses). Lives in one region.</td></tr>
+<tr><td><strong>Subnet</strong></td><td>A slice of the VPC CIDR (e.g. <code>10.0.1.0/24</code>) living in <em>one AZ</em>.</td></tr>
+<tr><td><strong>Route table</strong></td><td>Rules deciding where traffic from a subnet goes (destination CIDR to target).</td></tr>
+<tr><td><strong>Internet Gateway (IGW)</strong></td><td>Lets the VPC talk to the internet in both directions.</td></tr>
+<tr><td><strong>NAT Gateway</strong></td><td>Lets private instances start <em>outbound</em> connections (updates, APIs) but blocks inbound.</td></tr>
+<tr><td><strong>Security Group</strong></td><td>Stateful firewall attached to an instance/ENI.</td></tr>
+<tr><td><strong>Network ACL</strong></td><td>Stateless firewall at the subnet boundary.</td></tr>
+<tr><td><strong>VPC endpoint</strong></td><td>Private path to AWS services (S3, DynamoDB, ECR...) without leaving the AWS network.</td></tr>
+<tr><td><strong>Peering / Transit Gateway</strong></td><td>Connect VPCs to each other or to on-prem.</td></tr>
+</table>
+
+<h2>Public vs private subnets</h2>
+<p>There is no "public" checkbox on a subnet. A subnet is <strong>public</strong> simply because its route table has a route <code>0.0.0.0/0 → Internet Gateway</code> (and instances there have public IPs). A subnet is <strong>private</strong> if it has no route to the IGW. Private subnets typically route <code>0.0.0.0/0</code> to a NAT Gateway living in a public subnet.</p>
+<pre><code># Public subnet route table
+Destination      Target
+10.0.0.0/16      local
+0.0.0.0/0        igw-0abc...
+
+# Private subnet route table
+Destination      Target
+10.0.0.0/16      local
+0.0.0.0/0        nat-0def...   # outbound only</code></pre>
+
+<h2>Standard 3-tier VPC</h2>
+<pre class="diagram">
+                              Internet
+                                 │
+                          ┌──────┴──────┐
+                          │ Internet GW │
+                          └──────┬──────┘
+ ┌──────────────────────────── VPC 10.0.0.0/16 ───────────────────────────┐
+ │                                                                        │
+ │   AZ-a                                         AZ-b                    │
+ │  ┌────────────────────────┐        ┌────────────────────────┐          │
+ │  │ PUBLIC 10.0.1.0/24     │        │ PUBLIC 10.0.2.0/24     │          │
+ │  │  ALB node   NAT GW     │        │  ALB node   NAT GW     │          │
+ │  └───────────┬────────────┘        └───────────┬────────────┘          │
+ │              │ (SG: 443 from ALB only)         │                       │
+ │  ┌───────────▼────────────┐        ┌───────────▼────────────┐          │
+ │  │ PRIVATE-APP 10.0.11.0/24│       │ PRIVATE-APP 10.0.12.0/24│         │
+ │  │  app servers / tasks   │        │  app servers / tasks   │          │
+ │  └───────────┬────────────┘        └───────────┬────────────┘          │
+ │              │ (SG: 5432 from app SG only)     │                       │
+ │  ┌───────────▼────────────┐        ┌───────────▼────────────┐          │
+ │  │ PRIVATE-DB 10.0.21.0/24│        │ PRIVATE-DB 10.0.22.0/24│          │
+ │  │  RDS primary           │◀──────▶│  RDS standby           │          │
+ │  └────────────────────────┘        └────────────────────────┘          │
+ └────────────────────────────────────────────────────────────────────────┘
+</pre>
+<p>Tier 1 (public) holds only things that must be internet-facing. Tier 2 runs your code. Tier 3 holds data and has no route to the internet at all. Duplicating each tier across two AZs gives resilience.</p>
+
+<h2>Security groups vs NACLs</h2>
+<table>
+<tr><th></th><th>Security Group</th><th>Network ACL</th></tr>
+<tr><td>Applies to</td><td>Instance / network interface</td><td>Entire subnet</td></tr>
+<tr><td>State</td><td><strong>Stateful</strong>: replies automatically allowed</td><td><strong>Stateless</strong>: must allow return traffic explicitly (ephemeral ports)</td></tr>
+<tr><td>Rules</td><td>Allow only</td><td>Allow and deny, evaluated in number order</td></tr>
+<tr><td>Can reference</td><td>Other security groups</td><td>CIDR blocks only</td></tr>
+<tr><td>Typical use</td><td>Primary, day-to-day control</td><td>Coarse backstop, block abusive IP ranges</td></tr>
+</table>
+<p>The killer feature of security groups is referencing another group as the source. "The DB accepts 5432 from members of <code>sg-app</code>" keeps working as app servers come and go with changing IPs.</p>
+<pre><code># Terraform: DB security group that only trusts the app tier
+resource "aws_security_group" "db" {
+  name   = "db"
+  vpc_id = aws_vpc.main.id
+
+  ingress {
+    description     = "Postgres from app tier"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app.id]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}</code></pre>
+
+<h2>Reaching private machines</h2>
+<p>If servers have no public IP, how do you SSH in?</p>
+<ol>
+<li><strong>Bastion host (jump box)</strong>: a small hardened instance in a public subnet, SSH allowed only from your office IP. You hop <code>ssh -J ec2-user@bastion ec2-user@10.0.11.5</code>. Works but needs patching and key management.</li>
+<li><strong>SSM Session Manager</strong> (preferred on AWS): the instance has an IAM role and the SSM agent; you open a shell via <code>aws ssm start-session --target i-0123...</code>. No inbound ports, no keys, every session logged.</li>
+<li><strong>VPN / Zero-trust access</strong> (Client VPN, Tailscale, Cloudflare Access) for teams.</li>
+</ol>
+
+<h2>Planning CIDRs</h2>
+<ul>
+<li>Use RFC1918 ranges: <code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code>.</li>
+<li><strong>Do not overlap</strong> VPCs (or your office/on-prem) you might ever peer. Overlap cannot be fixed later without rebuilding.</li>
+<li>Give each VPC a roomy <code>/16</code>, subnets <code>/24</code> or larger. Reserve space for more tiers and AZs.</li>
+<li>Remember providers reserve a few addresses per subnet (AWS: 5).</li>
+</ul>
+
+<h2>Cost and pitfalls</h2>
+<div class="callout warn"><strong>NAT Gateways are a classic bill shock</strong><p>A NAT Gateway costs roughly $0.045/hour (~$32/month) <em>plus</em> about $0.045 per GB processed. Pulling container images or S3 data through NAT from private subnets burns money. Use <strong>VPC gateway endpoints for S3/DynamoDB (free)</strong> and interface endpoints for ECR, then check Cost Explorer.</p></div>
+<ul>
+<li><strong>0.0.0.0/0 on port 22 or a database port</strong>: the most common critical finding in audits.</li>
+<li><strong>Single AZ</strong>: one subnet per tier means an AZ outage takes you down.</li>
+<li><strong>Default VPC for production</strong>: its subnets are all public. Build your own.</li>
+<li><strong>Cross-AZ traffic is billed</strong> (~$0.01/GB each way). Chatty services across AZs add up.</li>
+<li>Forgetting that <strong>DNS names resolve to private IPs inside the VPC</strong>; use private hosted zones for internal service names.</li>
+</ul>
+
+<h2>GCP and Azure differences</h2>
+<p>GCP VPCs are global with regional subnets and firewall rules attached to the network by tags/service accounts; Cloud NAT provides outbound access. Azure uses VNets with subnets, Network Security Groups (NSGs, which combine SG and NACL ideas) and NAT Gateway. The 3-tier pattern is identical.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>In a sandbox account, build the diagram above with the VPC wizard or Terraform (<code>terraform-aws-modules/vpc/aws</code> makes this a 20-line module).</li>
+<li>Launch an instance in a private subnet with an SSM role and connect via Session Manager. Confirm <code>curl ifconfig.me</code> returns the NAT gateway's IP.</li>
+<li>Add an S3 gateway endpoint and watch how the route table changes.</li>
+<li>Try to connect to the DB port from your laptop. Why does it fail? Which layer blocks it?</li>
+</ol></div>

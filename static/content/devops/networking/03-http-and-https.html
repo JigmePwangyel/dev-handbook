@@ -1,0 +1,148 @@
+<h1>HTTP and HTTPS</h1>
+<p class="lead">HTTP is the language your app, browser, reverse proxy, load balancer and CDN all speak. Knowing it well turns mysterious 502s, stale caches and CORS errors into five-minute fixes.</p>
+
+<h2>Why learn the protocol and not just the framework</h2>
+<p>Frameworks hide HTTP. But in production the request passes through a CDN, a load balancer and nginx before reaching your code. Each hop reads and rewrites headers, enforces timeouts and returns its own errors. To debug, you must see the raw conversation.</p>
+
+<h2>Anatomy of a request and response</h2>
+<pre><code>GET /api/users/42?include=orders HTTP/1.1
+Host: api.example.com
+User-Agent: curl/8.7.1
+Accept: application/json
+Authorization: Bearer eyJhbGciOi...
+
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+Content-Length: 87
+Cache-Control: private, max-age=0
+ETag: "a1b2c3"
+
+{"id":42,"name":"Ada","orders":[]}</code></pre>
+<p>A request has a <strong>method</strong>, a <strong>path+query</strong>, <strong>headers</strong> and an optional <strong>body</strong>. A response has a <strong>status code</strong>, headers and a body. The <code>Host</code> header is how one IP address serves many sites (virtual hosting): nginx picks the config by it.</p>
+
+<h2>Methods</h2>
+<table>
+<tr><th>Method</th><th>Purpose</th><th>Safe</th><th>Idempotent</th></tr>
+<tr><td>GET</td><td>Read a resource</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>HEAD</td><td>Like GET, headers only (health checks)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>POST</td><td>Create / run an action</td><td>No</td><td>No</td></tr>
+<tr><td>PUT</td><td>Replace a resource</td><td>No</td><td>Yes</td></tr>
+<tr><td>PATCH</td><td>Partially modify</td><td>No</td><td>Not guaranteed</td></tr>
+<tr><td>DELETE</td><td>Remove</td><td>No</td><td>Yes</td></tr>
+<tr><td>OPTIONS</td><td>Capabilities; CORS preflight</td><td>Yes</td><td>Yes</td></tr>
+</table>
+<p>Idempotency matters operationally: a load balancer or client may <em>retry</em> idempotent requests automatically after a failure. A retried POST can double-charge a customer unless you use an idempotency key.</p>
+
+<h2>Status codes</h2>
+<table>
+<tr><th>Class</th><th>Code</th><th>Meaning and operational note</th></tr>
+<tr><td>2xx</td><td>200 OK, 201 Created, 204 No Content</td><td>Success</td></tr>
+<tr><td>3xx</td><td>301 / 308 permanent redirect, 302 / 307 temporary, 304 Not Modified</td><td>301/302 may change POST to GET; 307/308 preserve the method. 304 means "your cached copy is still valid".</td></tr>
+<tr><td>4xx</td><td>400 Bad Request, 401 Unauthenticated, 403 Forbidden, 404 Not Found, 409 Conflict, 413 Payload Too Large, 429 Too Many Requests</td><td>The client is at fault. A spike in 4xx after a deploy often means you broke an API contract.</td></tr>
+<tr><td>5xx</td><td>500 Internal Error, 502 Bad Gateway, 503 Service Unavailable, 504 Gateway Timeout</td><td>The server is at fault.</td></tr>
+</table>
+
+<div class="callout key"><strong>Decoding the gateway errors</strong><p><strong>502</strong>: the proxy reached the upstream but got garbage or the connection was refused/reset (your app crashed or is not listening). <strong>503</strong>: no healthy upstream, or the service is deliberately overloaded or in maintenance. <strong>504</strong>: the upstream accepted the request but did not answer in time (slow query, timeout too short). 502 and 504 are the proxy telling you the problem is behind it. Look at the app logs.</p></div>
+
+<h2>Important headers</h2>
+<table>
+<tr><th>Header</th><th>Direction</th><th>Why it matters</th></tr>
+<tr><td><code>Host</code></td><td>Req</td><td>Selects the virtual host</td></tr>
+<tr><td><code>Authorization</code>, <code>Cookie</code></td><td>Req</td><td>Credentials. Never log them.</td></tr>
+<tr><td><code>Content-Type</code></td><td>Both</td><td>Body format (<code>application/json</code>)</td></tr>
+<tr><td><code>Accept-Encoding</code> / <code>Content-Encoding</code></td><td>Req / Res</td><td>Compression: gzip, br (Brotli), zstd</td></tr>
+<tr><td><code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code>, <code>Forwarded</code></td><td>Req</td><td>Real client IP and original scheme behind proxies. Only trust them from your own proxy.</td></tr>
+<tr><td><code>Location</code></td><td>Res</td><td>Redirect target</td></tr>
+<tr><td><code>Set-Cookie</code></td><td>Res</td><td>Use <code>Secure; HttpOnly; SameSite=Lax</code></td></tr>
+<tr><td><code>Strict-Transport-Security</code></td><td>Res</td><td>HSTS: force HTTPS for a period</td></tr>
+<tr><td><code>Content-Security-Policy</code></td><td>Res</td><td>Restrict what scripts/resources run</td></tr>
+<tr><td><code>Access-Control-Allow-Origin</code></td><td>Res</td><td>CORS permission for browsers</td></tr>
+<tr><td><code>Retry-After</code></td><td>Res</td><td>With 429/503: when to try again</td></tr>
+</table>
+
+<h2>Caching headers</h2>
+<p>Caching is the cheapest performance and scalability feature you have. HTTP defines it precisely.</p>
+<pre><code># Immutable, fingerprinted assets (app.3f9c1a.js): cache a year, never revalidate
+Cache-Control: public, max-age=31536000, immutable
+
+# HTML pages: always check with the server, but allow cheap 304s
+Cache-Control: no-cache
+ETag: "v123"
+
+# Per-user API data: never store in shared caches (CDN)
+Cache-Control: private, no-store
+
+# Let CDN cache 60s, browser not at all
+Cache-Control: public, max-age=0, s-maxage=60
+
+# Serve stale while refreshing in the background
+Cache-Control: public, max-age=60, stale-while-revalidate=300</code></pre>
+<table>
+<tr><th>Directive</th><th>Meaning</th></tr>
+<tr><td><code>max-age=N</code></td><td>Fresh for N seconds in any cache</td></tr>
+<tr><td><code>s-maxage=N</code></td><td>Like max-age but only for shared caches (CDN, proxy)</td></tr>
+<tr><td><code>no-cache</code></td><td>May store, but must revalidate before each use (confusing name)</td></tr>
+<tr><td><code>no-store</code></td><td>Do not store at all</td></tr>
+<tr><td><code>public / private</code></td><td>Shared caches allowed / browser only</td></tr>
+<tr><td><code>immutable</code></td><td>Will never change; skip revalidation</td></tr>
+</table>
+<p><strong>Revalidation</strong>: the server sends <code>ETag: "abc"</code> (or <code>Last-Modified</code>). The client later sends <code>If-None-Match: "abc"</code>; if unchanged the server answers <code>304 Not Modified</code> with no body. <code>Vary: Accept-Encoding</code> tells caches the response differs per that request header; a wrong <code>Vary</code> causes serving the wrong variant.</p>
+<p>Best practice: fingerprint static file names with a content hash so they can be cached forever, and keep the HTML short-lived so a deploy takes effect immediately.</p>
+
+<h2>Connections: keep-alive, HTTP/1.1, HTTP/2, HTTP/3</h2>
+<p>A new TCP+TLS connection costs several round trips. <strong>Keep-alive</strong> (default in HTTP/1.1) reuses a connection for many requests. Between nginx and your app, enable upstream keep-alive too, or you pay connection setup on every proxied request.</p>
+<table>
+<tr><th>Version</th><th>Transport</th><th>Key ideas</th><th>Weakness</th></tr>
+<tr><td>HTTP/1.1</td><td>TCP</td><td>Text protocol, keep-alive, one request at a time per connection (browsers open ~6 connections)</td><td>Head-of-line blocking at HTTP level</td></tr>
+<tr><td>HTTP/2</td><td>TCP + TLS</td><td>Binary, multiplexed streams on one connection, header compression (HPACK)</td><td>One lost TCP packet stalls all streams</td></tr>
+<tr><td>HTTP/3</td><td>QUIC over UDP</td><td>Independent streams, faster handshake (1-RTT, 0-RTT resumption), connection migration (Wi-Fi to cellular)</td><td>UDP sometimes blocked; needs UDP 443 open</td></tr>
+</table>
+<p>Typically TLS terminates at the CDN/load balancer/nginx which speaks HTTP/2 or 3 to browsers and plain HTTP/1.1 to your app. Your app rarely needs to care. Browsers discover HTTP/3 via the <code>Alt-Svc</code> response header and fall back gracefully.</p>
+
+<h2>HTTPS in one paragraph</h2>
+<p>HTTPS is HTTP carried inside a TLS-encrypted connection. It provides confidentiality (no eavesdropping), integrity (no tampering) and authentication (you are talking to the real <code>example.com</code>). It is mandatory today: browsers mark HTTP as insecure, HTTP/2 in browsers requires it, and many browser APIs only work on secure origins. The next lesson covers how TLS works. Operationally:</p>
+<ul>
+<li>Redirect all HTTP to HTTPS (301/308).</li>
+<li>Send <code>Strict-Transport-Security: max-age=31536000; includeSubDomains</code> once you are confident (a mistake is sticky for the max-age).</li>
+<li>Mark cookies <code>Secure</code>.</li>
+<li>Avoid mixed content (an HTTPS page loading HTTP assets gets blocked).</li>
+</ul>
+
+<h2>Behind a proxy: the scheme and client IP problem</h2>
+<p>If TLS ends at nginx and your app sees plain HTTP from <code>127.0.0.1</code>, then <code>req.protocol</code> is <code>http</code> and <code>req.ip</code> is <code>127.0.0.1</code>. Redirect loops and wrong rate limiting follow. Fix: the proxy sets <code>X-Forwarded-*</code> and the app trusts exactly that proxy:</p>
+<pre><code>// Express
+app.set('trust proxy', 1);   // trust one hop (nginx). Don't use `true` blindly.
+// now req.ip is the real client IP and req.secure reflects X-Forwarded-Proto</code></pre>
+
+<h2>Timeouts</h2>
+<p>Every hop has them, and the smallest wins. Typical defaults: nginx <code>proxy_read_timeout</code> 60 s, AWS ALB idle timeout 60 s, Cloudflare 100 s. Long-running work (report generation, uploads) should return 202 Accepted and complete in a background job rather than hold a connection open. Make your app's keep-alive timeout <em>longer</em> than the load balancer's idle timeout, or you will see sporadic 502s when the app closes a connection the LB believes is still open (Node's <code>server.keepAliveTimeout</code> defaults to 5 s, a classic ALB 502 cause).</p>
+
+<h2>curl for HTTP debugging</h2>
+<pre><code>curl -i https://example.com/               # include response headers
+curl -I https://example.com/               # HEAD request only
+curl -v https://example.com/               # verbose: TLS, request, response
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' https://example.com/
+curl -X POST https://api.example.com/items \
+     -H 'Content-Type: application/json' -d '{"name":"widget"}'
+curl -L https://example.com/               # follow redirects
+curl --http2 -I https://example.com/       # force a protocol (also --http3 if built in)
+curl -H 'Accept-Encoding: gzip' -I https://example.com/   # check compression
+curl -I -H 'Origin: https://other.com' https://api.example.com/   # check CORS headers</code></pre>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Returning 200 with an error body, which breaks monitoring and retries. Use correct status codes.</li>
+<li>Using 301 for something you may change: browsers cache permanent redirects aggressively.</li>
+<li>Caching authenticated responses on a CDN. Always set <code>Cache-Control: private</code> or <code>no-store</code> for personalised data.</li>
+<li>Trusting <code>X-Forwarded-For</code> from the open internet: clients can forge it. Only accept it from your proxy.</li>
+<li>CORS is enforced by browsers, not servers; <code>curl</code> working does not mean the browser will.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>curl -v https://example.com/ 2&gt;&amp;1 | less</code>. Find the TLS version, the negotiated protocol (ALPN: h2), the status and the headers.</li>
+<li>Run <code>curl -I https://github.com/</code> and list the security and caching headers. Which have <code>max-age</code>?</li>
+<li>Fetch a static asset from a big site twice with <code>curl -I</code> and look for <code>Age</code>, <code>X-Cache</code> or <code>CF-Cache-Status</code> headers that reveal CDN caching.</li>
+<li>Test revalidation: take an <code>ETag</code> from a response and send <code>curl -I -H 'If-None-Match: "THE-ETAG"' URL</code>. Expect 304.</li>
+<li>Write a 10-line Express app that returns different <code>Cache-Control</code> headers on two routes and observe browser behaviour in DevTools (Network tab, "Disable cache" off).</li>
+</ol></div>

@@ -1,0 +1,234 @@
+<h1>Zero-Downtime Deploys and Rollbacks</h1>
+<p class="lead">Users should never notice you deployed, and when a release is bad, you should be able to undo it in seconds, not hours. Both goals come from the same few techniques: graceful shutdown, health checks, atomic switching of releases, and a rehearsed rollback plan.</p>
+
+<h2>Where downtime comes from</h2>
+<p>With <code>git pull &amp;&amp; npm ci &amp;&amp; systemctl restart myapp</code> on a live server:</p>
+<ul>
+<li><strong>The restart gap</strong>: the old process dies, the new one needs seconds to boot. Requests in that window get 502 from nginx.</li>
+<li><strong>Dropped in-flight requests</strong>: a request halfway through is cut off when the process is killed.</li>
+<li><strong>Half-updated code</strong>: while <code>git pull</code> and <code>npm ci</code> run, files on disk change under a running app; a lazy <code>require()</code> may load a new file against old ones.</li>
+<li><strong>Broken release, no way back</strong>: <code>npm ci</code> fails midway and <code>node_modules</code> is gone; the previous version no longer exists on disk.</li>
+<li><strong>Not ready, but receiving traffic</strong>: the new process is listening but still warming up its DB pool and caches.</li>
+</ul>
+<p>The fixes, in the order we will cover them: (1) shut down gracefully, (2) report readiness honestly, (3) build the new release next to the old one and switch atomically, (4) verify and roll back automatically.</p>
+
+<h2>1. Graceful shutdown</h2>
+<p>When a process manager or orchestrator stops your app it sends <strong>SIGTERM</strong>, waits a grace period, then <strong>SIGKILL</strong>. A well-behaved app on SIGTERM: stops accepting new connections, finishes in-flight requests, closes DB pools and queues, then exits 0.</p>
+<pre><code>const server = app.listen(port, '127.0.0.1');
+let shuttingDown = false;
+
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received: draining`);
+
+  // Fail readiness immediately so the LB stops sending new requests
+  // (health endpoint checks the `shuttingDown` flag)
+
+  server.close(async (err) =&gt; {          // stops accepting; waits for open connections to end
+    try {
+      await pool.end();                    // DB pool
+      await redis.quit();
+    } finally {
+      process.exit(err ? 1 : 0);
+    }
+  });
+  server.closeIdleConnections?.();         // Node 18.2+: drop idle keep-alive sockets now
+
+  // Hard deadline: never hang forever. Must be shorter than the manager's kill timeout.
+  setTimeout(() =&gt; { console.error('forced exit'); process.exit(1); }, 25_000).unref();
+}
+process.on('SIGTERM', () =&gt; shutdown('SIGTERM'));
+process.on('SIGINT',  () =&gt; shutdown('SIGINT'));
+
+app.get('/health/ready', (req, res) =&gt; res.status(shuttingDown ? 503 : 200).end());</code></pre>
+<p>Checklist: the manager's stop timeout (<code>TimeoutStopSec</code>, Kubernetes <code>terminationGracePeriodSeconds</code>, Docker <code>--stop-timeout</code>) must exceed your drain deadline, which must exceed your longest legitimate request. Run <code>node</code> directly, not via <code>npm start</code> or a shell wrapper that swallows signals. Long-lived WebSockets need an explicit "reconnect to another server" message, and background workers should finish or re-queue the current job.</p>
+<div class="callout tip"><strong>Kubernetes extra</strong><p>Pods are removed from Service endpoints asynchronously, so for a few seconds after SIGTERM they may still receive new requests. A <code>preStop</code> hook of <code>sleep 5</code> before the app starts draining prevents a burst of errors during rolling updates.</p></div>
+
+<h2>2. Health checks: liveness and readiness</h2>
+<table>
+<tr><th>Check</th><th>Question</th><th>Failure action</th><th>What to test</th></tr>
+<tr><td>Liveness</td><td>Is the process stuck beyond repair?</td><td>Restart it</td><td>Cheap: the event loop answers. Do not check dependencies, or a DB blip restarts every instance.</td></tr>
+<tr><td>Readiness</td><td>Can it serve traffic right now?</td><td>Remove from load balancer (do not restart)</td><td>DB reachable, migrations applied, caches warm, not shutting down</td></tr>
+<tr><td>Startup</td><td>Has it finished booting?</td><td>Wait; restart if too slow</td><td>Slow-starting apps (JVM)</td></tr>
+</table>
+<p>A deploy tool that waits for readiness before shifting traffic, and aborts if readiness is never reached, converts "deployed a broken build" from an outage into a failed deployment that users never saw.</p>
+
+<h2>3. Atomic releases with symlinks (the Capistrano pattern)</h2>
+<p>Instead of updating one directory in place, each deploy creates a <strong>new timestamped release directory</strong>, prepares it completely (install, build, migrate), and only then <strong>atomically repoints a <code>current</code> symlink</strong> to it. Switching a symlink is one atomic filesystem operation; there is never a half-updated state. Capistrano (Ruby) popularised this layout; Deployer (PHP), Mina, and many hand-rolled scripts use it.</p>
+<pre class="diagram">
+ /srv/myapp/
+ ├── releases/
+ │   ├── 20260610-101500-a1b2c3d/     ← old release (still on disk: instant rollback)
+ │   ├── 20260611-143000-e4f5a6b/     ← previous
+ │   └── 20260612-091200-c7d8e9f/     ← new, fully prepared BEFORE the switch
+ ├── shared/                           ← persists across releases
+ │   ├── .env  (or /etc/myapp/myapp.env)
+ │   ├── uploads/
+ │   └── logs/
+ └── current  ─────────▶ releases/20260612-091200-c7d8e9f      (symlink: the "switch")
+</pre>
+<p>Rules: code is immutable once released; anything that must persist (uploads, local files) lives in <code>shared/</code> and is symlinked in (better: object storage); keep the last N releases (3 to 5) and delete older ones.</p>
+
+<h3>A deploy script</h3>
+<pre><code>#!/usr/bin/env bash
+# /srv/myapp/deploy.sh  -  usage: ./deploy.sh [git-ref]      (run as the service user)
+set -euo pipefail
+
+APP=/srv/myapp
+REPO=git@github.com:you/myapp.git
+REF=${1:-main}
+KEEP=5
+HEALTH_URL=http://127.0.0.1:3000/health
+SERVICE=myapp
+
+TS=$(date +%Y%m%d-%H%M%S)
+RELEASE="$APP/releases/$TS"
+PREV=$(readlink -f "$APP/current" || true)
+
+log() { echo "[deploy $(date +%T)] $*"; }
+
+rollback_to_prev() {
+  if [ -n "$PREV" ] &amp;&amp; [ -d "$PREV" ]; then
+    log "ROLLING BACK to $PREV"
+    ln -sfn "$PREV" "$APP/current.tmp" &amp;&amp; mv -Tf "$APP/current.tmp" "$APP/current"
+    sudo systemctl restart "$SERVICE"
+  fi
+}
+
+mkdir -p "$APP/releases" "$APP/shared"
+
+log "cloning $REF into $RELEASE"
+git clone --depth 1 --branch "$REF" "$REPO" "$RELEASE"
+SHA=$(git -C "$RELEASE" rev-parse --short HEAD)
+rm -rf "$RELEASE/.git"
+echo "$SHA" &gt; "$RELEASE/REVISION"
+
+log "installing dependencies"
+( cd "$RELEASE" &amp;&amp; npm ci --omit=dev )
+# ( cd "$RELEASE" &amp;&amp; npm ci &amp;&amp; npm run build &amp;&amp; npm prune --omit=dev )   # if you build
+
+log "linking shared files"
+ln -sfn "$APP/shared/uploads" "$RELEASE/uploads"
+
+log "running migrations (must be backward compatible!)"
+( cd "$RELEASE" &amp;&amp; set -a &amp;&amp; . /etc/myapp/myapp.env &amp;&amp; set +a &amp;&amp; npm run migrate )
+
+log "switching current -&gt; $RELEASE"
+ln -sfn "$RELEASE" "$APP/current.tmp"
+mv -Tf "$APP/current.tmp" "$APP/current"          # atomic rename: no moment without a valid current
+
+log "restarting service"
+sudo systemctl restart "$SERVICE"                 # or: pm2 reload / HUP / start new then drain
+
+log "health check"
+ok=0
+for i in $(seq 1 30); do
+  if curl -fsS --max-time 2 "$HEALTH_URL" &gt;/dev/null; then ok=1; break; fi
+  sleep 1
+done
+if [ "$ok" -ne 1 ]; then
+  log "health check FAILED"
+  rollback_to_prev
+  exit 1
+fi
+
+log "cleaning old releases (keep $KEEP)"
+ls -1dt "$APP"/releases/* | tail -n +$((KEEP+1)) | xargs -r rm -rf
+
+log "deployed $SHA"</code></pre>
+<p>The unit file uses <code>WorkingDirectory=/srv/myapp/current</code>. The sudoers file allows only <code>systemctl restart myapp</code> without a password for the deploy user (<code>%deploy ALL=(root) NOPASSWD: /bin/systemctl restart myapp</code>). Two details: <code>ln -sfn</code> alone is <em>not</em> atomic (it unlinks then creates), so create the symlink under a temp name and <code>mv -T</code> (rename) over <code>current</code>, as above. And a plain <code>systemctl restart</code> still has a short gap; the next section removes it.</p>
+
+<h3>Closing the restart gap</h3>
+<table>
+<tr><th>Technique</th><th>How</th></tr>
+<tr><td>PM2 cluster <code>reload</code></td><td>Starts new workers, waits for ready, then stops old ones, one at a time</td></tr>
+<tr><td>Two instances behind nginx</td><td>Restart A (nginx sends traffic to B, via <code>proxy_next_upstream</code> or health marks), then restart B</td></tr>
+<tr><td>Blue-green ports</td><td>New release on 3001 while old runs on 3000. Health check 3001, switch nginx upstream, <code>nginx -s reload</code>, drain and stop old</td></tr>
+<tr><td>Socket activation / Unix socket handoff</td><td>systemd holds the listening socket during the restart so connections queue instead of failing (advanced)</td></tr>
+<tr><td>Orchestrator rolling update</td><td>Docker Swarm, Kubernetes, ECS: handled for you with readiness probes</td></tr>
+</table>
+<pre><code># Blue-green on one box (sketch): the nginx include file selects the live port
+#   /etc/nginx/conf.d/active_upstream.conf  contains:  server 127.0.0.1:3000;
+new_port=3001
+start_new_release_on_port $new_port
+wait_until_healthy "http://127.0.0.1:$new_port/health"
+echo "server 127.0.0.1:$new_port;" | sudo tee /etc/nginx/conf.d/active_upstream.conf
+sudo nginx -t &amp;&amp; sudo nginx -s reload      # graceful: old workers finish their requests
+stop_old_release_gracefully                     # SIGTERM; it drains and exits</code></pre>
+
+<h2>4. Rollback plans</h2>
+<p>A rollback is not a failure; it is a feature you must have designed <em>before</em> you need it at 2 a.m. under stress.</p>
+<h3>Rollback script</h3>
+<pre><code>#!/usr/bin/env bash
+# /srv/myapp/rollback.sh  - switch to the previous release
+set -euo pipefail
+APP=/srv/myapp
+CUR=$(readlink -f "$APP/current")
+PREV=$(ls -1dt "$APP"/releases/* | grep -vxF "$CUR" | head -n1)
+[ -n "$PREV" ] || { echo "no previous release"; exit 1; }
+
+echo "rolling back: $(basename "$CUR") -&gt; $(basename "$PREV")"
+ln -sfn "$PREV" "$APP/current.tmp"
+mv -Tf "$APP/current.tmp" "$APP/current"
+sudo systemctl restart myapp
+for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/health &gt;/dev/null &amp;&amp; { echo "healthy"; exit 0; }; sleep 1; done
+echo "rollback unhealthy!"; exit 1</code></pre>
+<p>It takes seconds because the previous release is still on disk with its dependencies installed. Compare with "git revert, rebuild, reinstall, restart" taking 5 to 15 minutes while customers are failing.</p>
+
+<h3>What can and cannot be rolled back</h3>
+<table>
+<tr><th>Thing</th><th>Rollback</th></tr>
+<tr><td>Application code</td><td>Easy: switch symlink / previous image tag / previous Kubernetes ReplicaSet (<code>kubectl rollout undo deployment/myapp</code>)</td></tr>
+<tr><td>Configuration and flags</td><td>Easy if versioned; hard if edited by hand on servers with no record</td></tr>
+<tr><td>Database schema</td><td>Only if backward compatible (expand/contract). Rolling the code back must work against the new schema.</td></tr>
+<tr><td>Data written by the new version</td><td>Cannot be un-written. Plan data fixes; take a backup/snapshot before risky releases.</td></tr>
+<tr><td>External side effects (emails sent, payments made)</td><td>Impossible. Feature-flag risky behaviour so it can be switched off.</td></tr>
+</table>
+<p>Because of the last rows, "roll forward" (ship a quick fix) is sometimes the right answer when the change is a data migration or the bad release has been live for hours with new data. Decide the policy beforehand: <strong>default to rollback when the problem started with the deploy; roll forward only when rollback is unsafe or the fix is trivial and certain.</strong></p>
+
+<h3>A rollback runbook</h3>
+<ol>
+<li><strong>Detect</strong>: error rate, latency, failing smoke test, alerts, user reports. Compare timing with the deploy time.</li>
+<li><strong>Decide fast</strong>: if in doubt, roll back first, investigate afterwards. Set a rule such as "error rate above X for 5 minutes after deploy triggers rollback".</li>
+<li><strong>Execute</strong>: <code>./rollback.sh</code> or the platform's equivalent. Announce in the incident channel.</li>
+<li><strong>Verify</strong>: health, error rate, key user journey. Confirm the version running (<code>/health</code> returns the git SHA).</li>
+<li><strong>Freeze</strong> further deploys until the cause is understood. Then write up a short post-mortem.</li>
+</ol>
+<p>Automate steps 1 to 3 where you can: pipelines that run smoke tests after the switch and roll back on failure, Kubernetes <code>progressDeadlineSeconds</code> plus automated undo, Argo Rollouts or Flagger analysis, AWS CodeDeploy alarms.</p>
+
+<h2>Putting it together</h2>
+<pre class="diagram">
+ build immutable artifact ──▶ run migrations (backward compatible) ──▶ start new release beside old
+        │                                                                   │
+        │                                                           readiness check passes?
+        │                                                             │ yes            │ no
+        │                                                             ▼                ▼
+        │                                                  shift traffic / flip symlink   abort, old keeps serving
+        │                                                             │
+        │                                                  old instances SIGTERM → drain → exit
+        │                                                             │
+        └──────────────────────  smoke tests + metrics watch ◀────────┘
+                                         │ regression? ──▶ rollback (previous release still ready)
+</pre>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Health endpoint returns 200 before the app is actually ready (no DB connection yet), so the deploy "passes" and users get errors.</li>
+<li>Shutdown deadline longer than the manager's kill timeout: SIGKILL arrives mid-drain.</li>
+<li>Keeping uploads or SQLite files inside the release directory; they vanish on the next deploy. Put them in <code>shared/</code> or object storage.</li>
+<li>Deleting old releases too eagerly (rollback target gone) or not at all (disk full).</li>
+<li>Rollback never rehearsed: the script rots, or depends on a tool missing on the server. Practise in staging.</li>
+<li>Releases that cannot run against the previous schema, making rollback impossible.</li>
+<li>Build on the server taking minutes and consuming CPU; prefer building once in CI and shipping the artifact, so what you tested is what runs.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Add the SIGTERM handler to a small Express app with a route that sleeps 10 seconds. Start a request with <code>curl</code>, then <code>kill -TERM</code> the process: the request should still complete. Remove the handler and see it fail.</li>
+<li>Measure downtime of the naive approach: <code>while true; do curl -s -o /dev/null -w '%{http_code}\n' localhost:3000/health; sleep 0.1; done | sort | uniq -c</code> in one terminal while running <code>systemctl restart</code> in another. Count the non-200s.</li>
+<li>Set up the <code>releases/</code> + <code>current</code> layout and the deploy and rollback scripts (clone from a local bare repo if you have no remote). Deploy three versions, then roll back.</li>
+<li>Deliberately ship a version whose <code>/health</code> returns 500 and confirm the script rolls back by itself.</li>
+<li>Repeat the downtime measurement using the two-port blue-green nginx switch and compare.</li>
+<li>Write the rollback runbook for your own app: who decides, what command, how you verify, and what cannot be undone.</li>
+</ol></div>

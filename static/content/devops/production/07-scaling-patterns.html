@@ -1,0 +1,116 @@
+<h1>Scaling Patterns</h1>
+<p class="lead">Scaling means keeping latency and error rates acceptable as load grows. There is no single trick; there is a toolbox, and a rule: measure first, then apply the cheapest pattern that removes the actual bottleneck. This lesson walks through the toolbox from cheap to expensive.</p>
+
+<h2>Vertical vs horizontal</h2>
+<table>
+<tr><th></th><th>Vertical (scale up)</th><th>Horizontal (scale out)</th></tr>
+<tr><td>How</td><td>Bigger machine</td><td>More machines behind a load balancer</td></tr>
+<tr><td>Pros</td><td>No code changes, simplest</td><td>No hard ceiling, resilient to node failure</td></tr>
+<tr><td>Cons</td><td>Ceiling, downtime to resize, single point of failure</td><td>Requires stateless design (12-factor), more moving parts</td></tr>
+</table>
+<p>Scale up first while it is cheap (a bigger instance is far less work than a distributed system), but design the app stateless so scaling out stays possible.</p>
+
+<h2>The request path and where to relieve it</h2>
+<pre class="diagram">
+ User ─▶ CDN ─▶ Load balancer ─▶ App (stateless) ─▶ Cache (Redis) ─▶ DB primary
+  ▲        │                          │                              └▶ DB read replicas
+  │ edge   │ static + cacheable       └▶ Queue ─▶ Workers (async, slow work)
+  └ cache hit returns here; the closer to the user, the cheaper
+</pre>
+
+<h2>1. Caching layers</h2>
+<p>The fastest request is one you never serve. Layer caches from the edge inward:</p>
+<table>
+<tr><th>Layer</th><th>Example</th><th>Notes</th></tr>
+<tr><td>Browser</td><td><code>Cache-Control: max-age=31536000, immutable</code> on hashed assets</td><td>Free; use content-hashed filenames</td></tr>
+<tr><td>CDN</td><td>Cloudflare, CloudFront, Fastly</td><td>Static files and cacheable API/HTML responses</td></tr>
+<tr><td>Reverse proxy</td><td>nginx <code>proxy_cache</code>, Varnish</td><td>Micro-caching (1-5s) can absorb spikes</td></tr>
+<tr><td>Application</td><td>Redis/Memcached cache-aside</td><td>Query results, rendered fragments</td></tr>
+<tr><td>Database</td><td>Buffer cache, materialized views</td><td>Precompute expensive aggregates</td></tr>
+</table>
+<p>Every cache adds an invalidation problem. Use TTLs, version keys (<code>product:v3:42</code>) and stale-while-revalidate (<code>Cache-Control: max-age=60, stale-while-revalidate=300</code>) to make staleness a conscious, bounded choice.</p>
+
+<h2>2. CDN</h2>
+<p>A CDN caches content at edge locations near users, cutting latency and shielding your origin. Beyond static assets it provides TLS termination, DDoS absorption and a WAF. Tips:</p>
+<ul>
+<li>Cache by URL; avoid putting per-user data in cacheable responses (<code>Vary</code> and <code>Set-Cookie</code> can accidentally disable or poison the cache).</li>
+<li>Purge by tag or version the URL instead of purging everything.</li>
+<li>Lock the origin so it only accepts traffic from the CDN, otherwise attackers bypass it.</li>
+</ul>
+
+<h2>3. Queues and workers: async processing</h2>
+<p>Do only what the user must wait for inside the request. Everything else (sending email, resizing images, generating PDFs, webhooks, syncing to third parties) goes on a queue and is handled by workers.</p>
+<pre class="diagram">
+ POST /orders ─▶ API: validate, write order, enqueue "send_receipt" ─▶ 202/201 in 40 ms
+                                         │
+                                  [ queue: SQS / RabbitMQ / Redis (BullMQ) / Kafka ]
+                                         │
+                              worker pool (scale independently) ─▶ email provider
+</pre>
+<pre><code>// producer
+await queue.add('send_receipt', { orderId }, { attempts: 5, backoff: { type: 'exponential', delay: 2000 } });
+// consumer
+new Worker('default', async job =&gt; sendReceipt(job.data.orderId), { concurrency: 10 });</code></pre>
+<p>Rules for reliable async work:</p>
+<ul>
+<li><strong>At-least-once delivery is the norm</strong>, so jobs must be <strong>idempotent</strong> (processing twice has the same effect as once). Use an idempotency key or a "processed" record.</li>
+<li>Retry with exponential backoff and jitter; after N attempts send to a <strong>dead-letter queue</strong> and alert.</li>
+<li>Write the DB row and enqueue atomically, using the <em>transactional outbox</em> pattern, or you lose jobs when one succeeds and the other fails.</li>
+<li>Autoscale workers on <strong>queue depth / age of oldest message</strong>, not CPU (KEDA does this on Kubernetes).</li>
+</ul>
+
+<h2>4. Read replicas</h2>
+<p>Most apps are read-heavy. Route reports, search and list pages to async replicas (see the databases lesson), mindful of replication lag. Replicas scale reads only; writes still go to one primary.</p>
+
+<h2>5. Sharding: the last resort</h2>
+<p>When a single primary cannot handle write volume or dataset size, you split data across multiple databases by a <strong>shard key</strong> (for example <code>tenant_id</code> or hash of <code>user_id</code>).</p>
+<table>
+<tr><th>Strategy</th><th>How</th><th>Trade-off</th></tr>
+<tr><td>Range</td><td>Users A-M on shard 1</td><td>Hot spots if data is skewed</td></tr>
+<tr><td>Hash</td><td><code>hash(id) % N</code> or consistent hashing</td><td>Even spread; range queries and resharding are harder</td></tr>
+<tr><td>Directory / tenant</td><td>Lookup table maps tenant to shard</td><td>Flexible; extra lookup</td></tr>
+</table>
+<p>Costs: cross-shard joins and transactions become hard or impossible, resharding is painful, operations multiply. Before sharding try: better indexes, partitioning (<code>PARTITION BY</code>, single node), archiving old data, bigger hardware, or a distributed SQL database (CockroachDB, Citus, Vitess, Aurora Limitless) that does it for you.</p>
+
+<h2>6. Rate limiting and load shedding</h2>
+<p>Capacity is finite. Decide who gets served when demand exceeds it, rather than letting everyone fail equally.</p>
+<ul>
+<li><strong>Rate limiting</strong> caps requests per client/key/IP. Algorithms: fixed window (simple, bursty at edges), sliding window, <strong>token bucket</strong> (allows bursts, most popular), leaky bucket.</li>
+<li>Return <code>429 Too Many Requests</code> and <code>Retry-After</code>; expose limits in headers.</li>
+<li>Use a shared store (Redis) so limits hold across replicas.</li>
+</ul>
+<pre><code>-- Redis fixed-window counter (atomic via Lua or INCR+EXPIRE)
+INCR rl:user:42:2026-10-05T10:21
+EXPIRE rl:user:42:2026-10-05T10:21 60
+-- if value &gt; 100 -&gt; 429</code></pre>
+
+<h2>7. Backpressure</h2>
+<p>Backpressure is a downstream system telling upstream "slow down" instead of silently buffering until it dies. Without it, a slow database causes app threads to pile up, memory balloons, timeouts trigger retries, retries add load, and you get a <em>retry storm</em> (metastable failure).</p>
+<ul>
+<li><strong>Bounded queues</strong>: reject or drop when full instead of growing without limit.</li>
+<li><strong>Timeouts everywhere</strong>: every outbound call has a deadline shorter than the caller's.</li>
+<li><strong>Retries with budgets</strong>: exponential backoff, jitter, cap on total retries.</li>
+<li><strong>Circuit breakers</strong>: stop calling a failing dependency for a cool-off period and fail fast.</li>
+<li><strong>Load shedding</strong>: return 503 early when overloaded and protect the critical paths (checkout over recommendations).</li>
+<li><strong>Autoscaling lag</strong>: new instances take minutes; queue and shed in the meantime.</li>
+</ul>
+
+<h2>Choosing a pattern</h2>
+<table>
+<tr><th>Symptom</th><th>Likely first move</th></tr>
+<tr><td>High TTFB for static assets worldwide</td><td>CDN, compression, HTTP/2/3</td></tr>
+<tr><td>DB CPU high on repeated identical queries</td><td>Cache-aside, fix N+1</td></tr>
+<tr><td>Requests slow because of email/PDF/API calls</td><td>Queue + workers</td></tr>
+<tr><td>DB CPU high, mostly SELECTs of varied queries</td><td>Indexes, read replicas</td></tr>
+<tr><td>Primary write-saturated</td><td>Batch writes, partitioning, bigger instance, then sharding</td></tr>
+<tr><td>Traffic spikes/abuse</td><td>Rate limits, autoscaling, shedding</td></tr>
+</table>
+
+<div class="callout tip"><strong>Premature scaling is its own failure</strong><p>A single well-indexed Postgres on a decent instance with a CDN in front serves a startling amount of traffic. Add complexity when metrics demand it, and keep the system simple enough that you can explain it in five minutes.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Add <code>proxy_cache</code> with a 5-second TTL to an nginx in front of a slow endpoint and compare p95 latency under load.</li>
+<li>Build a tiny queue worker (BullMQ or Celery) where a job randomly fails; confirm retries, backoff and a dead-letter path work and that the job is idempotent.</li>
+<li>Implement a token-bucket limiter in Redis and demonstrate 429 responses with <code>hey</code> or <code>k6</code>.</li>
+</ol></div>

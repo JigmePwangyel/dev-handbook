@@ -1,0 +1,302 @@
+<h1>GitHub Actions</h1>
+<p class="lead">GitHub Actions is the CI/CD system built into GitHub. Workflows are YAML files in your repo, triggered by repository events, executed on hosted or self-hosted runners. It is the most widely used CI system today; this lesson goes from concepts to a complete Node app pipeline that tests, builds and pushes a Docker image, and deploys over SSH.</p>
+
+<h2>Core concepts</h2>
+<pre class="diagram">
+ Event (push, pull_request, schedule, workflow_dispatch, release ...)
+        │ triggers
+        ▼
+ Workflow  (.github/workflows/ci.yml)
+   ├─ Job A  ── runs-on: ubuntu-latest ──▶ Runner VM #1
+   │    ├─ Step 1: uses: actions/checkout@v4        (reusable Action)
+   │    ├─ Step 2: run: npm ci                       (shell command)
+   │    └─ Step 3: run: npm test
+   └─ Job B  (needs: A) ── Runner VM #2 ...
+</pre>
+<table>
+<tr><th>Concept</th><th>Meaning</th></tr>
+<tr><td>Workflow</td><td>A YAML file under <code>.github/workflows/</code>. A repo can have many.</td></tr>
+<tr><td>Event</td><td>What triggers it: <code>push</code>, <code>pull_request</code>, <code>schedule</code>, <code>workflow_dispatch</code> (manual), <code>release</code>, <code>workflow_call</code> (reusable), etc.</td></tr>
+<tr><td>Job</td><td>A set of steps on one runner. Jobs run in parallel unless <code>needs</code> orders them.</td></tr>
+<tr><td>Step</td><td>Either <code>run:</code> (a shell command) or <code>uses:</code> (an action). Steps share the runner's filesystem.</td></tr>
+<tr><td>Action</td><td>A reusable unit (JavaScript, Docker or composite) from the Marketplace or your own repo.</td></tr>
+<tr><td>Runner</td><td>The machine executing a job: GitHub-hosted (<code>ubuntu-latest</code>, <code>windows-latest</code>, <code>macos-latest</code>, ARM variants) or self-hosted.</td></tr>
+<tr><td>Context / expressions</td><td><code>${{ github.sha }}</code>, <code>${{ secrets.X }}</code>, <code>${{ matrix.node }}</code>, <code>${{ needs.build.outputs.tag }}</code></td></tr>
+</table>
+
+<h2>Part 1: Continuous integration for a Node app</h2>
+<p>Save as <code>.github/workflows/ci.yml</code>.</p>
+<pre><code>name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# least privilege: the default token can only read the repo
+permissions:
+  contents: read
+
+# cancel older runs of the same PR/branch when a new commit arrives
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm                       # caches ~/.npm keyed by package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false                     # let all matrix legs finish
+      matrix:
+        node: [20, 22]                     # run on two Node versions
+    services:
+      postgres:                            # real DB for integration tests
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: app_test
+        ports: ["5432:5432"]
+        options: &gt;-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:test@localhost:5432/app_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --coverage
+      - uses: actions/upload-artifact@v4   # keep the report for download/inspection
+        if: always()                       # even when tests fail
+        with:
+          name: coverage-node${{ matrix.node }}
+          path: coverage/
+          retention-days: 7
+</code></pre>
+<p>Key points: <code>permissions</code> narrows the automatic <code>GITHUB_TOKEN</code>; <code>concurrency</code> saves minutes; <code>services</code> starts sidecar containers on the runner; <code>if: always()</code> runs the step regardless of earlier failures; the matrix creates two independent jobs.</p>
+
+<h2>Part 2: Build and push a Docker image</h2>
+<p>Save as <code>.github/workflows/release.yml</code>. It runs only on main after CI passes (via a shared trigger) and publishes to GitHub Container Registry (GHCR).</p>
+<pre><code>name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:                       # manual re-run / redeploy
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false                # never cancel a deploy mid-flight; queue instead
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}  # e.g. ghcr.io/acme/shop
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml       # reuse CI (needs "on: workflow_call" in ci.yml)
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write                      # needed to push to GHCR
+    outputs:
+      tag: ${{ steps.meta.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta                           # computes tags and labels
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha             # reuse layers between runs
+          cache-to: type=gha,mode=max
+          provenance: true                 # attach build provenance attestation
+</code></pre>
+<p>To use <code>uses: ./.github/workflows/ci.yml</code> as a reusable workflow, add <code>workflow_call:</code> under <code>on:</code> in <code>ci.yml</code>. The image gets an immutable <code>sha-&lt;40-char&gt;</code> tag; <code>latest</code> is a convenience pointer only, never what you deploy.</p>
+
+<h2>Part 3: Deploy over SSH with an approval gate</h2>
+<p>Append this job to <code>release.yml</code>. It targets a GitHub <strong>environment</strong> named <code>production</code>.</p>
+<pre><code>  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: production                     # applies protection rules + environment secrets
+      url: https://shop.example.com
+    steps:
+      - name: Set up SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}   # output of: ssh-keyscan host
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" &gt; ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" &gt; ~/.ssh/known_hosts
+
+      - name: Deploy image by digest
+        env:
+          HOST: ${{ vars.DEPLOY_HOST }}
+          IMAGE_REF: ${{ env.IMAGE }}@${{ needs.build.outputs.digest }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 deploy@"$HOST" bash -s -- "$IMAGE_REF" &lt;&lt;'EOF'
+            set -euo pipefail
+            IMAGE_REF="$1"
+            cd /opt/shop
+            echo "IMAGE=$IMAGE_REF" &gt; .env.deploy
+            docker pull "$IMAGE_REF"
+            docker compose --env-file .env.deploy up -d --remove-orphans
+          EOF
+
+      - name: Smoke test
+        run: |
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS https://shop.example.com/healthz; then exit 0; fi
+            sleep 10
+          done
+          echo "Health check failed" &gt;&amp;2
+          exit 1
+</code></pre>
+<p>Notes: the server's <code>docker-compose.yml</code> would reference <code>image: ${IMAGE}</code>; the private key lives in an <strong>environment secret</strong>, not repository-wide; the server user <code>deploy</code> should have only the rights it needs; deploying by <strong>digest</strong> guarantees you run exactly what was built. Using <code>known_hosts</code> instead of disabling host key checking prevents man-in-the-middle attacks.</p>
+
+<h2>Environments and approvals</h2>
+<p>In <em>Settings &gt; Environments</em> create <code>staging</code> and <code>production</code>. For <code>production</code> configure:</p>
+<ul>
+<li><strong>Required reviewers:</strong> the job pauses until one of them approves in the UI.</li>
+<li><strong>Wait timer:</strong> optional delay before deploy.</li>
+<li><strong>Deployment branches:</strong> only <code>main</code> (and tags) may deploy here.</li>
+<li><strong>Environment secrets and variables:</strong> scoped to jobs that reference the environment; only released after approval.</li>
+</ul>
+<p>The Deployments tab then gives a history of what version went where and who approved.</p>
+
+<h2>Concurrency, caching and artifacts</h2>
+<ul>
+<li><code>concurrency.group</code> ensures only one run per group; <code>cancel-in-progress: true</code> for CI, <code>false</code> for deploys.</li>
+<li><code>actions/cache</code> (or the <code>cache:</code> input of setup actions) restores directories by key. Entries unused for 7 days are evicted and each repo has a size cap (10 GB by default); never rely on it for correctness.</li>
+<li><code>upload-artifact</code> / <code>download-artifact</code> pass files between jobs and attach them to the run. Set <code>retention-days</code>.</li>
+<li><strong>Job outputs</strong> pass small strings (<code>needs.build.outputs.digest</code>); use artifacts for files.</li>
+</ul>
+
+<h2>Reusable workflows and composite actions</h2>
+<p>Stop copy-pasting pipelines across repos. A <strong>reusable workflow</strong> is a full workflow with <code>on: workflow_call</code>, called by other workflows:</p>
+<pre><code># in acme/platform-workflows/.github/workflows/node-ci.yml
+on:
+  workflow_call:
+    inputs:
+      node-version: {type: string, default: "22"}
+    secrets:
+      NPM_TOKEN: {required: false}
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: "${{ inputs.node-version }}", cache: npm}
+      - run: npm ci &amp;&amp; npm test
+
+# in a service repo
+jobs:
+  ci:
+    uses: acme/platform-workflows/.github/workflows/node-ci.yml@v2
+    with: {node-version: "20"}
+    secrets: inherit</code></pre>
+<p>A <strong>composite action</strong> (<code>action.yml</code> with <code>runs: using: composite</code>) bundles several steps into one reusable step. Use reusable workflows for whole jobs, composite actions for step sequences.</p>
+
+<h2>OIDC to the cloud: no long-lived keys</h2>
+<p>Instead of storing AWS keys as secrets, let the workflow prove its identity with a short-lived OpenID Connect token that the cloud exchanges for temporary credentials.</p>
+<pre><code>permissions:
+  id-token: write        # allow requesting the OIDC token
+  contents: read
+
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/gha-deploy
+      aws-region: eu-west-1
+  - run: aws sts get-caller-identity</code></pre>
+<p>On the AWS side the role's trust policy restricts the token's <code>sub</code> claim, for example to <code>repo:acme/shop:environment:production</code>, so only that repo and environment can assume it. The same pattern works with GCP Workload Identity Federation and Azure federated credentials. See the secrets lesson for details.</p>
+
+<h2>Other useful features</h2>
+<ul>
+<li><strong>Path filters:</strong> <code>on.push.paths: ['src/**', 'package*.json']</code> skips irrelevant runs.</li>
+<li><strong>Conditionals:</strong> <code>if: github.ref == 'refs/heads/main'</code>, <code>if: failure()</code>.</li>
+<li><strong>Schedules:</strong> <code>on.schedule: [{cron: '0 3 * * *'}]</code> (UTC).</li>
+<li><strong>Dependabot</strong> keeps actions and dependencies updated via PRs.</li>
+<li><strong>Job summaries:</strong> write Markdown to <code>$GITHUB_STEP_SUMMARY</code>.</li>
+<li><strong>Self-hosted runners / ARC:</strong> run on your own machines or Kubernetes (Actions Runner Controller) for private networking and cost control.</li>
+<li><strong>Debugging:</strong> re-run with debug logging; use <code>act</code> to run workflows locally (approximate).</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Using <code>pull_request_target</code> with untrusted code checkout</strong>: it runs with secrets and write token on code from forks. A classic supply-chain hole. Use <code>pull_request</code> for untrusted code.</li>
+<li><strong>Script injection:</strong> never interpolate untrusted values (<code>${{ github.event.pull_request.title }}</code>) directly into <code>run:</code>. Pass them via <code>env:</code> and quote.</li>
+<li><strong>Unpinned third-party actions:</strong> <code>@main</code> or even <code>@v3</code> tags can be moved. Pin to a full commit SHA for anything non-trivial.</li>
+<li><strong>Over-broad <code>GITHUB_TOKEN</code> permissions.</strong> Declare <code>permissions</code> explicitly.</li>
+<li><strong>Cache poisoning / stale caches</strong> and cache used as artifact store.</li>
+<li><strong>Secrets in logs:</strong> secrets are masked, but transformed values (base64, substrings) may not be.</li>
+<li><strong>YAML gotchas:</strong> <code>on</code> and numeric versions: write <code>node-version: "22"</code> quoted so <code>20.10</code> is not parsed as <code>20.1</code>.</li>
+<li>Hosted-runner minutes are billed (free tier for public repos); long matrices on macOS cost multiples of Linux.</li>
+</ul>
+
+<div class="callout tip"><strong>Validate before you push</strong><p>Use <code>actionlint</code> (a linter for workflow files) locally or in CI. It catches expression typos, bad <code>needs</code> references and shell issues in <code>run:</code> blocks.</p></div>
+
+<h2>Trade-offs</h2>
+<table>
+<tr><th>Pros</th><th>Cons</th></tr>
+<tr><td>Zero setup for GitHub repos; huge action ecosystem; tight PR integration; free for public repos</td><td>Lock-in to GitHub; Marketplace actions are third-party code you must vet</td></tr>
+<tr><td>Environments + OIDC give good deploy governance</td><td>YAML expression language is quirky; complex flows get verbose</td></tr>
+<tr><td>Reusable workflows for platform teams</td><td>Local reproduction of runs is imperfect</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a tiny Node app (<code>npm init -y</code>, one test with <code>node --test</code>), add <code>ci.yml</code>, push on a branch and open a PR. Watch the checks.</li>
+<li>Add the Docker build job to push to GHCR. Find your image under the repo's Packages.</li>
+<li>Create a <code>production</code> environment with yourself as required reviewer; add a deploy job that just <code>echo</code>s and see the approval pause.</li>
+<li>Replace one third-party action version tag with its commit SHA (<code>uses: actions/checkout@&lt;sha&gt; # v4.x.y</code>).</li>
+</ol></div>

@@ -1,0 +1,149 @@
+<h1>Capstone Overview: Ship a Real Service End to End</h1>
+<p class="lead">Reading about DevOps does not make you a DevOps engineer; shipping does. In this capstone you will take a small API plus a Postgres database through every stage of the handbook: containerize it, build a CI pipeline, deploy to a real server with HTTPS, define the server with Terraform and watch it with Prometheus and Grafana.</p>
+
+<h2>The project</h2>
+<p>We will build <strong>Notely</strong>, a tiny notes API. The language does not matter; the examples use Node.js (Express) because it is compact, but a Python (FastAPI), Go or Java service works identically as long as it has three things: it reads config from environment variables, talks to Postgres and exposes <code>/healthz</code> and <code>/metrics</code>.</p>
+<table>
+<tr><th>Endpoint</th><th>Purpose</th></tr>
+<tr><td><code>GET /healthz</code></td><td>Returns 200 when the app and database are reachable</td></tr>
+<tr><td><code>GET /notes</code></td><td>List notes</td></tr>
+<tr><td><code>POST /notes</code></td><td>Create a note: <code>{"title":"...","body":"..."}</code></td></tr>
+<tr><td><code>GET /metrics</code></td><td>Prometheus metrics (request counts, latency)</td></tr>
+</table>
+
+<h2>Target architecture</h2>
+<pre class="diagram">
+                    ┌─────────────────────────── GitHub ───────────────────────────┐
+ you ─ git push ──▶ │ repo ─▶ Actions: test ─▶ build image ─▶ push to GHCR          │
+                    └──────────────────────────────────────────────┬────────────────┘
+                                                                   │ ssh + docker compose pull
+ Internet ─▶ DNS (notely.example.com) ─▶ VPS (provisioned by Terraform)  ◀───────────┘
+                                         ┌───────────────────────────────────────┐
+                                         │ nginx :443 (TLS via Let's Encrypt)    │
+                                         │    │                                  │
+                                         │    ▼                                  │
+                                         │ api container ──▶ postgres container  │
+                                         │    │ /metrics        (volume + backup)│
+                                         │ prometheus ─▶ grafana                 │
+                                         └───────────────────────────────────────┘
+ external uptime check (UptimeRobot / Uptime Kuma elsewhere) ─▶ alerts you
+</pre>
+
+<h2>The stages</h2>
+<table>
+<tr><th>#</th><th>Stage</th><th>Lesson</th><th>You will practise</th></tr>
+<tr><td>0</td><td>Write the app</td><td>this page</td><td>12-factor config, health endpoint, graceful shutdown</td></tr>
+<tr><td>1</td><td>Containerize</td><td>Capstone: Containerize</td><td>Multi-stage Dockerfile, Compose, local dev with hot reload</td></tr>
+<tr><td>2</td><td>CI pipeline</td><td>Capstone: CI Pipeline</td><td>GitHub Actions, tests against Postgres, image to GHCR</td></tr>
+<tr><td>3</td><td>Deploy</td><td>Capstone: Deploy to a VPS</td><td>SSH deploy, compose in prod, nginx, TLS, zero-downtime-ish update, rollback</td></tr>
+<tr><td>4</td><td>IaC and monitoring</td><td>Capstone: IaC and Monitoring</td><td>Terraform the server and DNS, Prometheus, Grafana, uptime check, backups</td></tr>
+</table>
+
+<h2>Prerequisites</h2>
+<ul>
+<li>Git and a GitHub account.</li>
+<li>Docker Desktop (or Docker Engine + Compose v2) locally.</li>
+<li>Node.js 22 LTS if you want to run the app outside Docker.</li>
+<li>A cheap VPS (Hetzner, DigitalOcean, Vultr or AWS Lightsail; roughly 4-6 USD/month) and a domain name (or a free subdomain from DuckDNS / a spare domain).</li>
+<li>Comfort with the Linux, Docker and CI/CD lessons earlier in the handbook.</li>
+</ul>
+
+<h2>Stage 0: write the app</h2>
+<p>Create the repo layout:</p>
+<pre class="diagram">
+notely/
+├── src/
+│   ├── server.js
+│   └── db.js
+├── test/notes.test.js
+├── migrations/001_init.sql
+├── package.json
+├── Dockerfile
+├── compose.yaml
+├── .github/workflows/ci.yml
+├── deploy/            (prod compose, nginx conf)
+└── infra/             (Terraform)
+</pre>
+<pre><code>// src/db.js
+import pg from 'pg';
+export const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,   // factor III: config from env
+  max: 10,
+});</code></pre>
+<pre><code>// src/server.js
+import express from 'express';
+import client from 'prom-client';
+import { pool } from './db.js';
+
+const app = express();
+app.use(express.json());
+client.collectDefaultMetrics();
+const httpDuration = new client.Histogram({
+  name: 'http_request_duration_seconds', help: 'request latency',
+  labelNames: ['method', 'route', 'status'],
+});
+app.use((req, res, next) =&gt; {
+  const end = httpDuration.startTimer();
+  res.on('finish', () =&gt; end({ method: req.method, route: req.route?.path ?? req.path, status: res.statusCode }));
+  next();
+});
+
+app.get('/healthz', async (_req, res) =&gt; {
+  try { await pool.query('SELECT 1'); res.json({ status: 'ok' }); }
+  catch { res.status(503).json({ status: 'db unavailable' }); }
+});
+app.get('/notes', async (_req, res) =&gt; {
+  const { rows } = await pool.query('SELECT id, title, body, created_at FROM notes ORDER BY id DESC LIMIT 100');
+  res.json(rows);
+});
+app.post('/notes', async (req, res) =&gt; {
+  const { title, body = '' } = req.body ?? {};
+  if (!title) return res.status(400).json({ error: 'title required' });
+  const { rows } = await pool.query(
+    'INSERT INTO notes (title, body) VALUES ($1, $2) RETURNING *', [title, body]);
+  res.status(201).json(rows[0]);
+});
+app.get('/metrics', async (_req, res) =&gt; {
+  res.set('Content-Type', client.register.contentType);
+  res.end(await client.register.metrics());
+});
+
+const port = Number(process.env.PORT ?? 3000);
+const server = app.listen(port, () =&gt; console.log(JSON.stringify({ level: 'info', msg: 'listening', port })));
+process.on('SIGTERM', () =&gt; server.close(() =&gt; pool.end().then(() =&gt; process.exit(0))));
+export default app;</code></pre>
+<pre><code>-- migrations/001_init.sql
+CREATE TABLE IF NOT EXISTS notes (
+  id         BIGSERIAL PRIMARY KEY,
+  title      TEXT NOT NULL,
+  body       TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);</code></pre>
+<p>Install dependencies with <code>npm init -y &amp;&amp; npm i express pg prom-client</code>, set <code>"type": "module"</code> and <code>"start": "node src/server.js"</code> in <code>package.json</code>, and commit to a new GitHub repo. Add a <code>.gitignore</code> containing <code>node_modules</code> and <code>.env</code>.</p>
+
+<div class="callout tip"><strong>Use your own app if you have one</strong><p>Any small service you already have works better than Notely because you care about it. Just make sure it meets the 12-factor checklist: config in env, logs to stdout, stateless, health endpoint.</p></div>
+
+<h2>Definition of done</h2>
+<ul>
+<li><code>git push</code> to <code>main</code> runs tests, builds an image, publishes it and deploys it without manual steps.</li>
+<li><code>https://notely.yourdomain.com/healthz</code> returns 200 with a valid certificate.</li>
+<li>The server can be destroyed and recreated from Terraform plus one bootstrap script.</li>
+<li>Grafana shows request rate and latency; an external check alerts you when the site is down.</li>
+<li>A nightly database backup exists off the server, and you have restored it once.</li>
+<li>A README documents how to run, deploy, roll back and restore.</li>
+</ul>
+
+<h2>How to get the most out of it</h2>
+<ul>
+<li>Commit after every step with clear messages; your git history becomes your portfolio story.</li>
+<li>Break things on purpose (kill the container, fill the disk, push a failing test) and watch what the system does.</li>
+<li>Write the README as if a stranger had to operate it at 3 a.m.</li>
+<li>Stretch goals: swap compose for k3s/Kubernetes, add a staging environment, add blue-green deploys, add Trivy and cosign, add a managed database.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create the repo and the app above, start a local Postgres with <code>docker run -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:17</code>, apply the migration with <code>psql</code> and run the API with <code>DATABASE_URL=postgres://postgres:pw@localhost:5432/postgres npm start</code>.</li>
+<li>Verify with <code>curl -X POST localhost:3000/notes -H 'content-type: application/json' -d '{"title":"hello"}'</code> then <code>curl localhost:3000/notes</code>.</li>
+<li>Reserve your VPS and domain now, since DNS and account verification can take time.</li>
+</ol></div>

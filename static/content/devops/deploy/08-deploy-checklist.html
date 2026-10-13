@@ -1,0 +1,157 @@
+<h1>The Deploy Checklist</h1>
+<p class="lead">Experienced engineers are not people who never break production; they are people who run the same boring checks every time. A checklist moves deployment from heroics to routine. Use this one as a starting point and edit it after every incident.</p>
+
+<h2>Why checklists work</h2>
+<p>Pilots and surgeons use checklists not because they are novices, but because under time pressure and routine, humans skip steps. Most failed deployments come from a short list of repeated mistakes: a missing environment variable, a migration that was not run, a port not opened, a certificate that expired, no one watching after release. Writing them down converts tribal knowledge into something a new teammate (or you at 5 p.m. on Friday) can follow. Better still: automate every checkbox you can (CI gates, pipeline steps) and keep humans for judgement.</p>
+
+<h2>Before you deploy</h2>
+<h3>Code and build</h3>
+<ul>
+<li>[ ] Changes are merged via a reviewed pull request; the main branch is green in CI (lint, unit tests, integration tests).</li>
+<li>[ ] You know exactly <strong>what</strong> is being deployed: version/tag/commit SHA, and you have read the diff or changelog since the last release.</li>
+<li>[ ] The artifact (image, tarball) was built once in CI and is the same one that passed on staging. No "build on the server".</li>
+<li>[ ] Dependencies are locked (<code>package-lock.json</code>, <code>poetry.lock</code>); security scan passed or accepted.</li>
+</ul>
+<h3>Configuration and secrets</h3>
+<ul>
+<li>[ ] Any <strong>new environment variables or secrets</strong> are already set in the target environment (diff your <code>.env.example</code> against production).</li>
+<li>[ ] Config is validated at startup (app refuses to boot on missing values), so a mistake fails the deploy rather than a user.</li>
+<li>[ ] Feature flags for risky features are defined and set to the safe state.</li>
+</ul>
+<h3>Database</h3>
+<ul>
+<li>[ ] Migrations are backward-compatible with the version currently running (expand before contract), and tested on production-like data volume.</li>
+<li>[ ] A recent backup or snapshot exists, and you know how to restore it. Point-in-time recovery is on if available.</li>
+<li>[ ] Long-running or locking migrations have <code>lock_timeout</code>, batching, and a scheduled quiet period.</li>
+</ul>
+<h3>Infrastructure and timing</h3>
+<ul>
+<li>[ ] Disk space, memory and CPU headroom are fine (<code>df -h</code>, <code>free -m</code>): a full disk kills deploys.</li>
+<li>[ ] Dependencies are healthy (DB, cache, third-party APIs, certificate expiry more than 14 days away).</li>
+<li>[ ] It is a sensible time: avoid Friday afternoon, peak traffic, and when the one person who knows the system is unreachable. Ideal: small, frequent deploys on weekdays with people around.</li>
+<li>[ ] Stakeholders/support know if user-visible changes or brief degradation are expected. Incident channel open.</li>
+</ul>
+<h3>Rollback readiness</h3>
+<ul>
+<li>[ ] The previous version is still available (previous release dir, previous image tag) and you know the exact rollback command.</li>
+<li>[ ] You have decided in advance the signal that triggers a rollback (for example "error rate above 2 percent for 5 minutes").</li>
+</ul>
+
+<h2>During the deploy</h2>
+<ul>
+<li>[ ] Announce the start (team chat) with version and expected duration. Change freeze for others touching the same system.</li>
+<li>[ ] Run migrations first (if any) and confirm success before shipping code.</li>
+<li>[ ] Roll out using the agreed strategy (rolling/blue-green/canary). Watch logs live: <code>journalctl -u myapp -f</code> or <code>kubectl logs -f</code>.</li>
+<li>[ ] Do not make unrelated changes in the same window. One change at a time makes failures attributable.</li>
+</ul>
+
+<h2>After the deploy: smoke tests</h2>
+<p>A <strong>smoke test</strong> is a tiny, fast, automatic check that the most critical paths work, named after turning on new electronics to see if smoke comes out. It does not prove correctness; it proves "not obviously broken".</p>
+<pre><code>#!/usr/bin/env bash
+# smoke.sh  -  usage: ./smoke.sh https://app.example.com EXPECTED_SHA
+set -euo pipefail
+BASE=${1:?base url}; WANT=${2:-}
+fail() { echo "SMOKE FAIL: $*" &gt;&amp;2; exit 1; }
+
+# 1. Process healthy, dependencies reachable
+curl -fsS --max-time 5 "$BASE/health" &gt;/dev/null || fail "/health"
+
+# 2. Correct version is live
+if [ -n "$WANT" ]; then
+  GOT=$(curl -fsS "$BASE/health" | jq -r .version)
+  [ "$GOT" = "$WANT" ] || fail "version $GOT != $WANT"
+fi
+
+# 3. Home page renders
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BASE/")
+[ "$code" = 200 ] || fail "home returned $code"
+
+# 4. HTTPS and redirect behave
+curl -sI "http://${BASE#https://}/" | grep -qi '^location: https://' || fail "no http->https redirect"
+
+# 5. A critical read path works with test credentials
+curl -fsS -H "Authorization: Bearer $SMOKE_TOKEN" "$BASE/api/me" &gt;/dev/null || fail "/api/me"
+
+# 6. Static assets and TLS expiry
+curl -fsSI "$BASE/assets/app.js" &gt;/dev/null 2&gt;&amp;1 || echo "warn: assets not found at the guessed path"
+exp=$(echo | openssl s_client -connect "${BASE#https://}:443" -servername "${BASE#https://}" 2&gt;/dev/null \
+      | openssl x509 -noout -enddate | cut -d= -f2)
+echo "TLS expires: $exp"
+
+echo "SMOKE OK"</code></pre>
+<p>Run it from <em>outside</em> the server (CI runner or your laptop) so it exercises DNS, TLS, the proxy and the firewall, not just localhost. Run it in the pipeline automatically, and fail the deploy (and trigger rollback) if it fails. Test credentials should belong to a dedicated test account with minimal rights.</p>
+
+<h3>Post-deploy observation (the "bake" period)</h3>
+<ul>
+<li>[ ] <strong>Error rate</strong> (5xx, exceptions) is at or below baseline. Compare with the same time yesterday.</li>
+<li>[ ] <strong>Latency</strong> (p50, p95, p99) has not regressed.</li>
+<li>[ ] <strong>Saturation</strong>: CPU, memory (leaks show up as a slow climb), DB connections, queue depth, disk.</li>
+<li>[ ] <strong>Business metrics</strong>: signups, checkouts, jobs processed. A deploy can be technically healthy and functionally broken.</li>
+<li>[ ] <strong>Logs</strong>: no new error patterns, no flood of warnings. Check the error tracker for new issue types.</li>
+<li>[ ] Background workers and cron jobs are running the new version and consuming from queues.</li>
+<li>[ ] Watch for at least 15 to 30 minutes (longer for risky changes, covering at least one peak or cron cycle).</li>
+<li>[ ] Announce completion. Tag the release in Git; update the changelog. Remove temporary flags you are done with.</li>
+</ul>
+
+<h2>Common failure modes and how to spot them</h2>
+<table>
+<tr><th>Failure</th><th>Typical symptom</th><th>Prevention</th></tr>
+<tr><td>Missing or wrong env var / secret</td><td>Crash at boot or "undefined" behaviour; auth to third parties fails</td><td>Startup validation; config diff in checklist; per-environment secret store</td></tr>
+<tr><td>Migration not run, or run in wrong order</td><td><code>column does not exist</code> errors straight after deploy</td><td>Migration step in pipeline <em>before</em> code; expand/contract</td></tr>
+<tr><td>Migration locks a table</td><td>Whole app hangs, connection pool exhausted, timeouts</td><td><code>lock_timeout</code>, concurrent index builds, test on large data</td></tr>
+<tr><td>Port, firewall or security group not updated</td><td>Timeouts from the load balancer; health checks fail</td><td>Infrastructure as code; verify with <code>nc -zv</code></td></tr>
+<tr><td>Wrong Node/Python/JVM version on the server</td><td>Syntax errors, native module failures</td><td>Pin versions (<code>engines</code>, <code>.nvmrc</code>, container images)</td></tr>
+<tr><td>Dependency drift (<code>npm install</code> picks newer versions)</td><td>"Worked in staging" differences</td><td><code>npm ci</code> with lockfile; build once and promote the artifact</td></tr>
+<tr><td>Disk full</td><td>Install fails, DB crashes, logs stop</td><td>Monitor disk; rotate logs; prune old releases/images</td></tr>
+<tr><td>File permissions / wrong user</td><td><code>EACCES</code>, nginx 403</td><td>Consistent owner/group; deploy as the service owner; no stray <code>sudo</code></td></tr>
+<tr><td>Process not restarted (or old code still running)</td><td>New code deployed but old behaviour persists</td><td>Version in <code>/health</code>; smoke test verifies version</td></tr>
+<tr><td>Cache serves stale content</td><td>Users see old UI or API; broken mix of HTML and assets</td><td>Fingerprinted assets; purge HTML; short HTML TTL</td></tr>
+<tr><td>Certificate expired or wrong chain</td><td>Browser warnings, API clients failing</td><td>Expiry monitoring; <code>certbot renew --dry-run</code></td></tr>
+<tr><td>DNS not propagated / TTL too high</td><td>Some users hit the old server</td><td>Lower TTL days ahead; verify with multiple resolvers</td></tr>
+<tr><td>Health check too shallow or too strict</td><td>Broken build accepted, or healthy nodes ejected</td><td>Separate liveness and readiness; test the checks</td></tr>
+<tr><td>Old and new versions incompatible (queues, caches, API clients)</td><td>Errors only during rollout</td><td>Versioned message formats; backward-compatible APIs; mobile clients stay old for months</td></tr>
+<tr><td>Resource limits too low</td><td>OOM kills, CPU throttling, connection exhaustion under real load</td><td>Load test; alert on restarts and memory</td></tr>
+<tr><td>Timezone / locale / clock differences</td><td>Cron at wrong time, token expiry issues</td><td>UTC everywhere; NTP</td></tr>
+<tr><td>Third-party dependency changed or rate-limited</td><td>Sudden failures independent of your deploy</td><td>Timeouts, retries with backoff, circuit breakers, status page watch</td></tr>
+<tr><td>Nobody was watching</td><td>Bug found by customers hours later</td><td>Dashboards open during deploys; alerting; the bake period</td></tr>
+</table>
+
+<h2>When it goes wrong</h2>
+<ol>
+<li><strong>Stay calm and communicate</strong>: post in the incident channel what you see and what you are doing.</li>
+<li><strong>Roll back first, debug later</strong> when the deploy is the likely cause. Restoring service beats diagnosing in production.</li>
+<li><strong>Preserve evidence</strong>: logs, metrics screenshots, the failing request, before restarting things.</li>
+<li><strong>Verify recovery</strong> with the same smoke tests.</li>
+<li><strong>Blameless post-mortem</strong>: what happened, why the system allowed it, what automatic check would have caught it. Add that check to this list (or better, to the pipeline).</li>
+</ol>
+
+<h2>Maturing the checklist into automation</h2>
+<table>
+<tr><th>Manual checklist item</th><th>Becomes</th></tr>
+<tr><td>Tests pass</td><td>Required CI status check on the main branch</td></tr>
+<tr><td>Env vars present</td><td>Config schema validation; pipeline step diffing required keys</td></tr>
+<tr><td>Migration safe</td><td>Migration linter in CI</td></tr>
+<tr><td>Deploy and wait for health</td><td>Orchestrator readiness gates; deploy tool health check with auto-rollback</td></tr>
+<tr><td>Smoke tests</td><td>Post-deploy pipeline job; synthetic monitoring running continuously</td></tr>
+<tr><td>Watch dashboards</td><td>SLO-based alerts; automated canary analysis</td></tr>
+<tr><td>Announce</td><td>Pipeline posts the deploy and version to chat; deploy markers on graphs</td></tr>
+</table>
+<p>The goal is not a longer checklist but a shorter one, because the system itself refuses to do the unsafe things.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Checklist fatigue: ticking boxes without looking. Keep it short, specific, and tied to real past incidents.</li>
+<li>Treating smoke tests as full regression tests: they should run in seconds and cover only critical paths.</li>
+<li>Smoke tests that call <code>localhost</code> and miss DNS, TLS and proxy problems.</li>
+<li>Deploying and immediately leaving. The first 30 minutes are when most issues surface.</li>
+<li>A checklist that exists only in one person's head or an out-of-date wiki page. Version it in the repo next to the deploy scripts.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Copy this checklist into your repo as <code>DEPLOY.md</code>. Delete the items that do not apply and add two that come from your own past incidents.</li>
+<li>Adapt <code>smoke.sh</code> to your app, run it against staging, then deliberately break something (stop the service, break the nginx config in a staging copy) and confirm the script fails with a clear message.</li>
+<li>Hook the smoke test into your deploy script so a failure triggers rollback (see the previous lesson).</li>
+<li>Take the failure-mode table and, for three rows, write the exact command you would run to detect that failure on your server.</li>
+<li>Run a "game day": have a teammate (or a future-you) break one thing in staging after a deploy, and practise detecting and rolling back within five minutes. Time it.</li>
+</ol></div>

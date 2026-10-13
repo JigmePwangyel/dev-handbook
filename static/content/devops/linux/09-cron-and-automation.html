@@ -1,0 +1,141 @@
+<h1>Cron and Scheduled Automation</h1>
+<p class="lead">Backups, certificate renewals, log cleanup, report generation: servers constantly need things done on a schedule. Linux offers two tools, the classic cron and the modern systemd timers. Both fail quietly unless you design for it.</p>
+
+<h2>Why scheduling needs care</h2>
+<p>Scheduled jobs run unattended, with no terminal, a minimal environment and nobody watching. The typical failure: a nightly backup has silently failed for three months and you discover it when you need to restore. A good scheduled job is <strong>logged, idempotent, locked against overlap and monitored</strong>.</p>
+
+<h2>cron basics</h2>
+<p>The <code>cron</code> daemon reads tables ("crontabs") and runs commands when the time matches.</p>
+<pre><code>crontab -e        # edit YOUR crontab
+crontab -l        # list
+sudo crontab -u deploy -l   # another user's
+# system-wide: /etc/crontab and /etc/cron.d/*  (these have an extra USER column)
+# also drop scripts into /etc/cron.daily, .hourly, .weekly, .monthly</code></pre>
+<h3>The five fields</h3>
+<pre class="diagram">
+ ┌───────────── minute        (0-59)
+ │ ┌─────────── hour          (0-23)
+ │ │ ┌───────── day of month  (1-31)
+ │ │ │ ┌─────── month         (1-12)
+ │ │ │ │ ┌───── day of week   (0-7, 0 and 7 = Sunday)
+ │ │ │ │ │
+ * * * * *  command to run
+</pre>
+<table>
+<tr><th>Expression</th><th>Meaning</th></tr>
+<tr><td><code>*/5 * * * *</code></td><td>Every 5 minutes</td></tr>
+<tr><td><code>0 * * * *</code></td><td>Top of every hour</td></tr>
+<tr><td><code>30 2 * * *</code></td><td>Daily at 02:30</td></tr>
+<tr><td><code>0 9 * * 1-5</code></td><td>09:00 Monday to Friday</td></tr>
+<tr><td><code>0 0 1 * *</code></td><td>Midnight on the 1st of each month</td></tr>
+<tr><td><code>@reboot</code></td><td>Once at startup (also <code>@daily</code>, <code>@hourly</code>, <code>@weekly</code>)</td></tr>
+</table>
+<p>Use a tool like crontab.guru to check expressions. Note: if both day-of-month and day-of-week are set, cron runs when <em>either</em> matches.</p>
+
+<h3>A sensible crontab</h3>
+<pre><code>SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=ops@example.com
+
+# m h dom mon dow  command
+30 2 * * *  /opt/myapp/bin/backup.sh &gt;&gt; /var/log/myapp/backup.log 2&gt;&amp;1
+*/10 * * * * flock -n /tmp/sync.lock /opt/myapp/bin/sync.sh &gt;&gt; /var/log/myapp/sync.log 2&gt;&amp;1
+0 4 * * 0   /usr/bin/certbot renew --quiet</code></pre>
+
+<h2>Cron pitfalls (they all bite once)</h2>
+<ul>
+<li><strong>Minimal environment.</strong> Cron has a tiny <code>PATH</code> and none of your shell profile (no nvm, no env vars). Use absolute paths, set <code>PATH</code> at the top, source env files inside the script.</li>
+<li><strong>Silent output.</strong> stdout/stderr go to mail (usually unconfigured) and vanish. Redirect to a log file as above, or pipe to <code>logger -t backup</code> to land in the journal.</li>
+<li><strong>Overlapping runs.</strong> If a job takes longer than its interval, copies pile up. Wrap in <code>flock -n</code>.</li>
+<li><strong>The <code>%</code> character</strong> means newline in crontab lines; escape as <code>\%</code> (e.g. in <code>date +\%F</code>).</li>
+<li><strong>Time zones.</strong> Cron uses the server's local time; DST can skip or repeat jobs. Run servers in UTC.</li>
+<li><strong>Missed jobs.</strong> If the machine is off at the scheduled time, plain cron skips it (anacron or systemd timers with <code>Persistent=true</code> catch up).</li>
+<li><strong>No failure alerting.</strong> Nothing tells you it stopped working. Add a dead-man's-switch ping (below).</li>
+<li><strong>Many servers, one schedule.</strong> If three replicas each run the nightly job, it runs three times. Use a leader, a lock in the DB, or a central scheduler.</li>
+</ul>
+<pre><code># See what cron ran
+journalctl -u cron --since today          # Debian/Ubuntu: service "cron"
+journalctl -u crond --since today         # RHEL family
+grep CRON /var/log/syslog | tail</code></pre>
+
+<h2>Dead man's switch monitoring</h2>
+<p>Alerting on "job failed" misses the case where the job never ran. Invert it: the job pings a monitoring URL on success, and the service alerts if the ping does <em>not</em> arrive on schedule (Healthchecks.io, Cronitor, Uptime Kuma push monitors).</p>
+<pre><code>30 2 * * * /opt/myapp/bin/backup.sh &amp;&amp; curl -fsS -m 10 --retry 3 https://hc-ping.com/YOUR-UUID &gt;/dev/null</code></pre>
+
+<h2>systemd timers</h2>
+<p>A timer is a unit that activates a matching service unit. Compared with cron you get journal logging, dependency ordering, resource limits, hardening, catch-up of missed runs, random delay, and a clear list of next/last run times.</p>
+<h3>1. The job: <code>/etc/systemd/system/backup.service</code></h3>
+<pre><code>[Unit]
+Description=Nightly database backup
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=backup
+ExecStart=/opt/myapp/bin/backup.sh
+# Failure notification hook (optional)
+# OnFailure=notify-failure@%n.service
+Nice=10
+IOSchedulingClass=idle</code></pre>
+<h3>2. The schedule: <code>/etc/systemd/system/backup.timer</code></h3>
+<pre><code>[Unit]
+Description=Run backup nightly
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target</code></pre>
+<h3>3. Enable and inspect</h3>
+<pre><code>sudo systemctl daemon-reload
+sudo systemctl enable --now backup.timer      # enable the TIMER, not the service
+systemctl list-timers --all                   # NEXT / LEFT / LAST / PASSED
+sudo systemctl start backup.service           # run it right now to test
+journalctl -u backup.service -n 50            # output of runs
+systemd-analyze calendar "Mon..Fri *-*-* 09:00"   # validate and preview schedules</code></pre>
+<table>
+<tr><th>Timer setting</th><th>Meaning</th></tr>
+<tr><td><code>OnCalendar=</code></td><td>Wall-clock schedule: <code>hourly</code>, <code>daily</code>, <code>Mon *-*-* 03:00</code>, <code>*:0/15</code></td></tr>
+<tr><td><code>OnBootSec=</code>, <code>OnUnitActiveSec=</code></td><td>Relative: 5 minutes after boot, every 1 hour after last run</td></tr>
+<tr><td><code>Persistent=true</code></td><td>Run missed executions after downtime</td></tr>
+<tr><td><code>RandomizedDelaySec=</code></td><td>Spread load across many servers</td></tr>
+<tr><td><code>AccuracySec=</code></td><td>Allow coalescing wakeups (default 1 min)</td></tr>
+</table>
+
+<h2>cron vs systemd timers</h2>
+<table>
+<tr><th></th><th>cron</th><th>systemd timer</th></tr>
+<tr><td>Setup effort</td><td>One line</td><td>Two files</td></tr>
+<tr><td>Logging</td><td>Manual redirects</td><td>Automatic in journal</td></tr>
+<tr><td>Missed runs</td><td>Skipped</td><td><code>Persistent=true</code></td></tr>
+<tr><td>Overlap protection</td><td>Add <code>flock</code></td><td>Built in (a service is not started twice)</td></tr>
+<tr><td>Environment and sandboxing</td><td>Minimal, DIY</td><td>Full unit directives</td></tr>
+<tr><td>Portability</td><td>Everywhere, including macOS/BSD</td><td>systemd distros only</td></tr>
+</table>
+<p>Rule of thumb: quick personal chores, cron; anything operationally important on a modern Linux server, a timer.</p>
+
+<h2>Beyond one machine</h2>
+<ul>
+<li><strong>Kubernetes CronJob</strong>: schedule container jobs in a cluster (Kubernetes section).</li>
+<li><strong>CI schedules</strong>: <code>on: schedule: - cron: "0 3 * * *"</code> in GitHub Actions for nightly builds and dependency checks.</li>
+<li><strong>Cloud schedulers</strong>: EventBridge Scheduler, Cloud Scheduler; use workflow engines (Airflow, Temporal) for complex dependent jobs.</li>
+</ul>
+
+<h2>Best practices</h2>
+<ul>
+<li>Make each job a script you can run by hand (<code>set -euo pipefail</code>), then schedule the script.</li>
+<li>Idempotent, with locking and a timeout (<code>timeout 30m cmd</code>).</li>
+<li>Log with timestamps; alert on failure and on silence.</li>
+<li>Test restores, not just backups. A backup you never restored is unproven.</li>
+<li>Stagger heavy jobs; avoid the top of the hour when everyone else runs theirs.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Add a cron entry that runs every minute: <code>* * * * * date &gt;&gt; /tmp/cron-test.log 2&gt;&amp;1</code>. Confirm it works, then remove it.</li>
+<li>Write a script that fails, schedule it, and notice how you find out (logs, mail). Wrap it with <code>flock</code> and a log redirect.</li>
+<li>Convert the same job to a systemd service plus timer with <code>OnCalendar=*:0/2</code>, watch <code>systemctl list-timers</code> and <code>journalctl -u</code>.</li>
+<li>Sign up for a free Healthchecks.io account and add the ping so a missed run alerts you.</li>
+</ol></div>

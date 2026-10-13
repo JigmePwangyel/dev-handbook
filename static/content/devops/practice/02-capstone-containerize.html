@@ -1,0 +1,156 @@
+<h1>Capstone: Containerize the App</h1>
+<p class="lead">Stage 1: package Notely and its database so that <code>docker compose up</code> gives any teammate (or any server) an identical environment in one command. This is the "build once, run anywhere" step everything else depends on.</p>
+
+<h2>Goals</h2>
+<ul>
+<li>A small, secure, fast-building production image.</li>
+<li>A Compose file for local development with Postgres, migrations and live reload.</li>
+<li>Configuration through environment variables only.</li>
+</ul>
+
+<h2>The Dockerfile (multi-stage)</h2>
+<p>A multi-stage build separates build-time tooling from the runtime image, shrinking size and attack surface. Order instructions from least to most frequently changing so layer caching works.</p>
+<pre><code># syntax=docker/dockerfile:1
+ARG NODE_VERSION=22
+
+# ---- deps: install production dependencies only ----
+FROM node:${NODE_VERSION}-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
+
+# ---- runtime ----
+FROM node:${NODE_VERSION}-alpine AS runtime
+ENV NODE_ENV=production
+WORKDIR /app
+# non-root user (the node image ships with one called "node")
+COPY --from=deps --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node package.json ./
+COPY --chown=node:node src ./src
+COPY --chown=node:node migrations ./migrations
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+  CMD wget -qO- http://127.0.0.1:3000/healthz || exit 1
+CMD ["node", "src/server.js"]</code></pre>
+<p>Key decisions explained:</p>
+<ul>
+<li><strong>Copy <code>package*.json</code> before the source</strong>: dependency installation is cached until the lockfile changes, so a code edit rebuilds in seconds.</li>
+<li><strong><code>npm ci</code></strong> gives reproducible installs from the lockfile.</li>
+<li><strong>Exec-form <code>CMD ["node", ...]</code></strong> makes node PID 1 so it receives <code>SIGTERM</code> and shuts down gracefully (shell form would wrap it in <code>sh -c</code> and swallow the signal). Add <code>--init</code> or <code>tini</code> if your app spawns children.</li>
+<li><strong>Non-root user</strong>: a compromised app does not own the container.</li>
+<li><strong>Pin by digest</strong> in real production (<code>node:22-alpine@sha256:...</code>) and let Renovate bump it.</li>
+</ul>
+
+<h3>.dockerignore</h3>
+<p>Keeps the build context small and prevents secrets leaking into the image.</p>
+<pre><code>node_modules
+.git
+.env
+.env.*
+Dockerfile
+compose*.yaml
+npm-debug.log
+test
+infra
+*.md</code></pre>
+
+<h2>Build and inspect</h2>
+<pre><code>docker build -t notely:dev .
+docker images notely                 # check size (aim for well under 200 MB)
+docker history notely:dev            # confirm no secrets in layers
+docker run --rm -p 3000:3000 -e DATABASE_URL=... notely:dev</code></pre>
+
+<h2>Compose for local development</h2>
+<pre><code># compose.yaml
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: notely
+      POSTGRES_PASSWORD: devpassword      # dev only!
+      POSTGRES_DB: notely
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro   # runs *.sql on FIRST init only
+    ports:
+      - "127.0.0.1:5432:5432"             # bound to localhost only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notely -d notely"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgres://notely:devpassword@db:5432/notely
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy        # wait until Postgres accepts connections
+    restart: unless-stopped
+
+volumes:
+  pgdata:</code></pre>
+<pre><code>docker compose up --build -d
+docker compose ps
+docker compose logs -f api
+curl -s localhost:3000/healthz
+docker compose down            # keeps the volume (data survives)
+docker compose down -v         # also deletes the volume (fresh start)</code></pre>
+
+<div class="callout warn"><strong>Pitfalls you will probably hit</strong><p>1) <code>depends_on</code> without <code>condition: service_healthy</code> only waits for the container to <em>start</em>, not for Postgres to be ready. 2) Inside Compose, the hostname is the service name (<code>db</code>), not <code>localhost</code>. 3) Scripts in <code>docker-entrypoint-initdb.d</code> run only when the data directory is empty; later schema changes need a real migration tool. 4) Without a named volume the database vanishes with the container.</p></div>
+
+<h2>Development override with live reload</h2>
+<p>Compose automatically merges <code>compose.override.yaml</code> on top of <code>compose.yaml</code>, so developers get a hot-reload workflow while production uses the plain file.</p>
+<pre><code># compose.override.yaml
+services:
+  api:
+    build:
+      target: deps          # dev stage with all deps; add a "dev" stage if you need devDependencies
+    command: node --watch src/server.js
+    volumes:
+      - ./src:/app/src      # bind mount: edit on host, see changes in container
+    environment:
+      LOG_LEVEL: debug</code></pre>
+<p>Compose 2.22+ also offers <code>docker compose watch</code> with a <code>develop.watch</code> section that syncs files or rebuilds on change without bind-mount quirks.</p>
+
+<h2>Proper migrations</h2>
+<p>The initdb trick is fine on day one; replace it soon with a migration runner executed as a one-off container so schema changes are versioned and repeatable (twelve-factor XII):</p>
+<pre><code>  migrate:
+    build: .
+    command: ["node", "src/migrate.js"]     # or use flyway/dbmate/golang-migrate images
+    environment:
+      DATABASE_URL: postgres://notely:devpassword@db:5432/notely
+    depends_on:
+      db: { condition: service_healthy }
+    profiles: ["tools"]
+
+# run on demand
+docker compose run --rm migrate</code></pre>
+
+<h2>Image hygiene checklist</h2>
+<table>
+<tr><th>Check</th><th>Command or technique</th></tr>
+<tr><td>Small image</td><td>Alpine/slim/distroless base; multi-stage</td></tr>
+<tr><td>No secrets baked in</td><td><code>docker history --no-trunc</code>; use runtime env or secrets</td></tr>
+<tr><td>Runs as non-root</td><td><code>docker run --rm notely:dev id</code></td></tr>
+<tr><td>Vulnerability scan</td><td><code>trivy image notely:dev</code></td></tr>
+<tr><td>Graceful stop</td><td><code>time docker stop</code> should be under 2 seconds</td></tr>
+<tr><td>Reproducible</td><td>Lockfile + pinned base</td></tr>
+<tr><td>Lint the Dockerfile</td><td><code>hadolint Dockerfile</code></td></tr>
+</table>
+
+<h2>Trade-offs</h2>
+<p>Alpine uses musl libc, which occasionally breaks native Node modules or changes DNS behaviour; <code>-slim</code> (Debian) is the safer default if you hit odd issues. Distroless images are tiny and have no shell, which is excellent for security and slightly annoying for debugging (use <code>kubectl debug</code> or an ephemeral debug container).</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Write the Dockerfile, <code>.dockerignore</code> and <code>compose.yaml</code>, then run <code>docker compose up --build</code> and create a note with curl.</li>
+<li>Run <code>docker compose down</code> then <code>up</code> again and confirm the note persists. Then use <code>down -v</code> and confirm it is gone.</li>
+<li>Change one line of source and rebuild: observe cached layers in the output. Then change <code>package.json</code> and watch the install layer re-run.</li>
+<li>Scan with <code>trivy image notely:dev</code> and reduce the highest-severity finding by updating the base image.</li>
+</ol></div>

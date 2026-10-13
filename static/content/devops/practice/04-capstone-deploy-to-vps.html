@@ -1,0 +1,187 @@
+<h1>Capstone: Deploy to a VPS</h1>
+<p class="lead">Stage 3: put Notely on a real server behind nginx with a Let's Encrypt certificate, and make the pipeline update it automatically with minimal downtime. This is the same flow as a "real" deployment, just without the orchestrator.</p>
+
+<h2>Target layout on the server</h2>
+<pre class="diagram">
+ /opt/notely/
+ ├── compose.yaml        # production compose (pulls images, no build)
+ ├── .env                # secrets + IMAGE_TAG   (chmod 600, not in git)
+ └── nginx/notely.conf   # (or nginx runs on the host; see below)
+
+ Internet :443 ─▶ nginx (host) ─▶ 127.0.0.1:3000 ─▶ api container ─▶ db container (internal network only)
+</pre>
+<p>Design choice: nginx on the host (installed by apt) handles TLS with certbot, while the app and database run in Compose. It keeps certificates simple and lets nginx survive app redeploys. The alternative is to run nginx or Caddy as another container; Caddy gives automatic HTTPS with almost zero config.</p>
+
+<h2>1. Prepare the server</h2>
+<pre><code># as root on a fresh Ubuntu 24.04 VPS
+adduser --disabled-password --gecos "" deploy
+mkdir -p /home/deploy/.ssh
+# paste YOUR public key and a separate CI deploy key's public key:
+cat &gt;&gt; /home/deploy/.ssh/authorized_keys
+chown -R deploy:deploy /home/deploy/.ssh &amp;&amp; chmod 700 /home/deploy/.ssh &amp;&amp; chmod 600 /home/deploy/.ssh/authorized_keys
+
+# harden SSH: no root, no passwords (see hardening lesson), then:
+systemctl reload ssh
+
+# firewall
+ufw default deny incoming; ufw allow OpenSSH; ufw allow 80,443/tcp; ufw enable
+
+# install docker (official convenience script or apt repo) and give deploy access
+curl -fsSL https://get.docker.com | sh
+usermod -aG docker deploy      # note: docker group is root-equivalent
+apt install -y nginx certbot python3-certbot-nginx
+mkdir -p /opt/notely &amp;&amp; chown deploy:deploy /opt/notely</code></pre>
+<div class="callout warn"><strong>Docker group = root</strong><p>Anyone who can run <code>docker</code> can mount the host filesystem. That is acceptable for a dedicated deploy user whose key lives only in CI, but restrict that key (<code>command=</code> and <code>restrict</code> options in <code>authorized_keys</code>) if you want to go further.</p></div>
+
+<h2>2. Production compose file</h2>
+<pre><code># /opt/notely/compose.yaml
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    env_file: .env                      # POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]                # no published ports at all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      retries: 6
+
+  api:
+    image: ghcr.io/OWNER/notely:${IMAGE_TAG}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:3000:3000"           # only nginx on the host can reach it
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [internal]
+
+networks:
+  internal:
+volumes:
+  pgdata:</code></pre>
+<pre><code># /opt/notely/.env   (chmod 600)
+POSTGRES_USER=notely
+POSTGRES_PASSWORD=&lt;long random value from: openssl rand -base64 32&gt;
+POSTGRES_DB=notely
+IMAGE_TAG=sha-1a2b3c4</code></pre>
+<p>If the GHCR package is private, log in once on the server with a read-only classic token (<code>read:packages</code>): <code>echo $TOKEN | docker login ghcr.io -u USERNAME --password-stdin</code>. Making the package public avoids this for a demo.</p>
+
+<h2>3. nginx and TLS</h2>
+<p>Point DNS first: an <code>A</code> record for <code>notely.example.com</code> to the VPS IP (check with <code>dig +short notely.example.com</code>). Then:</p>
+<pre><code># /etc/nginx/sites-available/notely
+server {
+    listen 80;
+    server_name notely.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+    }
+}</code></pre>
+<pre><code>ln -s /etc/nginx/sites-available/notely /etc/nginx/sites-enabled/
+nginx -t &amp;&amp; systemctl reload nginx
+certbot --nginx -d notely.example.com --agree-tos -m you@example.com --redirect
+systemctl list-timers | grep certbot     # auto-renewal is installed as a timer
+certbot renew --dry-run
+curl -I https://notely.example.com/healthz</code></pre>
+<p>Certbot edits the config to add the 443 listener and the HTTP-to-HTTPS redirect. Block <code>/metrics</code> from the public internet (<code>location = /metrics { deny all; }</code>) and let Prometheus scrape it internally.</p>
+
+<h2>4. First deploy by hand</h2>
+<pre><code>cd /opt/notely
+docker compose pull
+docker compose up -d
+docker compose run --rm api node src/migrate.js   # or apply migrations/001_init.sql via psql
+docker compose ps
+curl -s localhost:3000/healthz</code></pre>
+<p>Doing it manually once teaches you what the pipeline must automate.</p>
+
+<h2>5. Automate: a deploy job in GitHub Actions</h2>
+<p>Create a dedicated key pair (<code>ssh-keygen -t ed25519 -f deploy_key -N ""</code>), put the public half in the server's <code>authorized_keys</code>, and store the private half as a repo secret <code>DEPLOY_SSH_KEY</code>, plus <code>DEPLOY_HOST</code>. Capture the host key fingerprint (<code>ssh-keyscan -t ed25519 host</code>) as <code>DEPLOY_KNOWN_HOSTS</code> so you verify the server rather than trust blindly.</p>
+<pre><code>  deploy:
+    needs: image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: production          # add required reviewers for manual approval
+    steps:
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" &gt; ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" &gt; ~/.ssh/known_hosts
+      - name: Deploy
+        env:
+          TAG: sha-${{ github.sha }}
+        run: |
+          SHORT=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          ssh deploy@${{ secrets.DEPLOY_HOST }} "SHORT=sha-${SHORT} bash -s" &lt;&lt; 'EOF'
+            set -euo pipefail
+            cd /opt/notely
+            sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${SHORT}/" .env
+            docker compose pull api
+            docker compose run --rm api node src/migrate.js
+            docker compose up -d --no-deps api
+            for i in $(seq 1 30); do
+              curl -fsS localhost:3000/healthz &amp;&amp; exit 0
+              sleep 2
+            done
+            echo "health check failed" &gt;&amp;2; exit 1
+          EOF
+      - name: Smoke test
+        run: curl -fsS https://notely.example.com/healthz</code></pre>
+<p>The docker/metadata <code>type=sha,format=short</code> tag is the first 7 characters of the commit SHA prefixed with <code>sha-</code>, which is what the script reconstructs.</p>
+
+<h2>Zero-downtime-ish updates</h2>
+<p><code>docker compose up -d --no-deps api</code> stops the old container and starts the new one, which causes a few seconds of 502 errors. Options, from simple to robust:</p>
+<table>
+<tr><th>Approach</th><th>How</th><th>Downtime</th></tr>
+<tr><td>Plain recreate</td><td><code>compose up -d</code></td><td>A few seconds</td></tr>
+<tr><td>nginx retry</td><td><code>proxy_next_upstream error timeout http_502;</code> plus a short retry window masks the blip</td><td>Near zero for GETs</td></tr>
+<tr><td>Blue-green with two compose projects</td><td>Run <code>api-blue</code> on :3001 and <code>api-green</code> on :3002; start the new one, health check, switch the nginx upstream port, <code>nginx -s reload</code>, stop the old one</td><td>Zero; instant rollback</td></tr>
+<tr><td>Rolling via Swarm / Kubernetes</td><td><code>docker service update</code> with <code>--update-order start-first</code></td><td>Zero</td></tr>
+<tr><td>Tools like Kamal</td><td>Healthcheck-gated container swap behind kamal-proxy</td><td>Zero</td></tr>
+</table>
+<pre><code># blue-green sketch (run on the server)
+CURRENT=$(cat /opt/notely/active_port)          # 3001 or 3002
+NEXT=$([ "$CURRENT" = 3001 ] &amp;&amp; echo 3002 || echo 3001)
+APP_PORT=$NEXT docker compose -p notely-$NEXT up -d api
+until curl -fs localhost:$NEXT/healthz; do sleep 1; done
+sed -i "s/127.0.0.1:$CURRENT/127.0.0.1:$NEXT/" /etc/nginx/sites-enabled/notely
+nginx -t &amp;&amp; nginx -s reload                      # reload is graceful: no dropped connections
+docker compose -p notely-$CURRENT stop api
+echo $NEXT &gt; /opt/notely/active_port</code></pre>
+<p>Remember migrations must be backward compatible so both versions can run against one database during the switch.</p>
+
+<h2>Rollback</h2>
+<pre><code>ssh deploy@host
+cd /opt/notely
+sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=sha-PREVIOUS/' .env
+docker compose up -d --no-deps api</code></pre>
+<p>Because every image is immutable and tagged by SHA, rollback is a one-line change. Keep the last N tags (<code>docker image prune</code> carefully) and record each deployed tag in a log file or a GitHub deployment record.</p>
+
+<h2>Verify like an operator</h2>
+<ul>
+<li><code>docker compose logs --tail 50 api</code> and <code>journalctl -u nginx</code> for errors.</li>
+<li><code>ss -tlnp</code>: only 22, 80, 443 should listen on public interfaces. Verify 5432 is not exposed: <code>nmap -p 5432 your.ip</code> from your laptop.</li>
+<li><code>docker stats --no-stream</code> for resource use; add swap or a bigger plan if memory is tight.</li>
+<li>Reboot the VPS and confirm everything comes back (<code>restart: unless-stopped</code> plus docker enabled at boot).</li>
+</ul>
+
+<div class="callout tip"><strong>Back up from day one</strong><p>Add a cron job: <code>docker compose exec -T db pg_dump -U notely -Fc notely | age -r YOUR_PUBKEY | rclone rcat remote:notely-backups/$(date +%F).dump.age</code>, then restore it into a scratch container once to prove it works.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Provision the VPS, perform the hardening steps, point DNS and get a valid certificate. Check it with <code>curl -vI</code>.</li>
+<li>Deploy manually once, then add the deploy job and push a trivial change; watch it roll out and verify the SHA in the running container: <code>docker compose images api</code>.</li>
+<li>Push a commit that fails the health check (for example, a bad <code>DATABASE_URL</code>). Does the pipeline fail and leave the old version serving? If not, improve the script.</li>
+<li>Practise a rollback and time it.</li>
+</ol></div>

@@ -1,0 +1,120 @@
+<h1>Docker Networking</h1>
+<p class="lead">Every container gets its own network namespace: its own IP address, interfaces and ports. Docker's job is to wire those namespaces together and to the outside world. Most "my containers cannot talk to each other" problems come down to five ideas: network drivers, user-defined networks with built-in DNS, port publishing, <code>localhost</code> meaning something different inside a container, and bind addresses.</p>
+
+<h2>How it works under the hood</h2>
+<p>On Linux, Docker creates a virtual bridge (<code>docker0</code>), then for each container a <code>veth</code> pair: one end inside the container's namespace (<code>eth0</code>), the other attached to the bridge. Outbound traffic is NAT'd (masqueraded) through the host with iptables/nftables rules, and published ports are implemented as DNAT rules.</p>
+<pre class="diagram">
+  Container A (172.18.0.2)   Container B (172.18.0.3)
+        eth0 ─┐                    eth0 ─┐
+              │ veth                     │ veth
+        ┌─────┴────────────────────┬─────┴──────┐
+        │         bridge (172.18.0.1)           │   ← Docker network "appnet"
+        └───────────────┬───────────────────────┘
+                        │ NAT / iptables
+                  Host eth0 (192.168.1.50) ──▶ Internet
+        host:8080 ──DNAT──▶ container A:80   (port publishing)
+</pre>
+
+<h2>Network drivers</h2>
+<table>
+<tr><th>Driver</th><th>Behavior</th><th>Use for</th></tr>
+<tr><td><code>bridge</code> (default)</td><td>Private virtual network on one host; NAT to outside</td><td>Almost everything on a single host</td></tr>
+<tr><td><code>host</code></td><td>Container shares the host's network stack; no isolation, no port mapping</td><td>Max network performance, tools that need host network visibility. Linux only (limited support in Docker Desktop)</td></tr>
+<tr><td><code>none</code></td><td>Only loopback; no networking</td><td>Offline batch jobs, maximum isolation</td></tr>
+<tr><td><code>overlay</code></td><td>Multi-host network (Swarm)</td><td>Docker Swarm; Kubernetes uses CNI plugins instead</td></tr>
+<tr><td><code>macvlan</code> / <code>ipvlan</code></td><td>Container gets its own MAC/IP on the physical LAN</td><td>Legacy apps needing to look like a physical host</td></tr>
+</table>
+<pre><code>docker network ls
+docker network inspect bridge
+docker run --rm --network host nginx        # shares host stack: nginx on host :80 directly
+docker run --rm --network none alpine ip a  # only "lo"</code></pre>
+
+<h2>The default bridge vs. user-defined bridges</h2>
+<p>Containers started without <code>--network</code> join the legacy default <code>bridge</code>. It works, but containers there can reach each other <strong>only by IP address</strong> (which changes on every restart) and all share one flat network. User-defined bridge networks fix both:</p>
+<ul>
+<li><strong>Automatic DNS</strong>: containers resolve each other by <em>name</em> (or service alias) via Docker's embedded DNS server at <code>127.0.0.11</code>.</li>
+<li><strong>Better isolation</strong>: only containers on the same network can talk.</li>
+<li><strong>Live attach/detach</strong> without restarting.</li>
+</ul>
+<pre><code>docker network create appnet
+docker run -d --name db  --network appnet -e POSTGRES_PASSWORD=pw postgres:16
+docker run -d --name api --network appnet -e DATABASE_URL=postgres://postgres:pw@db:5432/postgres myapp:1.0
+#                                                                              ^^ resolved by name
+
+docker exec api getent hosts db          # 172.18.0.2  db
+docker exec api ping -c1 db
+docker network connect appnet other      # attach a running container
+docker network rm appnet</code></pre>
+<div class="callout key"><strong>Always use a user-defined network</strong><p>Docker Compose does this for you automatically: each project gets its own network and each service name becomes a DNS name. That is why your app connects to host <code>db</code> or <code>redis</code> instead of an IP.</p></div>
+
+<h2>Port publishing</h2>
+<p>A container's ports are private to its network by default. <code>-p</code> publishes them on the host so outside clients can reach them.</p>
+<pre><code>-p 8080:80                 # host 8080 -&gt; container 80, on ALL host interfaces (0.0.0.0)
+-p 127.0.0.1:8080:80       # only reachable from the host itself
+-p 8080:80/udp             # UDP
+-p 3000-3005:3000-3005     # ranges
+-p 80                      # random host port; find it with: docker port web
+-P                         # publish all EXPOSEd ports to random host ports</code></pre>
+<p><code>EXPOSE</code> in a Dockerfile is just documentation; only <code>-p</code>/<code>-P</code> actually publishes.</p>
+<div class="callout warn"><strong>Published ports bypass your firewall</strong><p>Docker inserts its own iptables rules ahead of ufw/firewalld rules. <code>-p 5432:5432</code> on a cloud VM exposes Postgres to the internet even if ufw says "deny". Bind to <code>127.0.0.1</code> for anything not meant to be public, put only your reverse proxy on public ports, and use cloud security groups as the real perimeter.</p></div>
+
+<h2>Container-to-container vs. container-to-host</h2>
+<table>
+<tr><th>From</th><th>To</th><th>Address to use</th></tr>
+<tr><td>Container</td><td>Another container, same user-defined network</td><td>Service/container name and the <em>container's</em> port: <code>http://api:3000</code></td></tr>
+<tr><td>Container</td><td>The host machine (Docker Desktop)</td><td><code>host.docker.internal</code></td></tr>
+<tr><td>Container</td><td>The host machine (Linux)</td><td><code>--add-host=host.docker.internal:host-gateway</code> then the same name, or the bridge gateway IP</td></tr>
+<tr><td>Host</td><td>A container</td><td><code>localhost:&lt;published host port&gt;</code></td></tr>
+<tr><td>Container</td><td>Internet</td><td>Works via NAT; DNS comes from the host's resolver</td></tr>
+</table>
+<div class="callout warn"><strong>"localhost" inside a container is the container itself</strong><p>The single most common networking bug: your API container uses <code>localhost:5432</code> to reach Postgres. That points at the API container's own loopback, where nothing listens. Use the service name (<code>db:5432</code>). Also note that between containers you use the container's internal port (<code>5432</code>), not the host-published one.</p></div>
+<div class="callout warn"><strong>Bind to 0.0.0.0, not 127.0.0.1</strong><p>If your app listens only on <code>127.0.0.1</code> <em>inside</em> the container, traffic arriving via the bridge (or a published port) is refused. Configure the server to listen on <code>0.0.0.0</code> (e.g. <code>uvicorn --host 0.0.0.0</code>, <code>app.listen(3000, '0.0.0.0')</code>).</p></div>
+
+<h2>Putting it together: three-tier example</h2>
+<pre><code>docker network create front
+docker network create back
+
+docker run -d --name db    --network back  postgres:16
+docker run -d --name api   --network back  myapi:1.0
+docker network connect front api              # api is on BOTH networks
+docker run -d --name proxy --network front -p 80:80 nginx:1.27
+# proxy can reach api (front) but NOT db; db is invisible from the proxy.</code></pre>
+<pre class="diagram">
+ Internet ──:80──▶ [proxy] ── front ──▶ [api] ── back ──▶ [db]
+                      proxy cannot see db  ────────────╳
+</pre>
+<p>Segmenting networks like this is cheap defense in depth. For a stronger variant, <code>docker network create --internal back</code> blocks all outbound internet access from that network.</p>
+
+<h2>DNS details</h2>
+<ul>
+<li>On user-defined networks, name resolution uses the embedded DNS server; unresolved names are forwarded to the host's DNS.</li>
+<li>Add aliases: <code>docker run --network appnet --network-alias cache redis</code>. Multiple containers sharing an alias get round-robin DNS.</li>
+<li>Override DNS: <code>--dns 1.1.1.1</code>; add static entries with <code>--add-host name:ip</code>.</li>
+<li>Corporate VPN or split-horizon DNS often breaks name resolution inside containers. Check <code>docker exec c cat /etc/resolv.conf</code>.</li>
+</ul>
+
+<h2>Host networking and its trade-offs</h2>
+<p><code>--network host</code> removes the NAT hop and the namespace boundary: no <code>-p</code> needed, slightly better throughput and latency, ability to bind many ports. In exchange you lose port isolation (two containers cannot both listen on 80), and the container can see and bind host interfaces. It is useful for network monitoring agents or high-throughput proxies; avoid for ordinary apps.</p>
+
+<h2>IPv6 and custom subnets</h2>
+<pre><code>docker network create --subnet 10.50.0.0/24 --gateway 10.50.0.1 appnet
+docker network create --ipv6 --subnet 2001:db8:1::/64 v6net
+docker network inspect appnet --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'</code></pre>
+<p>If your corporate network or VPN uses the same private ranges Docker picks by default (172.17-31.x), routing silently breaks. Define <code>default-address-pools</code> in <code>/etc/docker/daemon.json</code> to avoid overlaps.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Default bridge: no name resolution. Use a user-defined network.</li>
+<li>Using the host-published port between containers.</li>
+<li>Starting the app before the DB is ready (see Compose healthchecks).</li>
+<li>Port already allocated: another process or container holds the host port; <code>lsof -i :8080</code> or <code>docker ps</code>.</li>
+<li>Docker Desktop's <code>host</code> mode behaves differently from Linux since the engine runs in a VM.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Start two alpine containers on the default bridge and try <code>ping</code> by name (fails) and by IP (works). Repeat on a user-defined network.</li>
+<li>Run nginx with <code>-p 127.0.0.1:8080:80</code>, then try reaching it from another machine or via your LAN IP and see it refused. Compare with <code>-p 8080:80</code>.</li>
+<li>Run <code>docker run --rm --network host alpine ip addr</code> and compare with the default. What changed?</li>
+<li>Build the front/back network example and prove with <code>docker exec proxy ping db</code> that isolation works.</li>
+</ol></div>

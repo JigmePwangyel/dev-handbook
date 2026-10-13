@@ -1,0 +1,155 @@
+<h1>DevOps Interview Questions and Strong Answers</h1>
+<p class="lead">Forty realistic questions grouped by topic, each with a concise answer of the kind that impresses an interviewer. Do not memorise the wording: understand the reasoning, add an example from your own projects, and be ready for the follow-up "why?" and "what are the trade-offs?".</p>
+
+<div class="callout tip"><strong>How to answer</strong><p>Structure: one-sentence definition, why it exists, a concrete example, a trade-off or failure mode. Saying "it depends, and here is on what" is a strong answer when followed by actual criteria. For troubleshooting questions, narrate a method (observe, hypothesise, test), not a guess.</p></div>
+
+<h2>Fundamentals and culture</h2>
+<h3>1. What is DevOps, in your own words?</h3>
+<p>A culture and set of practices that unifies building and running software so teams ship small changes frequently, safely and with fast feedback. Automation (CI/CD, IaC), shared ownership and measurement (DORA metrics) are the pillars; tools are secondary.</p>
+
+<h3>2. What are the DORA metrics?</h3>
+<p>Deployment frequency, lead time for changes, change failure rate and time to restore service (recent versions also stress reliability). The first two measure speed, the last two stability; high performers are good at both, which disproves the idea that speed trades off against safety.</p>
+
+<h3>3. Explain SRE versus DevOps.</h3>
+<p>DevOps is a philosophy; SRE is a concrete implementation of it from Google: treat operations as a software problem, define SLOs, use error budgets to balance feature velocity against reliability, cap toil at around 50% and write blameless postmortems.</p>
+
+<h3>4. What is an SLI, SLO, SLA and error budget?</h3>
+<p>SLI is a measured indicator (percentage of requests under 300 ms and non-5xx). SLO is the internal target for it (99.9% over 30 days). SLA is the contractual promise with penalties, usually looser. The error budget is 100% minus the SLO (about 43 minutes a month at 99.9%); when it is spent, you slow feature releases and prioritise reliability.</p>
+
+<h3>5. What is a blameless postmortem and why?</h3>
+<p>A written review of an incident that focuses on systemic causes, timeline, impact, what worked and concrete follow-ups with owners, without blaming individuals. People hide mistakes when blamed; hidden mistakes cannot be fixed. Human error is a symptom of a system that allowed it.</p>
+
+<h2>Linux and networking</h2>
+<h3>6. A server is slow. How do you investigate?</h3>
+<p>Use a method, such as the USE approach, for each resource. <code>uptime</code>/<code>top</code> for load and CPU, <code>free -h</code> and <code>vmstat</code> for memory and swapping, <code>iostat -x</code> for disk, <code>ss -s</code> and <code>sar -n DEV</code> for network, then identify the process with <code>pidstat</code> or <code>top</code>. Check logs and <code>dmesg</code> for OOM kills, and recent deploys or config changes. Narrow before acting.</p>
+
+<h3>7. Explain Linux file permissions: what does 754 mean?</h3>
+<p>Octal for owner, group, others: 7 = rwx, 5 = r-x, 4 = r--. Owner full control, group read and execute, others read only. On directories, x means permission to traverse. Special bits: setuid, setgid, sticky.</p>
+
+<h3>8. What happens when you type <code>https://example.com</code> in a browser?</h3>
+<p>DNS resolution (cache, resolver, root, TLD, authoritative) gives an IP; TCP handshake (or QUIC for HTTP/3); TLS handshake validates the certificate and negotiates keys; HTTP request goes through CDN/load balancer/reverse proxy to an app server, which may query a cache or database; the response returns and the browser renders, fetching further assets.</p>
+
+<h3>9. Difference between a process, a thread and a container?</h3>
+<p>A process has its own memory space; threads share a process's memory. A container is just a process (or group) isolated with namespaces (pid, net, mount, user) and limited with cgroups (CPU, memory), sharing the host kernel, unlike a VM which runs its own kernel on virtualised hardware.</p>
+
+<h3>10. "Connection refused" versus "connection timed out"?</h3>
+<p>Refused means the packet reached the host and nothing is listening on that port (or a firewall actively rejects): check the service and bind address. Timeout means packets are being dropped silently or not routed: firewall/security group, wrong IP, routing. Tools: <code>ss -tlnp</code> on the server, <code>nc -zv</code> and <code>traceroute</code> from the client.</p>
+
+<h3>11. What is DNS TTL and why does it matter for migrations?</h3>
+<p>The time resolvers may cache a record. Before cutting over an IP, lower the TTL (for example to 60 s) a full old-TTL period in advance, switch, then raise it again. Otherwise some users keep hitting the old server for hours.</p>
+
+<h3>12. Reverse proxy versus load balancer versus API gateway?</h3>
+<p>A reverse proxy sits in front of servers handling TLS, caching and routing (nginx). A load balancer distributes traffic across instances using health checks and algorithms (L4 or L7). An API gateway adds API-specific features: auth, rate limiting, request transformation, versioning. Products often combine all three roles.</p>
+
+<h2>Git and CI/CD</h2>
+<h3>13. What is the difference between CI, continuous delivery and continuous deployment?</h3>
+<p>CI: merge frequently and automatically build and test every change. Continuous delivery: every passing change is releasable and deployable with one approval. Continuous deployment: every passing change goes to production automatically.</p>
+
+<h3>14. Merge versus rebase?</h3>
+<p>Merge preserves history with a merge commit; safe on shared branches. Rebase replays your commits on a new base for linear history; never rebase commits others have based work on. Common practice: rebase or squash your own feature branch, then merge via PR.</p>
+
+<h3>15. Design a CI/CD pipeline for a web app.</h3>
+<p>On PR: lint, unit tests, dependency and secret scans, build. On merge to main: build an immutable image tagged by commit SHA, scan and sign it, push to a registry, deploy to staging automatically, run integration/smoke tests, then promote the <em>same</em> image to production (with approval if needed) using a rolling or canary strategy, post-deploy health checks and automatic rollback on failure. Add notifications and deployment metrics.</p>
+
+<h3>16. How do you keep pipelines fast?</h3>
+<p>Cache dependencies and Docker layers, run jobs in parallel, run only affected tests, fail fast with cheap checks first, use smaller images and better runners, split slow end-to-end suites into a later stage and cancel superseded runs.</p>
+
+<h3>17. How do you handle secrets in CI?</h3>
+<p>Use the platform's encrypted secrets scoped per environment, prefer OIDC federation to cloud roles over long-lived keys, never print them, restrict them from fork PRs, rotate regularly, and pull runtime secrets from a manager at deploy time rather than baking them into artifacts.</p>
+
+<h3>18. A flaky test fails 1 in 20 runs. What do you do?</h3>
+<p>Do not just re-run. Quarantine it quickly so it stops blocking people, track it as a bug, find the cause (shared state, time, ordering, network, race conditions), fix or delete it. Flaky tests erode trust in the pipeline, which is worse than missing tests.</p>
+
+<h2>Containers and Kubernetes</h2>
+<h3>19. Explain image layers and why Dockerfile order matters.</h3>
+<p>Each instruction creates a cached layer. A change invalidates that layer and all later ones, so put rarely changing steps (OS packages, dependency install from the lockfile) first and frequently changing source last. Multi-stage builds keep build tools out of the final image.</p>
+
+<h3>20. A container keeps restarting. How do you debug it?</h3>
+<p><code>docker ps -a</code> and exit code (137 = SIGKILL often OOM, 1 = app error), <code>docker logs</code>, <code>docker inspect</code> for OOMKilled and restart policy, run it interactively with the entrypoint overridden, check env vars, mounted files and dependencies, and health checks that may be killing it.</p>
+
+<h3>21. What is the difference between a Deployment, StatefulSet and DaemonSet?</h3>
+<p>Deployment: interchangeable stateless replicas with rolling updates. StatefulSet: stable identities and per-pod persistent storage, ordered rollout, for databases/clusters. DaemonSet: one pod per node, for agents like log shippers and node exporters.</p>
+
+<h3>22. A pod is in CrashLoopBackOff. Walk me through it.</h3>
+<p><code>kubectl describe pod</code> for events and last state/exit code, <code>kubectl logs --previous</code> for the crashed run, check config and secrets referenced, failing probes, resource limits (OOMKilled), image and command, and dependencies like the database being unreachable. Fix, then watch the rollout.</p>
+
+<h3>23. Liveness versus readiness versus startup probes?</h3>
+<p>Readiness decides whether the pod receives traffic; failing removes it from Service endpoints. Liveness decides whether to restart the container; use it only for unrecoverable hangs and keep it independent of dependencies, otherwise a database blip restarts everything. Startup probe delays the others for slow-starting apps.</p>
+
+<h3>24. How do requests and limits work?</h3>
+<p>Requests are what the scheduler reserves and what QoS is based on; limits are caps enforced at runtime. CPU over limit is throttled; memory over limit gets OOMKilled. Setting requests too low causes noisy neighbours; limits too low cause throttling and kills. Many teams set memory request = limit and avoid tight CPU limits.</p>
+
+<h3>25. How does a Service reach pods, and how does Ingress fit?</h3>
+<p>A Service selects pods by label and gets a stable virtual IP and DNS name; kube-proxy (or eBPF dataplane) load balances to ready endpoints. Ingress or Gateway API exposes HTTP(S) routes from outside via a controller such as nginx or Envoy, routing by host and path to Services.</p>
+
+<h3>26. When would you not use Kubernetes?</h3>
+<p>Small teams with a handful of services, simple workloads or tight budgets: a PaaS, managed containers (Cloud Run, ECS Fargate) or plain VMs with Compose are cheaper to operate. Kubernetes pays off with many services, multi-team platforms, need for portability or advanced scheduling, and the skills to run it.</p>
+
+<h2>Infrastructure as Code and cloud</h2>
+<h3>27. Why IaC, and what is Terraform state?</h3>
+<p>IaC makes infrastructure reviewable, versioned, repeatable and testable. Terraform state maps your configuration to real resources so it can compute diffs. Store it remotely with locking and encryption, since it may contain secrets, and never edit it by hand except via <code>terraform state</code> commands.</p>
+
+<h3>28. What is drift and how do you handle it?</h3>
+<p>Drift is reality diverging from code, usually from manual console changes. Detect with scheduled <code>terraform plan</code>; fix by either reverting the change or codifying it; prevent by restricting console write access so IaC is the only path.</p>
+
+<h3>29. Terraform versus Ansible?</h3>
+<p>Terraform is declarative provisioning of infrastructure (networks, instances, managed services) with state. Ansible is agentless configuration management over SSH (packages, files, services), procedural by default though idempotent modules help. They combine well: Terraform creates servers, Ansible or cloud-init configures them. Immutable images (Packer) or containers reduce the need for config management.</p>
+
+<h3>30. Explain a VPC with public and private subnets.</h3>
+<p>A VPC is an isolated virtual network. Public subnets route to an internet gateway and host load balancers and NAT. Private subnets have no direct inbound internet; their outbound traffic goes via NAT. Put app servers and databases in private subnets; control access with security groups (stateful, per-resource) and NACLs (stateless, per-subnet).</p>
+
+<h3>31. IAM best practices?</h3>
+<p>Least privilege, roles with temporary credentials instead of long-lived keys, MFA on humans, no shared accounts, no root usage, separate accounts per environment, policy review with access analyzer, and OIDC for CI. Prefer resource-scoped policies over wildcards.</p>
+
+<h3>32. How would you design for high availability on AWS?</h3>
+<p>Multiple AZs: instances in an Auto Scaling group behind an ALB with health checks, RDS Multi-AZ, state in managed services (S3, DynamoDB, ElastiCache), infrastructure in IaC, health-checked DNS failover if multi-region is required. Eliminate single points of failure and test by killing instances.</p>
+
+<h2>Deployment strategies and reliability</h2>
+<h3>33. Blue-green versus canary versus rolling?</h3>
+<p>Rolling replaces instances gradually using the same capacity; simple, but versions coexist. Blue-green keeps two full environments and switches traffic at once, giving instant rollback at double the cost. Canary sends a small percentage to the new version and expands as metrics stay healthy, limiting blast radius and ideally automated via metric analysis (Argo Rollouts, Flagger).</p>
+
+<h3>34. How do you do zero-downtime database migrations?</h3>
+<p>Expand and contract: make additive, backward-compatible changes first (new nullable column, concurrent index), deploy code that handles both, backfill in batches, switch reads, then remove the old structure in a later release. Use lock and statement timeouts, and never combine a breaking schema change with the code deploy.</p>
+
+<h3>35. You deployed and error rates spiked. What now?</h3>
+<p>Stabilise first: roll back (or flip the feature flag) rather than debug live, confirm recovery in metrics, communicate status. Then investigate with logs, traces and the diff, write a postmortem, and add a test or guardrail so it cannot recur. Mitigation before root cause.</p>
+
+<h3>36. What is the difference between monitoring and observability?</h3>
+<p>Monitoring checks known failure modes (dashboards and alerts on predefined metrics). Observability is the ability to ask new questions about system behaviour from its telemetry (logs, metrics, traces with high-cardinality context), which is needed to debug unknown unknowns in distributed systems.</p>
+
+<h3>37. How do you design good alerts?</h3>
+<p>Alert on symptoms that affect users (error rate, latency, availability against SLOs), not every cause. Each alert must be actionable, have a runbook and a clear severity, and page only for urgent issues; route the rest to tickets. Use burn-rate alerts on SLOs, and review noisy alerts regularly to fight fatigue.</p>
+
+<h2>Security and operations</h2>
+<h3>38. How do you secure the software supply chain?</h3>
+<p>Pin and lock dependencies, scan them and images in CI, generate SBOMs, build in hardened CI with provenance (SLSA), sign artifacts (cosign) and verify signatures at deploy, pin GitHub Actions to SHAs, use OIDC rather than stored credentials, protect branches and require reviews, and keep base images patched.</p>
+
+<h3>39. A secret was committed to a public repo. What do you do?</h3>
+<p>Revoke and rotate it immediately (removal from git history is secondary), check provider audit logs for misuse in the exposure window, then clean history if appropriate, find how it slipped through, and add pre-commit and CI secret scanning plus push protection. Document it in a blameless review.</p>
+
+<h3>40. How do you decide on backup strategy and prove it works?</h3>
+<p>Start from the business RPO and RTO. Use 3-2-1 with an immutable, separate-account copy, point-in-time recovery for databases, and encryption with keys backed up separately. Prove it by automated, timed restore tests and periodic game days; alert when backups stop arriving. An untested backup is not a backup.</p>
+
+<h2>Scenario bonus: system design prompts</h2>
+<table>
+<tr><th>Prompt</th><th>Points to cover</th></tr>
+<tr><td>Take a startup's monolith from a single VPS to something resilient</td><td>Containerise, CI/CD, managed DB with backups, load balancer + 2 instances, CDN, monitoring, IaC, then iterate; avoid premature Kubernetes</td></tr>
+<tr><td>Site goes down at 3 a.m. and you are on call</td><td>Acknowledge, assess impact, check recent changes, roll back, communicate, mitigate, then postmortem</td></tr>
+<tr><td>Cut cloud costs by 30%</td><td>Measure first (tags, cost explorer), rightsize, remove idle resources, savings plans/spot for stateless, storage tiering, schedule non-prod off-hours, watch egress and NAT costs</td></tr>
+<tr><td>Onboard 20 developers to deploy themselves</td><td>Golden-path templates, self-service pipelines, guardrails via policy as code, docs, paved-road defaults and clear ownership</td></tr>
+</table>
+
+<h2>Questions to ask them</h2>
+<ul>
+<li>What does the deployment process look like, and how long from merge to production?</li>
+<li>How is on-call organised, and what was your last major incident and what changed afterwards?</li>
+<li>How do you handle toil and technical debt in infrastructure?</li>
+<li>What is the split between feature work and platform work for this role?</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Pick ten questions at random, answer each aloud in 90 seconds and record yourself. Listen for rambling and missing trade-offs.</li>
+<li>For five of the answers, attach a real example from your capstone project ("when I did the VPS deploy, I hit...").</li>
+<li>Pair with a friend: have them break something in your staging environment and narrate your debugging process aloud.</li>
+</ol></div>

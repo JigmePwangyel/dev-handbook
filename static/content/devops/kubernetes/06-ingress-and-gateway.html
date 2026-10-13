@@ -1,0 +1,138 @@
+<h1>Ingress and the Gateway API</h1>
+<p class="lead">Services expose ports; Ingress and Gateway expose HTTP(S) applications. They give you host and path routing, TLS termination and one shared entry point for dozens of services instead of one costly load balancer each.</p>
+
+<h2>Why Ingress exists</h2>
+<p>Suppose you have <code>shop</code>, <code>blog</code> and <code>api</code>. With LoadBalancer Services you pay for three cloud LBs, get three IPs, and handle TLS three times. What you want is one public entry point that looks at the HTTP <code>Host</code> header and path and routes: <code>shop.example.com</code> to the shop Service, <code>example.com/blog</code> to the blog, and so on. That is a layer 7 reverse proxy (see the Networking section), managed declaratively.</p>
+<pre class="diagram">
+ Internet ──▶ Cloud LB ──▶ Ingress controller Pods (nginx/Traefik/Envoy)
+                                  │ routes by host + path
+              ┌───────────────────┼───────────────────┐
+              ▼                   ▼                   ▼
+        Service shop        Service blog         Service api
+</pre>
+
+<h2>Two parts: resource and controller</h2>
+<p>An <code>Ingress</code> object is just a set of routing rules. Nothing happens until an <strong>Ingress controller</strong> is installed to watch those objects and configure a real proxy. Kubernetes does not ship one. Common choices:</p>
+<table>
+<tr><th>Controller</th><th>Notes</th></tr>
+<tr><td>ingress-nginx</td><td>Very widespread; the community project is being retired (best-effort maintenance only after March 2026), so check migration plans for new builds</td></tr>
+<tr><td>Traefik</td><td>Dynamic config, built-in Let's Encrypt, default in k3s</td></tr>
+<tr><td>HAProxy, Kong, Contour/Envoy</td><td>Performance or API-gateway features</td></tr>
+<tr><td>Cloud-native (AWS Load Balancer Controller, GKE Ingress)</td><td>Provisions the cloud's own L7 LB per Ingress</td></tr>
+</table>
+<p>Pick one with <code>ingressClassName</code>; a cluster can have several.</p>
+
+<h2>An Ingress example</h2>
+<pre><code>apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod   # request a certificate
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [shop.example.com, api.example.com]
+      secretName: web-tls            # cert-manager creates and renews this
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: shop, port: { number: 80 } }
+    - host: api.example.com
+      http:
+        paths:
+          - path: /v1
+            pathType: Prefix
+            backend:
+              service: { name: api, port: { number: 80 } }</code></pre>
+<p>Install ingress-nginx on kind or minikube with their documented manifests/addons, then point DNS (or <code>/etc/hosts</code> or a <code>*.localtest.me</code> wildcard) at the controller's address.</p>
+
+<h2>TLS automation with cert-manager</h2>
+<p>Manually buying and rotating certificates does not scale and expired certs are a classic outage. <strong>cert-manager</strong> is an operator that obtains certificates from Let's Encrypt (or an internal CA) and renews them automatically about 30 days before expiry.</p>
+<pre><code>helm repo add jetstack https://charts.jetstack.io
+helm install cert-manager jetstack/cert-manager \
+  -n cert-manager --create-namespace --set crds.enabled=true</code></pre>
+<pre><code>apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx</code></pre>
+<p>The flow: the Ingress annotation causes cert-manager to create a <code>Certificate</code>, which creates an ACME <code>Order</code>; Let's Encrypt validates domain ownership by requesting a token over HTTP (HTTP-01) or via a DNS TXT record (DNS-01, required for wildcard certs); the signed certificate is stored in the Secret named in <code>tls.secretName</code> and the controller picks it up.</p>
+<div class="callout tip"><strong>Use staging first</strong><p>Let's Encrypt production has strict rate limits. Create a second ClusterIssuer pointing at the staging server and test with it before switching.</p></div>
+
+<h2>Limitations of Ingress</h2>
+<ul>
+<li>It only models HTTP(S). TCP/UDP, gRPC routing, header matching and traffic splitting need vendor-specific <strong>annotations</strong> that are not portable.</li>
+<li>One resource mixes the concerns of infrastructure admins (which load balancer, which certs) and app developers (which paths).</li>
+</ul>
+
+<h2>Gateway API: the successor</h2>
+<p>The Gateway API (<code>gateway.networking.k8s.io</code>) is the official, more expressive replacement, GA for core HTTP features and supported by Envoy Gateway, Istio, Cilium, Traefik, NGINX Gateway Fabric, Contour and cloud providers. It splits roles into separate objects:</p>
+<table>
+<tr><th>Object</th><th>Owned by</th><th>Purpose</th></tr>
+<tr><td><code>GatewayClass</code></td><td>Infrastructure provider</td><td>Which implementation (like StorageClass)</td></tr>
+<tr><td><code>Gateway</code></td><td>Cluster operator</td><td>Listeners: ports, protocols, hostnames, TLS</td></tr>
+<tr><td><code>HTTPRoute</code>, <code>GRPCRoute</code>, <code>TCPRoute</code></td><td>App developers</td><td>Routing rules attached to a Gateway</td></tr>
+</table>
+<pre><code>apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: infra
+spec:
+  gatewayClassName: envoy
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.example.com"
+      tls:
+        mode: Terminate
+        certificateRefs: [{ name: wildcard-tls }]
+      allowedRoutes:
+        namespaces: { from: All }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop
+  namespace: shop
+spec:
+  parentRefs: [{ name: public, namespace: infra }]
+  hostnames: ["shop.example.com"]
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      backendRefs:
+        - { name: shop-v1, port: 80, weight: 90 }   # canary: 90/10 split
+        - { name: shop-v2, port: 80, weight: 10 }</code></pre>
+<p>Native support for weighted traffic splitting, header matching, redirects, rewrites and cross-namespace delegation replaces the pile of annotations. For new clusters, prefer Gateway API; keep Ingress where it already works.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Forgetting <code>ingressClassName</code>: no controller claims the Ingress and nothing happens.</li>
+<li>The backend Service has no ready endpoints: you get 503 from the proxy. Check <code>kubectl get endpointslices</code>.</li>
+<li>Path rewriting surprises: <code>/api</code> forwarded as-is to an app expecting <code>/</code>. Configure rewrite or make the app base-path aware.</li>
+<li>HTTP-01 challenges fail if DNS does not point at the controller or a redirect rule blocks <code>/.well-known/acme-challenge</code>.</li>
+<li>Large uploads hit default proxy body size limits (nginx: 1 MB).</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>On kind (with the extraPortMappings config from lesson 3) install an ingress controller and create an Ingress routing <code>/a</code> and <code>/b</code> to two different echo Services.</li>
+<li>Read <code>kubectl describe ingress</code> and find the backends and any events.</li>
+<li>Stretch: install cert-manager with a self-signed ClusterIssuer and get a TLS Secret issued for a local hostname.</li>
+</ol></div>

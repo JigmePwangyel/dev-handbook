@@ -1,0 +1,122 @@
+<h1>Storage: Volumes, PVs and PVCs</h1>
+<p class="lead">Container filesystems vanish when a container restarts. Anything that must survive, such as a database, uploaded files or a queue, needs a volume whose lifecycle is independent of the Pod. Kubernetes abstracts storage so your YAML does not care whether the disk is an EBS volume, a Google Persistent Disk or an NFS share.</p>
+
+<h2>The problem</h2>
+<p>A container's writable layer is deleted with the container. Even within a Pod, a restarted container starts clean. And since Pods can be rescheduled to another node, data on a node's local disk may not follow. We need storage that is (a) outside the container, (b) optionally outside the node, and (c) requested by developers without knowing infrastructure details.</p>
+
+<h2>Ephemeral volumes</h2>
+<table>
+<tr><th>Type</th><th>Lifetime</th><th>Use</th></tr>
+<tr><td><code>emptyDir</code></td><td>Lives as long as the Pod (survives container restarts)</td><td>Scratch space, sharing files between containers; <code>medium: Memory</code> for tmpfs</td></tr>
+<tr><td><code>configMap</code> / <code>secret</code></td><td>Pod</td><td>Config files</td></tr>
+<tr><td><code>hostPath</code></td><td>Node's disk</td><td>Node agents only; a security risk, avoid for apps</td></tr>
+</table>
+<pre><code>volumes:
+  - name: cache
+    emptyDir:
+      sizeLimit: 1Gi</code></pre>
+
+<h2>Persistent storage: three objects</h2>
+<pre class="diagram">
+  Developer              Cluster admin / provisioner         Cloud / storage
+ ┌────────────┐ binds  ┌───────────────┐ backed by  ┌───────────────┐
+ │    PVC     │───────▶│      PV       │───────────▶│ EBS / PD / NFS │
+ │ "20Gi, RWO"│        │ real volume   │            └───────────────┘
+ └─────┬──────┘        └───────────────┘
+       │ created on demand by
+ ┌─────▼──────────┐
+ │ StorageClass   │  "gp3", "premium-ssd": provisioner + parameters
+ └────────────────┘
+</pre>
+<ul>
+<li><strong>PersistentVolume (PV)</strong>: a piece of storage in the cluster. A cluster-scoped resource, backed by a real disk.</li>
+<li><strong>PersistentVolumeClaim (PVC)</strong>: a developer's request: "I need 20 Gi, single-writer". Namespaced. Kubernetes binds it to a matching PV.</li>
+<li><strong>StorageClass</strong>: describes a tier of storage and the provisioner that creates it. With <strong>dynamic provisioning</strong>, creating a PVC causes the provisioner (a CSI driver) to create the disk and PV automatically. Nobody pre-creates PVs by hand any more.</li>
+</ul>
+
+<h3>StorageClass</h3>
+<pre><code>apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+reclaimPolicy: Delete             # or Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer   # create the disk in the zone where the Pod lands</code></pre>
+<p>Check what exists: <code>kubectl get storageclass</code>. kind and minikube include a default one using local disk.</p>
+
+<h3>PVC and using it in a Pod</h3>
+<pre><code>apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: fast
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: uploader }
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+      volumeMounts:
+        - { name: data, mountPath: /usr/share/nginx/uploads }
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: uploads }</code></pre>
+
+<h3>Access modes</h3>
+<table>
+<tr><th>Mode</th><th>Meaning</th><th>Typical backing</th></tr>
+<tr><td><code>ReadWriteOnce</code> (RWO)</td><td>One node mounts read-write</td><td>Block disks (EBS, PD)</td></tr>
+<tr><td><code>ReadWriteOncePod</code> (RWOP)</td><td>Exactly one Pod</td><td>CSI drivers supporting it</td></tr>
+<tr><td><code>ReadOnlyMany</code> (ROX)</td><td>Many nodes read-only</td><td>NFS, some file stores</td></tr>
+<tr><td><code>ReadWriteMany</code> (RWX)</td><td>Many nodes read-write</td><td>EFS, Filestore, CephFS, NFS</td></tr>
+</table>
+<p>Block disks are RWO and zone-bound: a Pod using an EBS volume in us-east-1a cannot start in 1b. This is why <code>WaitForFirstConsumer</code> matters, and why Deployments with RWO volumes and several replicas on different nodes fail.</p>
+
+<h2>Reclaim policy and data safety</h2>
+<ul>
+<li><code>Delete</code>: deleting the PVC deletes the PV and the cloud disk. Convenient, dangerous for important data.</li>
+<li><code>Retain</code>: the PV and disk remain after the PVC is deleted for manual recovery. Use for precious data.</li>
+</ul>
+<div class="callout warn"><strong>PVCs are not backups</strong><p>A volume is one copy of data on one disk. Use VolumeSnapshots (CSI) and tools like Velero for backups, and database-level backups for databases. Test restores.</p></div>
+
+<h2>StatefulSet volumes</h2>
+<p>With a Deployment all replicas share one PVC (only works for RWX). A StatefulSet's <code>volumeClaimTemplates</code> instead creates a PVC <em>per replica</em> (<code>data-db-0</code>, <code>data-db-1</code>), and when Pod <code>db-1</code> is rescheduled it reattaches to <code>data-db-1</code>. Scaling the StatefulSet down does not delete PVCs by default (configurable via <code>persistentVolumeClaimRetentionPolicy</code>), protecting data but leaving orphaned disks to clean up.</p>
+
+<h2>Expanding and snapshotting</h2>
+<pre><code># expand (StorageClass needs allowVolumeExpansion: true); you can only grow
+kubectl patch pvc uploads -p '{"spec":{"resources":{"requests":{"storage":"50Gi"}}}}'
+
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata: { name: uploads-snap }
+spec:
+  volumeSnapshotClassName: csi-snap
+  source: { persistentVolumeClaimName: uploads }</code></pre>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>PVC stuck <code>Pending</code>: no default StorageClass, wrong class name, no capacity, or a CSI driver not installed. <code>kubectl describe pvc</code> tells you.</li>
+<li>Pod stuck <code>ContainerCreating</code> with a "Multi-Attach error": an RWO volume is still attached to another node (old Pod terminating).</li>
+<li>Running databases on network disks has latency; for high performance consider local SSDs with replication handled by the database.</li>
+<li>Do not use <code>hostPath</code> for app data: it ties the Pod to one node and is a container-escape risk.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>On your kind cluster create a PVC and a Pod writing a file into it. Delete the Pod, recreate it, and confirm the file persists.</li>
+<li>Run <code>kubectl get pv,pvc,storageclass</code> and trace the binding.</li>
+<li>Create a 2-replica StatefulSet with volumeClaimTemplates and observe the per-Pod PVCs.</li>
+</ol></div>

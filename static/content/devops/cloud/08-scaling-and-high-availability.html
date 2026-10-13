@@ -1,0 +1,142 @@
+<h1>Scaling and High Availability</h1>
+<p class="lead">Two questions drive production architecture. <strong>Scaling</strong>: can the system handle more load? <strong>High availability (HA)</strong>: does it keep working when parts fail? Hardware fails, deploys break, traffic spikes. The cloud gives you the tools; design is up to you.</p>
+
+<h2>Vertical vs horizontal scaling</h2>
+<table>
+<tr><th></th><th>Vertical (scale up)</th><th>Horizontal (scale out)</th></tr>
+<tr><td>How</td><td>Bigger machine: more CPU/RAM</td><td>More machines behind a load balancer</td></tr>
+<tr><td>Simplicity</td><td>Very simple, no code changes</td><td>Requires stateless design</td></tr>
+<tr><td>Limit</td><td>Largest instance available; downtime to resize</td><td>Practically very high</td></tr>
+<tr><td>Failure</td><td>One big single point of failure</td><td>Lose one node, others carry on</td></tr>
+<tr><td>Cost curve</td><td>Gets superlinear at top end</td><td>Roughly linear</td></tr>
+</table>
+<p>Start vertical (it is easy and often enough, especially for databases). Go horizontal for the stateless application tier as you need resilience or exceed single-machine capacity.</p>
+
+<h2>Stateless design: the prerequisite</h2>
+<p>You can only add and remove copies of a server freely if any copy can serve any request. That means no state living <em>on</em> the instance:</p>
+<ul>
+<li><strong>Sessions</strong>: store in Redis/DB or use signed tokens (JWT), not in process memory.</li>
+<li><strong>Uploaded files</strong>: object storage, not local disk.</li>
+<li><strong>Caches</strong>: shared (Redis) or treat local caches as disposable.</li>
+<li><strong>Scheduled jobs</strong>: run in one place (a scheduler service, or a lock) so each replica does not run them.</li>
+<li><strong>Config</strong>: from env/parameter store, identical on every instance.</li>
+</ul>
+<p>Stateful things (databases, queues) live in dedicated managed services that handle their own replication.</p>
+
+<h2>Autoscaling</h2>
+<p>An <strong>Auto Scaling Group</strong> (ASG) keeps a number of identical instances running between a minimum and maximum, replacing unhealthy ones and adding/removing capacity from a <em>launch template</em>.</p>
+<pre><code>resource "aws_autoscaling_group" "web" {
+  name                = "web"
+  min_size            = 2          # never fewer than 2: survive an AZ loss
+  desired_capacity    = 2
+  max_size            = 12
+  vpc_zone_identifier = [aws_subnet.app_a.id, aws_subnet.app_b.id]  # 2 AZs
+  target_group_arns   = [aws_lb_target_group.web.arn]
+  health_check_type   = "ELB"      # replace instances failing LB health checks
+  health_check_grace_period = 120
+
+  launch_template {
+    id      = aws_launch_template.web.id
+    version = "$Latest"
+  }
+}
+
+resource "aws_autoscaling_policy" "cpu" {
+  name                   = "target-cpu-50"
+  autoscaling_group_name = aws_autoscaling_group.web.name
+  policy_type            = "TargetTrackingScaling"
+  target_tracking_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ASGAverageCPUUtilization"
+    }
+    target_value = 50
+  }
+}</code></pre>
+<h3>Scaling policy types</h3>
+<ul>
+<li><strong>Target tracking</strong> (recommended): "keep average CPU at 50%" or "keep 1000 requests per target". The service does the math.</li>
+<li><strong>Step scaling</strong>: add N instances at thresholds.</li>
+<li><strong>Scheduled</strong>: scale up before known peaks (9 a.m., Black Friday).</li>
+<li><strong>Predictive</strong>: learns daily/weekly patterns.</li>
+<li><strong>Queue-based</strong>: workers scale on queue depth (e.g. SQS messages per worker), often the best signal for async work.</li>
+</ul>
+<p>Kubernetes equivalents: HorizontalPodAutoscaler (pods) plus Cluster Autoscaler or Karpenter (nodes). ECS has Service Auto Scaling; Cloud Run scales on concurrency.</p>
+<div class="callout warn"><strong>Autoscaling is not instant</strong><p>New VMs take 1-5 minutes to boot and warm up. Sudden spikes can overwhelm you before capacity arrives. Keep headroom, use fast-booting images or containers, scale on leading indicators, and use rate limiting or queues to absorb bursts. Also scale <em>in</em> conservatively to avoid flapping.</p></div>
+
+<h2>High availability architecture</h2>
+<pre class="diagram">
+                     Route 53 (health-checked DNS)
+                              │
+                       CloudFront (CDN)
+                              │
+        ┌────────────── Region eu-west-1 ──────────────┐
+        │          Application Load Balancer           │
+        │          (spans all AZs, health checks)      │
+        │         ┌──────────────┼──────────────┐      │
+        │   ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐│
+        │   │   AZ-a    │  │   AZ-b    │  │   AZ-c    ││
+        │   │ app x2    │  │ app x2    │  │ app x2    ││  ASG spreads
+        │   └─────┬─────┘  └─────┬─────┘  └───────────┘│  across AZs
+        │         │              │                     │
+        │   ┌─────▼─────┐  ┌─────▼─────┐               │
+        │   │ RDS       │◀─┤ RDS       │   Redis       │
+        │   │ primary   │  │ standby   │   replicas    │
+        │   └───────────┘  └───────────┘               │
+        │         S3 (replicated across AZs by design) │
+        └──────────────────────────────────────────────┘
+</pre>
+<p>The principles:</p>
+<ol>
+<li><strong>No single point of failure</strong>: every layer has at least two of everything, in different failure domains.</li>
+<li><strong>Spread across AZs</strong>: lose a data center, keep serving. Size so that N-1 AZs can carry full load (with 3 AZs, run at about 60-65% max utilisation each).</li>
+<li><strong>Health checks + automatic replacement</strong>: the LB stops sending traffic to bad nodes; the ASG replaces them.</li>
+<li><strong>Managed multi-AZ data stores</strong> for state.</li>
+<li><strong>Graceful degradation</strong>: when a dependency fails, serve a reduced experience (cached data, disabled recommendations) rather than errors.</li>
+</ol>
+
+<h2>Availability math</h2>
+<table>
+<tr><th>Availability</th><th>Downtime / year</th><th>Downtime / month</th></tr>
+<tr><td>99%</td><td>3.65 days</td><td>7.3 hours</td></tr>
+<tr><td>99.9%</td><td>8.76 hours</td><td>43.8 minutes</td></tr>
+<tr><td>99.95%</td><td>4.38 hours</td><td>21.9 minutes</td></tr>
+<tr><td>99.99%</td><td>52.6 minutes</td><td>4.4 minutes</td></tr>
+</table>
+<p>Components in <strong>series</strong> multiply: a 99.9% LB, 99.9% app and 99.9% DB give about 99.7% overall. Redundant components in <strong>parallel</strong> multiply failure probabilities: two independent 99% nodes give 99.99%. That is why redundancy beats trying to make one node perfect, and why every extra hard dependency in a request path costs you nines.</p>
+
+<h2>Multi-region</h2>
+<p>A region outage is rare but real, and some businesses (or regulations) cannot tolerate one. Multi-region patterns, in rising cost and complexity:</p>
+<table>
+<tr><th>Pattern</th><th>Description</th><th>RTO / RPO</th></tr>
+<tr><td>Backup &amp; restore</td><td>Copy backups to another region; rebuild from IaC on disaster</td><td>Hours / minutes-hours</td></tr>
+<tr><td>Pilot light</td><td>Data replicated; minimal core running; scale up on failover</td><td>Tens of minutes / seconds-minutes</td></tr>
+<tr><td>Warm standby</td><td>Scaled-down full copy running</td><td>Minutes / seconds</td></tr>
+<tr><td>Active-active</td><td>Both regions serve traffic (latency or geo routing)</td><td>Near zero / near zero</td></tr>
+</table>
+<p>The hard part is <strong>data</strong>: cross-region replication is asynchronous (risking loss), and active-active writes require conflict handling (DynamoDB global tables, Aurora Global Database, CockroachDB/Spanner). Route 53 failover or latency routing with health checks steers users. Also design for control-plane independence: during a regional event, your failover process must not depend on that region's APIs. Most applications are better served by a solid multi-AZ design and a practised pilot-light DR plan than by active-active.</p>
+
+<h2>Capacity planning</h2>
+<ul>
+<li><strong>Load test</strong> (k6, Locust, Gatling) to find the throughput one instance sustains at acceptable latency. Capacity = peak load / per-instance throughput, plus headroom.</li>
+<li><strong>Know your bottleneck</strong>: usually the database (connections, IOPS, locks) long before the app tier. Autoscaling app servers just stampedes the DB.</li>
+<li><strong>Check quotas</strong>: service limits (vCPUs per region, ENIs, API rate limits) can block scale-out. Request increases ahead of launches.</li>
+<li><strong>Plan for events</strong>: marketing campaigns, launches, seasonal peaks. Pre-warm load balancers and scale proactively.</li>
+<li><strong>Re-measure</strong> after every major release.</li>
+</ul>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Autoscaling group with min=1 in a single AZ, the illusion of HA.</li>
+<li>Sticky sessions hiding statefulness, then uneven load and lost sessions on scale-in.</li>
+<li>Health checks too shallow (always 200) or too deep (failing when a non-critical dependency blips, causing cascading removal of all nodes).</li>
+<li>Untested failover: you do not have HA until you have killed an instance, an AZ, and the primary DB on purpose.</li>
+<li>Retry storms amplifying outages (see the resilience lesson in the Monitoring section).</li>
+<li>Scaling the app but not downstream limits (DB connections, third-party API rate limits).</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Build an ASG across two AZs behind an ALB. Terminate an instance manually and watch the replacement. Then simulate load with <code>hey -z 5m -c 100 http://your-alb/</code> and watch target tracking scale out.</li>
+<li>Failover a Multi-AZ RDS instance using "reboot with failover" and measure how long your app is unavailable and whether it reconnects by itself.</li>
+<li>Compute the combined availability of: CDN 99.99%, LB 99.99%, app 99.95% (two replicas independent), DB 99.95%.</li>
+</ol></div>

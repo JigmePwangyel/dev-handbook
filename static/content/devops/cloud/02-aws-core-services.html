@@ -1,0 +1,132 @@
+<h1>AWS Core Services: The Essential Map</h1>
+<p class="lead">AWS has 200+ services, but a typical production web application uses about a dozen. Learn these well and you can read almost any architecture diagram. The same concepts exist on Google Cloud and Azure under different names.</p>
+
+<h2>The big picture</h2>
+<pre class="diagram">
+ Users
+   │
+   ▼
+ Route 53 (DNS) ──▶ CloudFront (CDN + TLS) ──▶ S3 (static assets)
+                          │
+                          ▼
+                 ┌─────────────────── VPC ───────────────────┐
+                 │  Application Load Balancer (ELB)          │
+                 │      │               │                    │
+                 │   EC2 / ECS / EKS / Lambda (compute)      │
+                 │      │               │                    │
+                 │   RDS (database)   ElastiCache (cache)    │
+                 │      │                                    │
+                 │   EBS (disks)                             │
+                 └───────────────────────────────────────────┘
+   IAM controls who can do what everywhere.  CloudWatch watches everything.
+</pre>
+
+<h2>Compute</h2>
+<h3>EC2 (Elastic Compute Cloud)</h3>
+<p>Virtual machines. You choose an <strong>instance type</strong> (family + size, e.g. <code>t3.micro</code>, <code>m7g.large</code>, <code>c7i.xlarge</code>), an <strong>AMI</strong> (the OS image), a disk, a network location and a security group. Families: <code>t</code> burstable general purpose, <code>m</code> balanced, <code>c</code> compute-heavy, <code>r</code> memory-heavy, <code>g/p</code> GPU. A <code>g</code> suffix (e.g. <code>m7g</code>) means ARM Graviton chips, which are typically cheaper for the same performance.</p>
+<pre><code>aws ec2 run-instances \
+  --image-id ami-0abcdef1234567890 \
+  --instance-type t3.micro \
+  --key-name my-key \
+  --security-group-ids sg-0123456789abcdef0 \
+  --subnet-id subnet-0123456789abcdef0 \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=demo}]'</code></pre>
+
+<h3>Lambda</h3>
+<p>Run a function in response to an event (HTTP request, S3 upload, queue message, schedule). No servers to manage; billed per millisecond. Max 15 minutes per invocation.</p>
+
+<h3>ECS and EKS</h3>
+<p><strong>ECS</strong> (Elastic Container Service) is AWS's own container orchestrator, simple and deeply integrated; run it on EC2 or on <strong>Fargate</strong> (serverless containers: no instances to manage). <strong>EKS</strong> (Elastic Kubernetes Service) is managed Kubernetes: AWS runs the control plane, you run (or Fargate-run) the nodes.</p>
+
+<h2>Storage</h2>
+<h3>EBS (Elastic Block Store)</h3>
+<p>Network-attached disks for EC2. Behaves like a hard drive: one instance at a time (mostly), lives in one AZ, survives instance termination if configured. Types: <code>gp3</code> (default SSD), <code>io2</code> (high IOPS), <code>st1</code> (throughput HDD). Snapshot them for backups.</p>
+<h3>S3 (Simple Storage Service)</h3>
+<p>Object storage: store files ("objects") in "buckets", addressed by key, over HTTP. Effectively unlimited, 11 nines of durability, cheap. Used for static sites, uploads, backups, logs, data lakes. Not a filesystem: no partial in-place edits, no directories (just key prefixes).</p>
+<h3>EFS</h3>
+<p>Managed NFS: a shared filesystem mountable by many instances at once. Useful for legacy apps needing shared files; pricier than S3 or EBS.</p>
+
+<h2>Networking</h2>
+<ul>
+<li><strong>VPC</strong>: your private, isolated virtual network (next lesson).</li>
+<li><strong>ELB</strong>: load balancers. <strong>ALB</strong> (Layer 7, HTTP routing by path/host), <strong>NLB</strong> (Layer 4, TCP/UDP, extreme performance, static IPs).</li>
+<li><strong>Route 53</strong>: DNS plus health-checked routing (weighted, latency-based, failover).</li>
+<li><strong>CloudFront</strong>: CDN. Caches content at edge locations; terminates TLS near users; shields your origin.</li>
+<li><strong>API Gateway</strong>: managed front door for HTTP APIs, often in front of Lambda.</li>
+</ul>
+
+<h2>Databases</h2>
+<ul>
+<li><strong>RDS</strong>: managed PostgreSQL, MySQL, MariaDB, SQL Server, Oracle. Automated backups, patching, Multi-AZ failover, read replicas.</li>
+<li><strong>Aurora</strong>: AWS's cloud-native MySQL/Postgres-compatible engine with shared storage across 3 AZs.</li>
+<li><strong>DynamoDB</strong>: serverless key-value/document NoSQL with single-digit-ms latency at any scale.</li>
+<li><strong>ElastiCache</strong>: managed Redis/Valkey/Memcached for caching and sessions.</li>
+</ul>
+
+<h2>Security and identity</h2>
+<ul>
+<li><strong>IAM</strong>: users, roles, policies: every API call is authorised here.</li>
+<li><strong>KMS</strong>: encryption keys. <strong>Secrets Manager / SSM Parameter Store</strong>: store secrets and config.</li>
+<li><strong>ACM</strong>: free TLS certificates for ALB/CloudFront.</li>
+</ul>
+
+<h2>Observability</h2>
+<ul>
+<li><strong>CloudWatch</strong>: metrics, logs, alarms, dashboards. EC2 CPU is free by default; memory and disk need an agent.</li>
+<li><strong>CloudTrail</strong>: audit log of every API call (who did what, when). Enable it in every account.</li>
+</ul>
+
+<h2>Cross-cloud equivalents</h2>
+<table>
+<tr><th>Concept</th><th>AWS</th><th>Google Cloud</th><th>Azure</th></tr>
+<tr><td>Virtual machines</td><td>EC2</td><td>Compute Engine</td><td>Virtual Machines</td></tr>
+<tr><td>Block storage</td><td>EBS</td><td>Persistent Disk / Hyperdisk</td><td>Managed Disks</td></tr>
+<tr><td>Object storage</td><td>S3</td><td>Cloud Storage</td><td>Blob Storage</td></tr>
+<tr><td>Private network</td><td>VPC</td><td>VPC (global)</td><td>Virtual Network (VNet)</td></tr>
+<tr><td>Identity</td><td>IAM</td><td>Cloud IAM</td><td>Entra ID + Azure RBAC</td></tr>
+<tr><td>Managed relational DB</td><td>RDS / Aurora</td><td>Cloud SQL / AlloyDB</td><td>Azure Database / SQL Database</td></tr>
+<tr><td>Load balancer</td><td>ELB (ALB/NLB)</td><td>Cloud Load Balancing</td><td>Load Balancer / Application Gateway</td></tr>
+<tr><td>DNS</td><td>Route 53</td><td>Cloud DNS</td><td>Azure DNS</td></tr>
+<tr><td>CDN</td><td>CloudFront</td><td>Cloud CDN</td><td>Front Door / CDN</td></tr>
+<tr><td>Functions</td><td>Lambda</td><td>Cloud Functions / Cloud Run functions</td><td>Azure Functions</td></tr>
+<tr><td>Serverless containers</td><td>ECS Fargate / App Runner</td><td>Cloud Run</td><td>Container Apps</td></tr>
+<tr><td>Managed Kubernetes</td><td>EKS</td><td>GKE</td><td>AKS</td></tr>
+<tr><td>Monitoring</td><td>CloudWatch</td><td>Cloud Monitoring / Logging</td><td>Azure Monitor</td></tr>
+<tr><td>Audit log</td><td>CloudTrail</td><td>Cloud Audit Logs</td><td>Activity Log</td></tr>
+<tr><td>Secrets</td><td>Secrets Manager</td><td>Secret Manager</td><td>Key Vault</td></tr>
+<tr><td>Queue / pub-sub</td><td>SQS / SNS</td><td>Pub/Sub</td><td>Service Bus / Event Grid</td></tr>
+</table>
+
+<div class="callout tip"><strong>Learn concepts, not product names</strong><p>Once you understand "a private network with subnets and route tables", every cloud is a dialect. Notable differences: GCP VPCs are global (subnets are regional), Azure organises resources into Resource Groups, and AWS accounts are the strongest isolation boundary.</p></div>
+
+<h2>Accounts, regions and the CLI</h2>
+<p>Most services are <strong>regional</strong>: an S3 bucket's data lives in one region, an EC2 instance in one AZ. IAM, Route 53 and CloudFront are <strong>global</strong>. "Where did my resources go?" almost always means the console is set to a different region.</p>
+<pre><code># List S3 buckets (global listing, regional data)
+aws s3 ls
+
+# List EC2 instances in a region, compact output
+aws ec2 describe-instances --region us-east-1 \
+  --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name]' \
+  --output table
+
+# Upload a file and share it temporarily (presigned URL, 1 hour)
+aws s3 cp report.pdf s3://my-bucket/reports/report.pdf
+aws s3 presign s3://my-bucket/reports/report.pdf --expires-in 3600</code></pre>
+
+<h2>A first real architecture</h2>
+<p>A sensible small production setup: Route 53 points your domain to an ALB (with an ACM certificate). The ALB forwards to two ECS Fargate tasks in two AZs. They talk to an RDS Postgres instance (Multi-AZ) in private subnets. Static assets go to S3 behind CloudFront. Logs flow to CloudWatch. Secrets live in Secrets Manager. Everything is defined in Terraform. That is "the cloud" for 90% of products.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Service sprawl.</strong> Newer is not better. Prefer boring, well-documented services you can operate.</li>
+<li><strong>Region confusion</strong> and resources "lost" in other regions (and still billing).</li>
+<li><strong>Lock-in via proprietary services</strong> such as DynamoDB or Step Functions. Often an acceptable trade for speed; decide consciously.</li>
+<li><strong>Default settings are not production settings</strong>: default VPCs, public subnets, and no backups on some services.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create an S3 bucket (block public access ON), upload a file, and generate a presigned URL. Open it in a private browser window.</li>
+<li>Launch a <code>t3.micro</code> (or free-tier equivalent) and note its AZ, its EBS volume, and the security group. Terminate it and check that the volume is gone.</li>
+<li>Draw the architecture of an app you know using only the services on this page, and write the GCP/Azure equivalent next to each box.</li>
+</ol></div>

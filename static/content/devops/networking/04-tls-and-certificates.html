@@ -1,0 +1,181 @@
+<h1>TLS and Certificates</h1>
+<p class="lead">TLS is what makes the padlock appear. Operationally it is about one thing: getting a valid certificate onto your server and renewing it before it expires. Expired certificates are among the most common, most embarrassing and most preventable outages.</p>
+
+<h2>The problem TLS solves</h2>
+<p>Plain HTTP crosses many machines you do not control: Wi-Fi routers, ISPs, corporate proxies. Anyone along the path can read passwords and cookies, or alter the page. TLS (Transport Layer Security, the successor to SSL) gives you three guarantees:</p>
+<ul>
+<li><strong>Confidentiality</strong>: traffic is encrypted.</li>
+<li><strong>Integrity</strong>: tampering is detected.</li>
+<li><strong>Authentication</strong>: the server proves it is really <code>example.com</code>. Without this, an attacker could encrypt traffic to <em>themselves</em> and relay it (man-in-the-middle).</li>
+</ul>
+<p>Authentication is the job of <strong>certificates</strong>.</p>
+
+<h2>Key ideas: asymmetric and symmetric crypto</h2>
+<ul>
+<li><strong>Asymmetric</strong> (public/private key pairs): what the public key encrypts or verifies, only the private key can decrypt or sign. Slow, but solves "how do two strangers agree on a secret".</li>
+<li><strong>Symmetric</strong> (AES, ChaCha20): one shared key, very fast. Used for the bulk of the data.</li>
+</ul>
+<p>TLS uses asymmetric techniques during the handshake to authenticate the server and agree on a shared secret, then switches to symmetric encryption.</p>
+
+<h2>The TLS 1.3 handshake</h2>
+<pre class="diagram">
+ Client                                            Server
+   │── ClientHello ───────────────────────────────▶│  supported versions/ciphers,
+   │     (SNI: example.com, key share, ALPN h2)    │  SNI = which hostname I want
+   │                                               │
+   │◀─ ServerHello (chosen cipher, key share) ─────│  both sides can now derive keys
+   │◀─ {Certificate chain}  (encrypted) ───────────│  "here is my proof of identity"
+   │◀─ {CertificateVerify}  (signature) ───────────│  proves I own the private key
+   │◀─ {Finished} ─────────────────────────────────│
+   │                                               │
+   │── {Finished} ────────────────────────────────▶│
+   │══ encrypted HTTP request/response ═══════════│
+</pre>
+<p>TLS 1.3 needs one round trip (TLS 1.2 needs two). The key agreement uses ephemeral Diffie-Hellman, which gives <strong>forward secrecy</strong>: even if the server's private key leaks later, recorded past traffic cannot be decrypted. <strong>SNI</strong> (Server Name Indication) is the hostname sent in the clear in ClientHello, which lets one IP host many certificates.</p>
+<p>Disable TLS 1.0/1.1 (and SSLv3). Allow TLS 1.2 and 1.3.</p>
+
+<h2>Certificates and the chain of trust</h2>
+<p>A certificate is a signed statement: "this public key belongs to <code>example.com</code>", signed by a <strong>Certificate Authority (CA)</strong>. Your browser/OS ships with a trust store of root CA certificates. Roots do not sign server certificates directly; they sign <strong>intermediate</strong> CAs, which sign yours:</p>
+<pre class="diagram">
+ Root CA (in browser trust store, offline, long-lived)
+    └── Intermediate CA (signs leaf certs)
+           └── Leaf certificate: example.com, www.example.com   (yours, 90 days)
+</pre>
+<p>The server must send the leaf <strong>plus intermediates</strong> (the "full chain"). Missing intermediates is a common bug: it works in Chrome (which can fetch them) but fails in <code>curl</code>, Java or mobile apps.</p>
+<p>A leaf certificate contains: the subject names (Subject Alternative Names, SANs, are what browsers check), the public key, validity dates, and the issuer's signature. Validation checks: signature chain to a trusted root, the name matches the host, the date is valid, not revoked.</p>
+
+<h3>Certificate types</h3>
+<table>
+<tr><th>Type</th><th>Validates</th><th>Notes</th></tr>
+<tr><td>DV (domain validated)</td><td>You control the domain</td><td>Automated; what Let's Encrypt issues. Enough for nearly everything.</td></tr>
+<tr><td>OV / EV</td><td>Organisation identity</td><td>Paid; browsers no longer show special UI, little practical benefit</td></tr>
+<tr><td>Wildcard</td><td><code>*.example.com</code></td><td>Covers one label level only (not <code>a.b.example.com</code>); needs DNS-01 validation</td></tr>
+<tr><td>Self-signed</td><td>Nothing</td><td>Fine for local dev or internal mTLS with your own CA; browsers warn</td></tr>
+</table>
+
+<h2>Let's Encrypt and ACME</h2>
+<p>Let's Encrypt is a free, automated, non-profit CA. It uses the <strong>ACME</strong> protocol: your server proves it controls a domain by completing a challenge, and the CA issues a certificate with a short lifetime (90 days; the industry is moving toward even shorter lifetimes, so automation is not optional).</p>
+<table>
+<tr><th>Challenge</th><th>How</th><th>Use when</th></tr>
+<tr><td>HTTP-01</td><td>CA fetches <code>http://example.com/.well-known/acme-challenge/TOKEN</code> on port 80</td><td>Single public web server. Port 80 must be reachable. No wildcards.</td></tr>
+<tr><td>DNS-01</td><td>You publish a TXT record <code>_acme-challenge.example.com</code></td><td>Wildcards; servers not publicly reachable. Needs DNS provider API access.</td></tr>
+<tr><td>TLS-ALPN-01</td><td>Special handshake on 443</td><td>Port 80 unavailable</td></tr>
+</table>
+<p>Rate limits exist (for example, a limited number of certificates per registered domain per week). Use the <strong>staging</strong> environment (<code>--staging</code>) while experimenting so you do not get locked out.</p>
+
+<h2>certbot on Ubuntu with nginx</h2>
+<pre><code># Prerequisites: DNS A record points to this server; ports 80 and 443 are open.
+sudo apt update
+sudo apt install -y certbot python3-certbot-nginx
+
+# Obtain a cert AND let certbot edit your nginx server block
+sudo certbot --nginx -d example.com -d www.example.com \
+     --redirect --agree-tos -m you@example.com
+
+# Or obtain only (you edit nginx yourself)
+sudo certbot certonly --nginx -d example.com -d www.example.com
+
+# Without a web server on the box (standalone mode: certbot binds port 80 briefly)
+sudo certbot certonly --standalone -d example.com
+
+# Wildcard via DNS-01 (example with the Cloudflare plugin)
+sudo apt install -y python3-certbot-dns-cloudflare
+sudo certbot certonly --dns-cloudflare \
+     --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
+     -d example.com -d '*.example.com'</code></pre>
+<p>Files land in <code>/etc/letsencrypt/live/example.com/</code>:</p>
+<table>
+<tr><th>File</th><th>Contains</th></tr>
+<tr><td><code>fullchain.pem</code></td><td>Your leaf cert plus intermediates. Use as <code>ssl_certificate</code>.</td></tr>
+<tr><td><code>privkey.pem</code></td><td>Private key. Use as <code>ssl_certificate_key</code>. Guard it; mode 600/root only.</td></tr>
+<tr><td><code>cert.pem</code>, <code>chain.pem</code></td><td>Separate pieces (rarely needed)</td></tr>
+</table>
+<p>These are symlinks into <code>/etc/letsencrypt/archive/</code>; always reference the <code>live/</code> paths so renewals are picked up.</p>
+
+<h3>The nginx side</h3>
+<pre><code>server {
+    listen 443 ssl;
+    listen 443 quic reuseport;          # HTTP/3 (nginx 1.25+), also open UDP 443
+    http2 on;                           # nginx 1.25.1+ syntax
+    server_name example.com www.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+    # ... location blocks ...
+}
+server {
+    listen 80;
+    server_name example.com www.example.com;
+    return 301 https://$host$request_uri;
+}</code></pre>
+
+<h2>Renewal</h2>
+<p>The Ubuntu package installs a systemd timer (or cron job) that runs <code>certbot renew</code> twice a day. It renews only certificates within 30 days of expiry.</p>
+<pre><code>systemctl list-timers | grep certbot        # confirm the timer exists
+sudo certbot renew --dry-run                # simulate renewal against staging: DO THIS
+sudo certbot certificates                   # list certs and expiry dates
+
+# Reload nginx after a successful renewal so it loads the new file
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh &lt;&lt;'EOF'
+#!/bin/sh
+systemctl reload nginx
+EOF
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh</code></pre>
+<p>The nginx plugin normally reloads nginx automatically, but a deploy hook makes it explicit and works for any setup. A server that renews the file but never reloads keeps serving the old, soon-expired certificate.</p>
+
+<div class="callout warn"><strong>Why renewals fail in practice</strong><p>Port 80 got firewalled or redirected oddly; DNS no longer points to this server; the DNS API token expired (DNS-01); nginx config changed so the challenge location is shadowed; disk full; the timer was never enabled. Always alert on <em>days until expiry</em> (monitoring a probe such as <code>openssl s_client</code>, Prometheus blackbox exporter, or your uptime tool) rather than trusting that renewal works.</p></div>
+
+<h2>Inspecting certificates</h2>
+<pre><code># What does the server present? (expiry, issuer, SANs)
+echo | openssl s_client -connect example.com:443 -servername example.com 2&gt;/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+# Only the expiry
+echo | openssl s_client -connect example.com:443 -servername example.com 2&gt;/dev/null \
+  | openssl x509 -noout -enddate
+
+# Is the chain complete?
+openssl s_client -connect example.com:443 -servername example.com -showcerts &lt;/dev/null
+
+# Verbose TLS info via curl
+curl -vI https://example.com/ 2&gt;&amp;1 | grep -iE 'TLS|subject|issuer|expire'
+
+# Generate a self-signed cert for local testing
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout dev.key -out dev.crt -subj "/CN=localhost"</code></pre>
+
+<h2>Where to terminate TLS</h2>
+<table>
+<tr><th>Option</th><th>Pros</th><th>Cons</th></tr>
+<tr><td>On the app server / nginx</td><td>Simple, full control</td><td>Certs on every server; you manage renewal</td></tr>
+<tr><td>On the load balancer (ALB, ACM)</td><td>One place; cloud-managed auto-renewing certs</td><td>Traffic to backends is plain unless you re-encrypt</td></tr>
+<tr><td>On the CDN (Cloudflare)</td><td>Zero ops; edge performance</td><td>Needs a secure CDN-to-origin link (see "Full (strict)" mode)</td></tr>
+<tr><td>End-to-end / mTLS</td><td>Encrypted everywhere; mutual authentication (service meshes)</td><td>Operational complexity</td></tr>
+</table>
+<p>Managed options (AWS ACM, Cloudflare, Caddy's automatic HTTPS, Kubernetes cert-manager) automate everything in this lesson. The concepts remain the same when they break.</p>
+
+<h2>Pitfalls and best practices</h2>
+<ul>
+<li>Serve <code>fullchain.pem</code>, not <code>cert.pem</code>.</li>
+<li>Protect and never commit private keys. If one leaks, revoke and reissue.</li>
+<li>Do not rely on email expiry warnings; monitor expiry yourself.</li>
+<li>Add a <code>CAA</code> DNS record to restrict who can issue for your domain.</li>
+<li>Clients with wrong clocks see "certificate not yet valid / expired" errors. Run NTP (chrony) on servers.</li>
+<li>Pinning certificates in mobile apps without a rotation plan creates outages when certs change.</li>
+<li>Internal hostnames (<code>db.internal</code>) cannot get public certs; use a private CA (step-ca, Vault PKI, cloud private CA).</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run the <code>openssl s_client</code> command against three sites. Compare issuers and expiry dates. How many days remain on each?</li>
+<li>Count the certificates in the chain with <code>-showcerts</code>. Which one is the leaf?</li>
+<li>On a VPS with a real domain: install certbot, run <code>sudo certbot --nginx --staging -d yourdomain.com</code> first, then repeat without <code>--staging</code>.</li>
+<li>Run <code>sudo certbot renew --dry-run</code> and read the output. Then run <code>systemctl list-timers</code> and find the renewal timer.</li>
+<li>Locally: generate a self-signed cert, point an nginx <code>server</code> block at it, and observe the browser warning and what <code>curl -k</code> does differently.</li>
+<li>Run <code>curl https://expired.badssl.com/</code> and <code>curl https://self-signed.badssl.com/</code> to see the exact error messages you would see in production.</li>
+</ol></div>

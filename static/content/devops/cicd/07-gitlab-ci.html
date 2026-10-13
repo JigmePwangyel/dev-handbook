@@ -1,0 +1,232 @@
+<h1>GitLab CI/CD</h1>
+<p class="lead">GitLab bundles source hosting, CI/CD, a container registry, security scanning and environments into one product. Its pipeline model, stages containing jobs, defined in a single <code>.gitlab-ci.yml</code>, is concise and has influenced many other tools.</p>
+
+<h2>The model</h2>
+<pre class="diagram">
+ .gitlab-ci.yml in repo root
+        │ push / merge request / schedule / API / tag
+        ▼
+ Pipeline
+   stage: build ──▶ stage: test ──────────▶ stage: package ──▶ stage: deploy
+     build_app       unit_tests  ┐             docker_image       staging
+                     lint        ├ parallel                       production (manual)
+                     sast        ┘
+ (jobs in a stage run in parallel; next stage starts when all succeed)
+        │ each job
+        ▼
+ GitLab Runner (shell / docker / kubernetes executor) pulls the job and runs it
+</pre>
+<table>
+<tr><th>Concept</th><th>Meaning</th></tr>
+<tr><td>Pipeline</td><td>The whole run for a commit or MR.</td></tr>
+<tr><td>Stage</td><td>Ordered phase; default order: <code>.pre</code>, <code>build</code>, <code>test</code>, <code>deploy</code>, <code>.post</code>. You can define your own with <code>stages:</code>.</td></tr>
+<tr><td>Job</td><td>A named block with a <code>script:</code>; assigned to a stage.</td></tr>
+<tr><td>Runner</td><td>The agent that executes jobs. Shared (GitLab.com), group, or project runners; executor types: docker, kubernetes, shell, etc.</td></tr>
+<tr><td>Artifacts / cache</td><td>Same distinction as everywhere: artifacts pass outputs; cache speeds dependencies.</td></tr>
+<tr><td>Environment</td><td>A named deploy target with history, URL, rollback button and protected access.</td></tr>
+<tr><td>Variables</td><td>Predefined (<code>CI_COMMIT_SHA</code>, <code>CI_REGISTRY_IMAGE</code>) and custom, set in UI/API, can be masked, protected, or file-type.</td></tr>
+</table>
+
+<h2>A complete example</h2>
+<p>Node app: lint and test in parallel, build, package a Docker image to the built-in GitLab registry, deploy to staging automatically, to production after a manual click.</p>
+<pre><code>stages: [lint, test, build, package, deploy]
+
+default:
+  image: node:22-alpine
+  interruptible: true            # newer pipelines on same branch may cancel this job
+  timeout: 15 minutes
+
+variables:
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"   # keep npm cache inside the project for caching
+  IMAGE: "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+
+# --- reusable hidden template: names starting with "." are not run ---
+.node_setup:
+  cache:
+    key:
+      files: [package-lock.json]               # invalidate when lockfile changes
+    paths: [.npm/]
+  before_script:
+    - npm ci --prefer-offline
+
+lint:
+  extends: .node_setup
+  stage: lint
+  script:
+    - npm run lint
+    - npm run typecheck
+
+unit_tests:
+  extends: .node_setup
+  stage: test
+  script:
+    - npm test -- --coverage
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'   # parse % from output
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml                         # shows test results in the MR
+    paths: [coverage/]
+    expire_in: 1 week
+
+integration_tests:
+  extends: .node_setup
+  stage: test
+  services:
+    - name: postgres:16
+      alias: db
+  variables:
+    POSTGRES_PASSWORD: test
+    DATABASE_URL: "postgres://postgres:test@db:5432/postgres"
+  script:
+    - npm run test:integration
+
+build_app:
+  extends: .node_setup
+  stage: build
+  script:
+    - npm run build
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 day
+
+docker_image:
+  stage: package
+  image: docker:27
+  services: [docker:27-dind]                  # Docker-in-Docker for building images
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build --pull -t "$IMAGE" .
+    - docker push "$IMAGE"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH   # only on main
+
+deploy_staging:
+  stage: deploy
+  image: alpine:3.20
+  environment:
+    name: staging
+    url: https://staging.shop.example.com
+  before_script:
+    - apk add --no-cache openssh-client
+    - install -m 700 -d ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" &gt; ~/.ssh/id_ed25519 &amp;&amp; chmod 600 ~/.ssh/id_ed25519
+    - echo "$SSH_KNOWN_HOSTS" &gt; ~/.ssh/known_hosts
+  script:
+    - ssh deploy@"$STAGING_HOST" "IMAGE=$IMAGE /opt/shop/deploy.sh"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy_production:
+  extends: deploy_staging
+  environment:
+    name: production
+    url: https://shop.example.com
+  script:
+    - ssh deploy@"$PROD_HOST" "IMAGE=$IMAGE /opt/shop/deploy.sh"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual                              # human clicks "play"
+  resource_group: production                    # serialise prod deploys
+</code></pre>
+<p>Highlights: <code>extends</code> and hidden <code>.templates</code> remove duplication; <code>cache:key:files</code> keys on the lockfile; <code>artifacts:reports:junit</code> surfaces failures in the merge request; <code>resource_group</code> prevents two deploys to the same environment at once; <code>environment</code> gives a deployments page and one-click rollback to a previous deployment.</p>
+
+<h2>Rules: controlling when jobs run</h2>
+<p><code>rules:</code> replaces the older <code>only/except</code>. Rules are evaluated top to bottom; the first match decides.</p>
+<pre><code>job:
+  script: ./run.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"       # MR pipelines
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/               # release tags
+      variables: {DEPLOY_TARGET: "prod"}
+    - changes: ["docs/**/*"]                                 # only when docs changed
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: false
+    - when: never                                            # default: don't run</code></pre>
+<p>A common trap: a pipeline can be triggered both by a branch push and by an MR event, producing <strong>duplicate pipelines</strong>. Use <code>workflow:rules</code> at the top level to choose one:</p>
+<pre><code>workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH &amp;&amp; $CI_OPEN_MERGE_REQUESTS
+      when: never                       # avoid duplicate branch pipeline
+    - if: $CI_COMMIT_BRANCH || $CI_COMMIT_TAG</code></pre>
+
+<h2>DAG pipelines and parallelism</h2>
+<ul>
+<li><code>needs: [job]</code> lets a job start as soon as its dependencies finish rather than waiting for the whole previous stage, forming a DAG and shortening pipelines.</li>
+<li><code>parallel: 4</code> runs N copies (with <code>CI_NODE_INDEX</code>/<code>CI_NODE_TOTAL</code>) for test sharding; <code>parallel: matrix:</code> runs combinations of variables.</li>
+<li><code>interruptible: true</code> + auto-cancel redundant pipelines saves runner time.</li>
+</ul>
+
+<h2>Includes, templates and components</h2>
+<p>Share pipeline logic across projects with <code>include:</code>:</p>
+<pre><code>include:
+  - local: ci/node.yml                                     # file in this repo
+  - project: acme/ci-templates                             # another project
+    ref: v3.2.0                                            # pin a version
+    file: /templates/docker-build.yml
+  - template: Security/SAST.gitlab-ci.yml                  # GitLab-provided template
+  - component: gitlab.com/acme/components/deploy@1.4.0     # CI/CD component (catalog)
+    inputs:
+      environment: production</code></pre>
+<p><strong>CI/CD components</strong> (the catalog) are versioned, parameterised building blocks, the modern way to share pipelines. Pin versions to avoid surprise breakage.</p>
+
+<h2>Runners</h2>
+<ul>
+<li><strong>Shared runners</strong> on GitLab.com need no setup and run jobs in a fresh VM/container (consumption of compute minutes applies).</li>
+<li><strong>Self-managed runners:</strong> install <code>gitlab-runner</code>, register with a token, pick an executor. The Docker executor runs each job in the image named by <code>image:</code>; the Kubernetes executor spawns a pod per job (good for autoscaling).</li>
+<li><strong>Tags:</strong> label runners (<code>gpu</code>, <code>arm64</code>, <code>prod-deploy</code>) and select with <code>tags:</code> in the job.</li>
+<li>Docker-in-Docker needs privileged mode, which is a security risk on shared runners. Alternatives: Kaniko, BuildKit rootless, Buildah, or a dedicated build runner.</li>
+</ul>
+<pre><code># register a runner (interactive flags shown non-interactively)
+gitlab-runner register \
+  --url https://gitlab.example.com \
+  --token "$RUNNER_AUTH_TOKEN" \
+  --executor docker \
+  --docker-image alpine:3.20</code></pre>
+
+<h2>Variables, secrets and security</h2>
+<ul>
+<li>Set variables in <em>Settings &gt; CI/CD &gt; Variables</em>. Tick <strong>Masked</strong> (hidden in logs), <strong>Protected</strong> (only available on protected branches/tags) and scope by environment.</li>
+<li>Prefer <strong>ID tokens (OIDC)</strong> (<code>id_tokens:</code> keyword) to authenticate to cloud and Vault without stored keys.</li>
+<li>Built-in <strong>security templates</strong>: SAST, secret detection, dependency scanning, container scanning, DAST, with findings shown in merge requests (some features in paid tiers).</li>
+<li>Merge request pipelines from forks do not receive protected variables.</li>
+</ul>
+
+<h2>Auto DevOps and Review Apps</h2>
+<p><strong>Review apps</strong> deploy every merge request to a temporary URL (<code>environment: name: review/$CI_COMMIT_REF_SLUG</code> with an <code>on_stop</code> job to tear it down) so reviewers and product people can click the real change. <strong>Auto DevOps</strong> provides an opinionated, zero-config pipeline (build, test, scan, deploy to Kubernetes); good for learning, usually replaced by a custom pipeline later.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Duplicate pipelines from mixing branch and MR triggers (fix with <code>workflow:rules</code>).</li>
+<li>Forgetting that each job starts clean: pass <code>dist/</code> with <code>artifacts</code>, use <code>dependencies</code>/<code>needs</code> to control which artifacts are downloaded.</li>
+<li>Cache not shared across runners (local cache); configure a distributed cache (S3/GCS) for fleets.</li>
+<li>Privileged DinD on shared runners.</li>
+<li>Unmasked secrets: masking requires the value to meet format rules (e.g. min length, no spaces).</li>
+<li>Unpinned <code>include</code> refs (<code>ref: main</code>) mean someone else's change can break your pipeline.</li>
+<li>YAML anchors vs <code>extends</code> vs <code>!reference</code>: prefer <code>extends</code>; use <code>!reference [.job, script]</code> to reuse fragments.</li>
+</ul>
+
+<h2>GitLab CI vs GitHub Actions at a glance</h2>
+<table>
+<tr><th>Topic</th><th>GitLab CI</th><th>GitHub Actions</th></tr>
+<tr><td>Config</td><td>One <code>.gitlab-ci.yml</code> (+ includes)</td><td>Many files in <code>.github/workflows/</code></td></tr>
+<tr><td>Ordering</td><td>Stages + <code>needs</code></td><td><code>needs</code> only</td></tr>
+<tr><td>Reuse</td><td>extends, include, components</td><td>Reusable workflows, composite actions, Marketplace</td></tr>
+<tr><td>Runner model</td><td>Executors (docker, k8s, shell)</td><td>VM per job; ARC for k8s</td></tr>
+<tr><td>Built-in extras</td><td>Registry, environments, security scans, review apps in one platform</td><td>Packages, Environments, Dependabot, code scanning</td></tr>
+<tr><td>Self-hosting the platform</td><td>First-class (GitLab self-managed)</td><td>GitHub Enterprise Server</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a free GitLab project, add a <code>.gitlab-ci.yml</code> with two stages (<code>test</code>, <code>deploy</code>) and echo jobs; open the pipeline graph.</li>
+<li>Add <code>rules</code> so the deploy job is <code>manual</code> on main and never runs on MRs.</li>
+<li>Add the <code>Security/SAST.gitlab-ci.yml</code> template and review the report in the pipeline's Security tab.</li>
+<li>Run <em>CI Lint</em> (Pipeline editor) to validate your file before committing.</li>
+</ol></div>

@@ -1,0 +1,114 @@
+<h1>The Request Lifecycle</h1>
+<p class="lead">What really happens between typing a URL and seeing a page? Knowing every hop tells you where to look when something breaks, and which DevOps tool lives at which hop.</p>
+
+<h2>Why this matters</h2>
+<p>"The site is down" can mean DNS is wrong, a certificate expired, the load balancer has no healthy backends, the app crashed, or the database is out of connections. Each has a different symptom and a different owner. A mental model of the path lets you bisect: <em>where does the request stop?</em></p>
+
+<h2>The full path</h2>
+<pre class="diagram">
+ Browser
+   │ 1. DNS lookup: app.example.com ─▶ 203.0.113.10
+   │ 2. TCP connect to port 443
+   │ 3. TLS handshake (certificate check)
+   ▼
+ CDN / edge ──(cache hit? return)──────────────────────────┐
+   │ miss                                                  │
+   ▼                                                       │
+ Load balancer ─ health checks ─▶ picks a healthy backend  │
+   ▼                                                       │
+ Reverse proxy (nginx/Caddy): TLS termination, routing     │
+   ▼                                                       │
+ App server (Node/Java/Python): business logic             │
+   │            │                                          │
+   ▼            ▼                                          │
+ Cache (Redis)  Database (PostgreSQL)                      │
+   └──────────── response travels back up ◀────────────────┘
+</pre>
+
+<h2>Step by step</h2>
+<h3>1. DNS: name to address</h3>
+<p>Computers route by IP, humans type names. The browser asks a resolver (usually your ISP's or 1.1.1.1 / 8.8.8.8), which walks root, <code>.com</code>, then the domain's authoritative nameserver. Answers are cached for the record's TTL. Pitfall: lowering a record's TTL <em>after</em> you need a change is too late, so lower it before migrations.</p>
+<pre><code>dig +short app.example.com          # the A record
+dig app.example.com +trace          # watch the delegation chain
+curl -v https://app.example.com 2&gt;&amp;1 | head -30   # connect, TLS, headers</code></pre>
+
+<h3>2. TCP and TLS</h3>
+<p>The client opens a TCP connection to port 443 (HTTP is 80), then performs the TLS handshake: the server presents a certificate, the client verifies it was issued by a trusted authority for that hostname and not expired, and both derive session keys. Expired certificates are one of the most common production outages. HTTP/3 uses QUIC over UDP but the idea is the same.</p>
+
+<h3>3. CDN and edge</h3>
+<p>Static assets and cacheable responses can be served from a node near the user (Cloudflare, CloudFront, Fastly), never reaching your servers. It lowers latency and absorbs traffic spikes and attacks.</p>
+
+<h3>4. Load balancer</h3>
+<p>Spreads requests across several identical backends and removes unhealthy ones (via health checks like <code>GET /healthz</code>). This is how you scale horizontally and deploy with no downtime.</p>
+
+<h3>5. Reverse proxy</h3>
+<p>nginx, Caddy, Traefik or HAProxy sits in front of apps: terminates TLS, routes by host/path (<code>/api</code> to service A, <code>/</code> to service B), compresses, rate-limits, adds headers. Your app listens on a private port (3000) and never faces the internet directly.</p>
+
+<h3>6. The application</h3>
+<p>Your code parses the request, authenticates, runs logic, and talks to backing services. Most time is usually spent waiting on I/O, not computing.</p>
+
+<h3>7. Data layer</h3>
+<p>Typically a relational database, often fronted by a cache. Databases are the hardest tier to scale and to change safely, because they hold state.</p>
+
+<h3>8. The response</h3>
+<p>A status code (200, 301, 404, 500, 503) and body flow back. Each layer can modify or replace it: a proxy returns <code>502 Bad Gateway</code> when the app is down, a load balancer <code>503</code> when no backend is healthy, a gateway <code>504</code> on timeout.</p>
+
+<table>
+<tr><th>Symptom</th><th>Likely layer</th></tr>
+<tr><td>"Server not found"</td><td>DNS</td></tr>
+<tr><td>Connection timed out/refused</td><td>Firewall, nothing listening, load balancer</td></tr>
+<tr><td>Certificate warning</td><td>TLS (expired, wrong host)</td></tr>
+<tr><td>502 Bad Gateway</td><td>Proxy reached nothing/invalid reply from app</td></tr>
+<tr><td>503 Service Unavailable</td><td>No healthy backends or app overloaded</td></tr>
+<tr><td>504 Gateway Timeout</td><td>App or DB too slow</td></tr>
+<tr><td>500 Internal Server Error</td><td>Application bug (check logs)</td></tr>
+</table>
+
+<h2>Architectures: how the app tier is organised</h2>
+<h3>Tiers</h3>
+<p>A <strong>3-tier</strong> design separates presentation (frontend), logic (API) and data (database). Each tier can be scaled and secured independently; the database sits in a private network unreachable from the internet.</p>
+
+<h3>Monolith vs microservices</h3>
+<table>
+<tr><th></th><th>Monolith</th><th>Microservices</th></tr>
+<tr><td>Shape</td><td>One deployable containing everything</td><td>Many small services, each owning its data</td></tr>
+<tr><td>Deploy</td><td>Simple: one artifact</td><td>Many pipelines, versioning between services</td></tr>
+<tr><td>Scaling</td><td>Scale the whole thing</td><td>Scale only hot services</td></tr>
+<tr><td>Failure</td><td>One bug can take down all</td><td>Isolation, but cascading failures over the network</td></tr>
+<tr><td>Debugging</td><td>One stack trace</td><td>Need distributed tracing</td></tr>
+<tr><td>Team fit</td><td>Small teams</td><td>Many teams needing autonomy</td></tr>
+</table>
+<div class="callout tip"><strong>Start with a well-structured monolith</strong><p>Microservices trade code complexity for operational complexity. Most products should split only when team size or scaling pain demands it. A "modular monolith" keeps the option open.</p></div>
+
+<h3>Stateless vs stateful</h3>
+<p>A <strong>stateless</strong> process keeps nothing between requests that another instance couldn't reconstruct. Any request can go to any instance, so you can add, kill and replace instances freely. That property is what makes load balancing, autoscaling, rolling deploys and containers easy.</p>
+<p><strong>State</strong> still exists, so push it to dedicated places:</p>
+<table>
+<tr><th>State</th><th>Where it lives</th></tr>
+<tr><td>User sessions</td><td>Signed cookie/JWT, or Redis</td></tr>
+<tr><td>Uploaded files</td><td>Object storage (S3), not local disk</td></tr>
+<tr><td>Business data</td><td>Database</td></tr>
+<tr><td>Background work</td><td>Queue (SQS, RabbitMQ, Redis)</td></tr>
+</table>
+<div class="callout warn"><strong>The local-disk trap</strong><p>An app that saves uploads to <code>./uploads</code> works on one server and silently breaks behind a load balancer: the next request lands on a server without the file. Treat the app's filesystem as disposable.</p></div>
+
+<h3>Synchronous vs asynchronous</h3>
+<p>Slow work (sending email, resizing images) should not block the response. Put a message on a queue, return <code>202 Accepted</code>, and let a worker process it. Workers are separate processes you must also deploy and monitor.</p>
+
+<h2>Where DevOps tools plug in</h2>
+<table>
+<tr><th>Hop</th><th>Topic in this handbook</th></tr>
+<tr><td>DNS, TLS, proxy, LB, CDN</td><td>Networking section</td></tr>
+<tr><td>App process, systemd</td><td>Linux, Deploy</td></tr>
+<tr><td>Packaging the app</td><td>Containers</td></tr>
+<tr><td>Running many copies</td><td>Kubernetes, Cloud</td></tr>
+<tr><td>Seeing what happened</td><td>Observability</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>curl -v https://example.com</code> and identify: the resolved IP, TLS version, certificate subject, status line, and headers.</li>
+<li>Run <code>dig +trace example.com</code> and name each server in the chain.</li>
+<li>Use browser DevTools (Network tab) on a site you like. Which requests came from a CDN? (Look for <code>cf-cache-status</code>, <code>x-cache</code>, <code>age</code> headers.)</li>
+<li>Draw your own app's path from browser to database. Mark which parts are stateful.</li>
+</ol></div>

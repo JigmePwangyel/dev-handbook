@@ -1,0 +1,147 @@
+<h1>Container Security and Best Practices</h1>
+<p class="lead">Containers share the host kernel, so their isolation is thinner than a VM's, and default settings are permissive. Security here is mostly about shrinking what a compromised process can do: run as an unprivileged user, drop capabilities, make the filesystem read-only, cap resources, keep secrets out of images and keep the contents patched.</p>
+
+<h2>The threat model</h2>
+<p>Assume your application will eventually be exploited (a vulnerable library, an injection bug). The question is what the attacker gets next:</p>
+<ul>
+<li>Root inside the container, then escape to the host via a kernel bug or misconfiguration.</li>
+<li>Network access to other containers, the cloud metadata service (<code>169.254.169.254</code>, which holds IAM credentials) or the Docker socket.</li>
+<li>Secrets baked into image layers or environment variables.</li>
+<li>A vulnerable or malicious base image or dependency (supply chain).</li>
+</ul>
+<p>Defense in depth: each control below removes one rung from the attacker's ladder.</p>
+
+<h2>1. Run as a non-root user</h2>
+<p>By default the process in a container is root (UID 0). Container root is not host root, but it is dangerously close: with a kernel bug, a writable host mount or an extra capability, it can become host root. And inside the container root can modify everything the app can see.</p>
+<pre><code># Debian/Ubuntu-based
+RUN groupadd --system --gid 10001 app &amp;&amp; useradd --system --uid 10001 --gid app --no-create-home app
+USER 10001:10001
+
+# Alpine
+RUN addgroup -S -g 10001 app &amp;&amp; adduser -S -u 10001 -G app app
+USER app
+
+# Many images ship one: node has "node", distroless has ":nonroot" (UID 65532), nginx-unprivileged
+FROM gcr.io/distroless/static-debian12:nonroot</code></pre>
+<p>Use a numeric UID so Kubernetes' <code>runAsNonRoot</code> check can verify it. Non-root processes cannot bind ports below 1024; listen on 8080 and map it with <code>-p 80:8080</code>. Enforce at run time with <code>--user 10001</code>.</p>
+
+<h2>2. Read-only root filesystem</h2>
+<pre><code>docker run --read-only --tmpfs /tmp --tmpfs /run -v appdata:/data myapp:1.4.2</code></pre>
+<p>If an attacker cannot write to the filesystem, they cannot drop tools or modify your code. Give the app only the writable spots it really needs (tmpfs for temp files, one volume for data).</p>
+
+<h2>3. Drop capabilities and block privilege escalation</h2>
+<p>Linux splits root's power into ~40 capabilities. Docker grants a default subset (including <code>NET_RAW</code>, <code>CHOWN</code>, <code>SETUID</code>). A typical web app needs none.</p>
+<pre><code>docker run \
+  --cap-drop ALL \
+  --cap-add NET_BIND_SERVICE \
+  --security-opt no-new-privileges:true \
+  myapp:1.4.2</code></pre>
+<p><code>NET_BIND_SERVICE</code> is only needed to bind ports below 1024. <code>no-new-privileges</code> stops setuid binaries from gaining privileges. Docker's default seccomp profile (blocks ~44 dangerous syscalls) and AppArmor/SELinux profiles are enabled by default; do not disable them (<code>--security-opt seccomp=unconfined</code>).</p>
+<div class="callout warn"><strong>Never do these</strong><ul>
+<li><code>--privileged</code>: gives nearly all capabilities and device access; equals root on the host.</li>
+<li>Mounting <code>/var/run/docker.sock</code>: lets the container control Docker, hence the host.</li>
+<li>Mounting <code>/</code>, <code>/etc</code> or <code>/proc</code> from the host.</li>
+<li><code>--network host</code> / <code>--pid host</code> without a specific reason.</li>
+</ul></div>
+<p>Rootless Docker/Podman and user namespace remapping (<code>userns-remap</code>) go further: container "root" maps to an unprivileged host UID, so even an escape lands as a nobody.</p>
+
+<h2>4. Resource limits</h2>
+<p>Without limits, one runaway or compromised container can starve the host (memory leak, fork bomb, crypto-miner).</p>
+<pre><code>docker run --memory=512m --memory-swap=512m --cpus=1.5 --pids-limit=200 \
+           --ulimit nofile=4096:4096 myapp:1.4.2</code></pre>
+<p>Exceeding the memory limit gets the process OOM-killed (exit code 137): size limits from measured usage plus headroom, and make runtimes aware of the limit (modern JVMs and Go respect cgroup limits; Node needs <code>--max-old-space-size</code> tuned below the container limit).</p>
+
+<h2>5. Secrets</h2>
+<table>
+<tr><th>Method</th><th>Verdict</th></tr>
+<tr><td>Hardcoded in code or Dockerfile (<code>ENV</code>, <code>ARG</code>, <code>COPY .env</code>)</td><td>Never. Lives in layers and <code>docker history</code>/<code>inspect</code> forever.</td></tr>
+<tr><td>Environment variable at run time</td><td>Acceptable for low-risk setups. Visible in <code>docker inspect</code>, <code>/proc</code>, crash dumps and child processes.</td></tr>
+<tr><td>File mounted at run time (<code>/run/secrets/x</code>, Compose/Swarm secrets, Kubernetes Secret volumes)</td><td>Better. Not in the image, not in <code>inspect</code>. Many images support <code>*_FILE</code> variables.</td></tr>
+<tr><td>Secret manager fetched at start (Vault, AWS Secrets Manager, SSM, external-secrets operator)</td><td>Best. Central rotation, audit logs, short-lived credentials.</td></tr>
+<tr><td>Build-time secrets</td><td>Use BuildKit <code>--mount=type=secret</code>, never <code>ARG</code>.</td></tr>
+</table>
+<p>If a secret ever entered an image or a Git repository, treat it as leaked and rotate it. Deleting the layer or commit does not un-leak it.</p>
+
+<h2>6. Image hygiene: minimal, pinned, scanned</h2>
+<ul>
+<li><strong>Minimal base:</strong> slim, distroless or scratch. Fewer packages, fewer CVEs, no shell for attackers.</li>
+<li><strong>Pin versions:</strong> <code>FROM node:22.11-slim</code>, ideally with <code>@sha256:</code> digest, and automate bumps with Renovate or Dependabot. Pin OS and language packages too (lockfiles, <code>npm ci</code>, <code>pip --require-hashes</code>).</li>
+<li><strong>Use trusted sources:</strong> Docker Official Images, verified publishers, your own mirrored base images. A random Hub image is arbitrary code running in your infrastructure.</li>
+<li><strong>Rebuild regularly:</strong> a weekly scheduled build picks up base image patches even when your code does not change.</li>
+</ul>
+
+<h3>Scanning with Trivy</h3>
+<pre><code>trivy image myapp:1.4.2                                   # OS + language package CVEs
+trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed myapp:1.4.2   # CI gate
+trivy fs .                                                # scan source dependencies
+trivy config .                                            # lint Dockerfile, Compose, Kubernetes, Terraform
+trivy image --scanners secret myapp:1.4.2                 # hunt for leaked secrets in layers
+trivy image --format cyclonedx -o sbom.json myapp:1.4.2   # produce an SBOM</code></pre>
+<pre><code># GitHub Actions step
+- uses: aquasecurity/trivy-action@0.28.0
+  with:
+    image-ref: ghcr.io/acme/api:${{ github.sha }}
+    severity: CRITICAL,HIGH
+    ignore-unfixed: true
+    exit-code: "1"</code></pre>
+<p>A scan is a snapshot: schedule re-scans of what is already deployed. Not every CVE is exploitable in your context; triage, but do not ignore everything. Complement with <code>hadolint</code> (Dockerfile lint) and Docker Bench for Security / CIS Docker Benchmark checks on hosts.</p>
+
+<h2>7. Protect the daemon and the host</h2>
+<ul>
+<li>Keep Docker and the kernel patched; most container escapes are kernel or runtime CVEs.</li>
+<li>Restrict membership in the <code>docker</code> group (it equals root).</li>
+<li>Never expose the daemon on TCP (<code>-H tcp://0.0.0.0:2375</code>) without mutual TLS. Open Docker ports on the internet are routinely hijacked for crypto-mining.</li>
+<li>Block containers from the cloud metadata endpoint (enforce IMDSv2 with hop limit 1 on AWS) so a compromised container cannot steal the instance's IAM role.</li>
+<li>Run untrusted code in stronger sandboxes (gVisor, Kata Containers, Firecracker microVMs).</li>
+</ul>
+
+<h2>A hardened run command</h2>
+<pre><code>docker run -d --name api \
+  --user 10001:10001 \
+  --read-only --tmpfs /tmp \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --memory 512m --cpus 1 --pids-limit 200 \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -e DATABASE_URL_FILE=/run/secrets/dburl \
+  -v "$PWD/secrets/dburl":/run/secrets/dburl:ro \
+  ghcr.io/acme/api@sha256:&lt;digest&gt;</code></pre>
+<p>The same in Compose:</p>
+<pre><code>services:
+  api:
+    image: ghcr.io/acme/api:1.4.2
+    user: "10001:10001"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 200</code></pre>
+
+<h2>The 12 do's and don'ts</h2>
+<table>
+<tr><th>#</th><th>Do</th><th>Don't</th></tr>
+<tr><td>1</td><td>Run as a non-root numeric user</td><td>Leave the default root user</td></tr>
+<tr><td>2</td><td>Use minimal, official, version-pinned base images</td><td>Use <code>:latest</code> or unknown publishers</td></tr>
+<tr><td>3</td><td>Use multi-stage builds so compilers and dev tools never ship</td><td>Ship build toolchains and source in the runtime image</td></tr>
+<tr><td>4</td><td>Inject secrets at run time from a secret manager or files</td><td>Bake secrets into ENV, ARG, layers or Git</td></tr>
+<tr><td>5</td><td>Scan images in CI and continuously in the registry</td><td>Scan once and assume it stays clean</td></tr>
+<tr><td>6</td><td>Set memory, CPU and PID limits</td><td>Leave containers unbounded</td></tr>
+<tr><td>7</td><td>Drop all capabilities; add back only what is needed</td><td>Use <code>--privileged</code></td></tr>
+<tr><td>8</td><td>Use a read-only root filesystem with tmpfs for scratch</td><td>Let the app write anywhere</td></tr>
+<tr><td>9</td><td>Keep one process per container, logs to stdout/stderr</td><td>Run sshd, cron and the app together in one container</td></tr>
+<tr><td>10</td><td>Add a <code>.dockerignore</code> and a HEALTHCHECK</td><td>Copy <code>.git</code>, <code>.env</code>, or credentials into the context</td></tr>
+<tr><td>11</td><td>Build once, sign it, promote the same digest</td><td>Rebuild per environment, deploy mutable tags</td></tr>
+<tr><td>12</td><td>Publish only needed ports, bind internal ones to 127.0.0.1</td><td>Mount <code>docker.sock</code> or expose the Docker API</td></tr>
+</table>
+
+<div class="callout key"><strong>Security is a trade-off with convenience</strong><p>Read-only filesystems, distroless images and dropped capabilities make debugging and onboarding harder. Adopt them progressively: non-root and pinned versions first (nearly free), then scanning, then read-only and capabilities. Verify each step with tests so hardening does not break production at 3 a.m.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>docker run --rm alpine id</code>, then <code>docker run --rm --user 10001 alpine id</code>. Then try <code>docker run --rm --read-only alpine touch /x</code> and read the error.</li>
+<li>Run <code>docker run --rm alpine sh -c 'cat /proc/self/status | grep Cap'</code> with and without <code>--cap-drop ALL</code> and compare.</li>
+<li>Scan an old image such as <code>node:16</code> with Trivy and a current <code>node:22-slim</code>. Count criticals.</li>
+<li>Take a Dockerfile from your own project and apply items 1, 2, 3 and 10 from the list. Rescan and compare size and CVE counts.</li>
+</ol></div>

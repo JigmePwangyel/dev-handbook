@@ -1,0 +1,132 @@
+<h1>CDNs and Caching</h1>
+<p class="lead">Physics sets a floor on latency: a round trip from Sydney to a server in Virginia costs roughly 200 ms, however fast your code is. A CDN puts copies of your content near users and absorbs traffic before it ever reaches your servers.</p>
+
+<h2>The problem a CDN solves</h2>
+<ul>
+<li><strong>Latency</strong>: distance. Several round trips for TCP, TLS and HTTP add up.</li>
+<li><strong>Origin load</strong>: every image, script and font request hits your server. A traffic spike (front page of Hacker News) can topple it.</li>
+<li><strong>Bandwidth cost</strong>: egress from a cloud provider is expensive; CDN egress is usually cheaper, sometimes free.</li>
+<li><strong>Availability and attacks</strong>: DDoS traffic must be absorbed somewhere; a CDN's distributed network has far more capacity than one origin.</li>
+</ul>
+
+<h2>How a CDN works</h2>
+<p>A CDN is a globally distributed fleet of caching reverse proxies called <strong>edge</strong> servers (points of presence, PoPs). Your <strong>origin</strong> is your real server. Users are steered to a nearby edge, via anycast routing or DNS that answers with the closest PoP.</p>
+<pre class="diagram">
+ User (Sydney) ──▶ Edge PoP (Sydney)
+                      │
+                      ├─ HIT:  has fresh copy → returns it in ~10 ms. Origin never sees the request.
+                      │
+                      └─ MISS: fetch from origin ───────────────▶ Origin (Virginia)
+                               store copy (obey Cache-Control) ◀── response
+                               return to user
+ Next Sydney user: HIT.
+</pre>
+<p>Many CDNs add an intermediate <strong>shield / tiered cache</strong> layer so that dozens of edges missing at once result in <em>one</em> request to the origin, not dozens.</p>
+<p>Setup in the common "proxy" model: you change your domain's DNS (or name servers) so <code>www.example.com</code> points at the CDN, which is configured with your origin address. Users hit the CDN; the CDN talks to you. Your origin firewall can then accept traffic only from the CDN's IP ranges.</p>
+
+<h2>What gets cached?</h2>
+<ul>
+<li><strong>Static assets</strong>: JS, CSS, images, fonts, video segments, downloads. Cached by default by file extension in most CDNs.</li>
+<li><strong>HTML and API responses</strong>: only if you opt in or your headers allow it (<code>Cache-Control: public, s-maxage=60</code>). Hugely effective for public, read-heavy content (news, product pages, public APIs).</li>
+<li><strong>Never cache</strong> personalised or authenticated responses with shared caches. Mark them <code>Cache-Control: private</code> or <code>no-store</code>.</li>
+</ul>
+
+<h3>The cache key</h3>
+<p>The CDN decides "is this the same request?" using a <strong>cache key</strong>: normally scheme + host + path + query string. Rules matter:</p>
+<ul>
+<li>Tracking parameters (<code>?utm_source=...</code>) make each URL unique and tank your hit ratio; configure the CDN to ignore them.</li>
+<li><code>Vary: Accept-Encoding</code> and <code>Vary: Accept-Language</code> multiply cache entries. <code>Vary: Cookie</code> effectively disables caching.</li>
+<li>By default, requests with cookies or an <code>Authorization</code> header are often not cached; verify for your CDN.</li>
+</ul>
+<p>Measure <strong>cache hit ratio</strong> (hits divided by total). For static sites aim for above 95 percent. Check responses for headers such as <code>CF-Cache-Status: HIT</code> (Cloudflare), <code>X-Cache: Hit from cloudfront</code> (CloudFront), or <code>Age: 253</code> (seconds in cache).</p>
+
+<h2>Cache control: telling the CDN what to do</h2>
+<pre><code># Origin response headers
+
+# Fingerprinted build artefacts: cache everywhere for a year
+Cache-Control: public, max-age=31536000, immutable
+
+# Public HTML or API: edge caches 5 min; browsers always revalidate
+Cache-Control: public, max-age=0, s-maxage=300
+
+# Serve stale content while refreshing, and keep serving it if origin errors
+Cache-Control: public, s-maxage=60, stale-while-revalidate=300, stale-if-error=86400
+
+# Personalised
+Cache-Control: private, no-store</code></pre>
+<p><code>s-maxage</code> targets shared caches (CDN) separately from the browser's <code>max-age</code>, allowing "CDN caches 5 minutes; users' browsers always ask the CDN". <code>stale-if-error</code> is a free resilience feature: if your origin falls over, users still see the last good copy.</p>
+
+<h2>Cache invalidation</h2>
+<p>"There are only two hard things in computer science: cache invalidation and naming things." When content changes, stale copies sit at hundreds of edges and in users' browsers. Strategies, best first:</p>
+<ol>
+<li><strong>Cache busting by fingerprinting (best).</strong> Put a content hash in the file name: <code>app.3f9c1a7b.js</code>. A new build produces a new URL; old URLs stay cached harmlessly. Nothing to invalidate. Webpack, Vite, Next.js and most bundlers do this by default. Only the HTML that references the files needs a short TTL.</li>
+<li><strong>Short TTLs</strong> for content that changes unpredictably: 30 to 300 s caps staleness and still shields the origin from spikes ("micro-caching").</li>
+<li><strong>Purge by URL / tag / prefix / everything.</strong> Explicit API calls on content change. Tag-based purging (Cloudflare Cache-Tags, Fastly surrogate keys) lets you purge "all pages that mention product 42". Purge propagates in seconds to a minute, depending on the CDN.</li>
+<li><strong>Versioned paths</strong> (<code>/v2/api/...</code>), with query strings (<code>?v=123</code>) as a weaker form.</li>
+</ol>
+<pre><code># Cloudflare: purge specific URLs (API token with Cache Purge permission)
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/purge_cache" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  --data '{"files":["https://example.com/index.html","https://example.com/pricing"]}'
+
+# Purge everything (use sparingly: the next minute hits your origin hard)
+curl -X POST "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/purge_cache" \
+  -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
+  --data '{"purge_everything":true}'
+
+# AWS CloudFront invalidation
+aws cloudfront create-invalidation --distribution-id E123ABC --paths "/index.html" "/blog/*"</code></pre>
+<div class="callout key"><strong>The deploy pattern for frontends</strong><p>Upload hashed assets first (immutable, one-year cache), then upload the small <code>index.html</code> last (<code>no-cache</code> or a short s-maxage), and purge only <code>index.html</code>. Users then never see HTML pointing at assets that do not exist yet, and never see old assets that were cleaned up too early. Keep the previous build's assets around for a while: users with an old page open still request them.</p></div>
+
+<h2>Cloudflare in practice</h2>
+<p>Cloudflare is the most common starting point because the free tier is generous and setup is only a DNS change.</p>
+<ol>
+<li>Add your domain; Cloudflare scans existing DNS records. Change your registrar's <code>NS</code> to the two Cloudflare name servers.</li>
+<li>For each record, the cloud icon is <strong>Proxied</strong> (orange: traffic goes via Cloudflare, you get CDN/WAF and your origin IP is hidden) or <strong>DNS only</strong> (grey: plain DNS). Proxy web traffic; do not proxy SSH, mail or database hostnames (non-HTTP ports are not proxied on the free plan).</li>
+<li>SSL/TLS mode: use <strong>Full (strict)</strong>: Cloudflare connects to your origin over HTTPS and validates the certificate (install a Let's Encrypt or Cloudflare Origin Certificate on the origin). <em>Flexible</em> mode sends plain HTTP to the origin and invites redirect loops and interception; avoid it.</li>
+<li>Turn on "Always Use HTTPS", HTTP/3, Brotli, and Auto Minify/Rocket features as appropriate. Add Cache Rules (what to cache, edge TTL, bypass for <code>/admin</code> and <code>/api</code>).</li>
+<li>Lock the origin: allow 80/443 only from Cloudflare's published IP ranges (cloudflare.com/ips), or use Authenticated Origin Pulls / Cloudflare Tunnel (<code>cloudflared</code>) so the origin needs no inbound ports at all.</li>
+</ol>
+<p>Note: by default Cloudflare caches by file extension (static assets), not HTML. To cache HTML, add a Cache Rule ("Eligible for cache") and set edge TTL or respect origin headers.</p>
+<p>Other CDNs: Amazon CloudFront (tight AWS integration, S3 origins with Origin Access Control), Fastly (instant purge, VCL/Compute programmability), Akamai (enterprise), Bunny.net (cheap, simple), Vercel/Netlify (built in).</p>
+
+<h2>More than caching</h2>
+<ul>
+<li><strong>TLS termination near the user</strong>: the expensive handshake is short-haul; the CDN reuses long-lived connections to the origin.</li>
+<li><strong>DDoS mitigation and WAF</strong>: block bad traffic at the edge; rate limiting; bot management.</li>
+<li><strong>Image optimisation</strong>: resizing and converting to WebP/AVIF per device.</li>
+<li><strong>Edge compute</strong> (Cloudflare Workers, CloudFront Functions/Lambda@Edge, Fastly Compute): run small code at the edge for redirects, A/B tests, auth checks, header rewriting.</li>
+<li><strong>Origin failover</strong> and load balancing across origins.</li>
+</ul>
+
+<h2>Caching layers overall</h2>
+<table>
+<tr><th>Layer</th><th>Where</th><th>Controlled by</th></tr>
+<tr><td>Browser cache</td><td>User's device</td><td><code>Cache-Control: max-age</code>, ETag</td></tr>
+<tr><td>CDN edge</td><td>Near the user</td><td><code>s-maxage</code>, CDN rules, purge</td></tr>
+<tr><td>Reverse proxy cache</td><td>nginx <code>proxy_cache</code>, Varnish</td><td>Config</td></tr>
+<tr><td>Application cache</td><td>Redis, memcached, in-process</td><td>Your code, TTLs, explicit deletes</td></tr>
+<tr><td>Database</td><td>Buffer pool, query cache</td><td>Engine</td></tr>
+</table>
+<p>Every layer is a place where stale data can hide. When "my change does not show up", walk the layers from the browser inwards: hard-refresh, <code>curl -I</code> to see the CDN status header, curl the origin directly, then check app caches.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Caching a response that contains user data</strong> and serving it to others. This is a serious security incident. Default to <code>private</code> for anything personalised and test with two accounts.</li>
+<li><strong>Caching error pages</strong>: a transient 500 cached for an hour. Make sure errors are not cacheable, or use short negative TTLs.</li>
+<li><strong>Long TTL on non-fingerprinted files</strong> (<code>style.css</code> cached for a year, unfixable except by purge).</li>
+<li><strong>Origin IP leaks</strong> (old DNS records, mail headers) let attackers bypass the CDN. Firewall the origin to CDN ranges.</li>
+<li><strong>Purging everything during peak</strong>: cold cache plus full traffic equals an origin outage ("cache stampede"). Use request coalescing/tiered caching and purge selectively.</li>
+<li><strong>Treating CDN as a fix for a slow app</strong>: dynamic, uncacheable requests still go to your origin.</li>
+<li><strong>Cookies on static domains</strong> can make assets uncacheable. Serve static content from cookieless paths/hosts.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>curl -sI https://www.cloudflare.com/ | grep -iE 'cf-cache-status|age|cache-control|server'</code>. Run it twice and watch <code>Age</code>.</li>
+<li>Compare headers for an HTML page versus a hashed asset (<code>.js</code>) on a large site. How do their <code>Cache-Control</code> values differ and why?</li>
+<li>Put a free Cloudflare account in front of a domain pointing at a small VPS. Request a static file twice and confirm <code>cf-cache-status: HIT</code> on the second.</li>
+<li>Change the file on the origin. Request it again: you get the old content. Purge that URL through the dashboard or API and fetch again.</li>
+<li>Add a hashed filename to a test asset instead of purging, and notice no purge is required.</li>
+<li>Restrict your origin's firewall (<code>ufw allow from &lt;CF range&gt; to any port 443</code>) and confirm direct access to the origin IP fails while the proxied domain works.</li>
+</ol></div>

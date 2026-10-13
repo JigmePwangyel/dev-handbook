@@ -1,0 +1,162 @@
+<h1>Capstone: Build the CI Pipeline</h1>
+<p class="lead">Stage 2: every push to GitHub should automatically run the tests, build the Docker image and publish it to the GitHub Container Registry (GHCR) with an immutable tag. After this, "what is running in production" is answered by a commit SHA.</p>
+
+<h2>Pipeline design</h2>
+<pre class="diagram">
+ pull request ─▶ [ test job ] ─▶ (optionally build image, do not push)
+ push to main ─▶ [ test job ] ─▶ [ build-and-push job ] ─▶ ghcr.io/OWNER/notely:sha-abc1234, :main
+ tag v1.2.0   ─▶ same, plus :1.2.0
+</pre>
+<p>Principles: fail fast (cheap checks first), build the artifact once and promote it (never rebuild per environment), tag with the commit SHA, use the built-in <code>GITHUB_TOKEN</code> instead of a personal access token, and give each job the least permissions it needs.</p>
+
+<h2>The workflow</h2>
+<p>Save as <code>.github/workflows/ci.yml</code>:</p>
+<pre><code>name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+# cancel superseded runs on the same branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read            # default for every job; widen per job below
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: notely
+          POSTGRES_PASSWORD: testpw
+          POSTGRES_DB: notely_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U notely"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgres://notely:testpw@localhost:5432/notely_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: psql "$DATABASE_URL" -f migrations/001_init.sql
+      - run: npm test
+      # optional extras: npm run lint, npx audit-ci, gitleaks
+
+  image:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write        # push to GHCR
+      id-token: write        # keyless signing / provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,format=short
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: 1</code></pre>
+<p>Pin third-party actions to commit SHAs once you are comfortable (see the supply-chain lesson); version tags are used here for readability.</p>
+
+<h2>Walkthrough</h2>
+<h3>Triggers and concurrency</h3>
+<p>Pull requests get tests only; pushes to <code>main</code> additionally publish. <code>concurrency</code> cancels an older run when a newer commit lands, saving minutes and money.</p>
+<h3>Service containers</h3>
+<p>The <code>services:</code> block starts Postgres next to your job and waits for the health check. Because the job runs directly on the runner, the database is reachable at <code>localhost:5432</code> (if the job itself ran in a container you would use the service name as host).</p>
+<h3>Caching</h3>
+<p><code>setup-node</code> with <code>cache: npm</code> caches the npm download cache keyed on the lockfile. Docker layers are cached in the GitHub Actions cache via <code>cache-from/cache-to type=gha</code>, which can cut image builds from minutes to seconds.</p>
+<h3>Tagging</h3>
+<p><code>docker/metadata-action</code> generates tags: <code>sha-1a2b3c4</code> (what you deploy), <code>main</code> (convenience, mutable) and semantic versions on <code>v*</code> tags. Deploy by SHA or digest, never by <code>latest</code>.</p>
+<h3>Permissions</h3>
+<p><code>GITHUB_TOKEN</code> is created per run and expires with it. <code>packages: write</code> lets it push to GHCR. After the first push, go to the package settings and link it to the repo (or set visibility) so your server can pull it; for a private package, create a read-only token for the VPS (next lesson).</p>
+
+<h2>A minimal test to make the pipeline meaningful</h2>
+<pre><code>// test/notes.test.js  (Node's built-in test runner; "test": "node --test")
+import { test, after } from 'node:test';
+import assert from 'node:assert/strict';
+import app from '../src/server.js';
+import { pool } from '../src/db.js';
+
+const server = app.listen(0);
+const base = () =&gt; `http://127.0.0.1:${server.address().port}`;
+after(async () =&gt; { server.close(); await pool.end(); });
+
+test('create and list notes', async () =&gt; {
+  const created = await fetch(`${base()}/notes`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'ci note' }),
+  });
+  assert.equal(created.status, 201);
+  const list = await (await fetch(`${base()}/notes`)).json();
+  assert.ok(list.some(n =&gt; n.title === 'ci note'));
+});
+
+test('rejects missing title', async () =&gt; {
+  const r = await fetch(`${base()}/notes`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+  assert.equal(r.status, 400);
+});</code></pre>
+<p>Tip: make <code>server.js</code> skip <code>app.listen</code> when imported by tests (or split <code>app.js</code> and <code>server.js</code>) to avoid binding two ports.</p>
+
+<h2>Protect main</h2>
+<p>In repository settings add a branch protection rule (or ruleset) for <code>main</code>: require pull requests, require the <code>test</code> status check, block force pushes. Now broken code cannot be merged, and the pipeline is the gatekeeper rather than a suggestion.</p>
+
+<h2>Common failures and fixes</h2>
+<table>
+<tr><th>Symptom</th><th>Cause and fix</th></tr>
+<tr><td><code>denied: permission_denied: write_package</code></td><td>Missing <code>packages: write</code> permission, or the package was created by another user/repo and is not linked to this repo</td></tr>
+<tr><td>Tests fail with <code>ECONNREFUSED 5432</code></td><td>Service not healthy yet (add health options) or wrong host</td></tr>
+<tr><td>Repository name has uppercase, push fails</td><td>Image names must be lowercase; <code>metadata-action</code> handles it, hand-written tags may not</td></tr>
+<tr><td>Build always slow</td><td>Layer order wrong (source copied before dependencies) or cache not configured</td></tr>
+<tr><td>Workflow cannot access secrets on forked PRs</td><td>By design for security; do not work around with <code>pull_request_target</code></td></tr>
+</table>
+
+<h2>Where this leads</h2>
+<p>The next stage adds a deploy job that runs after the image job. Later improvements: a staging environment with auto-deploy and a production environment with manual approval, cosign signing, a nightly scheduled build to pick up base-image patches, and Dependabot for actions and npm.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Add the workflow and a test, push a branch and open a pull request: confirm only the <code>test</code> job runs.</li>
+<li>Merge it. Find the package under your profile's "Packages" and pull it: <code>docker pull ghcr.io/OWNER/notely:main</code>.</li>
+<li>Break a test on purpose and confirm the image job is skipped. Fix and re-run.</li>
+<li>Enable branch protection requiring the check, then try to push directly to <code>main</code>.</li>
+</ol></div>

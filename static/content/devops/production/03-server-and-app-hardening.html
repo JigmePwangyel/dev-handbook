@@ -1,0 +1,143 @@
+<h1>Server and Application Hardening</h1>
+<p class="lead">A public server is probed within minutes of getting an IP address. Hardening is the unglamorous work of shrinking what an attacker can reach and limiting what they can do if they get in. Most of it is a one-time checklist plus automation.</p>
+
+<h2>The mindset: defense in depth</h2>
+<pre class="diagram">
+ Internet ─▶ [ Firewall / security group ] ─▶ [ Reverse proxy: TLS, headers, rate limit ]
+          ─▶ [ App: validation, authn/z ] ─▶ [ DB: least-privilege user, private network ]
+              each layer assumes the previous one has failed
+</pre>
+<p>No single control is enough. Assume any layer can be bypassed and make sure the next one still limits the damage ("blast radius").</p>
+
+<h2>1. Patching the operating system</h2>
+<p>Unpatched known vulnerabilities are the most common entry point. Automate security updates and reboot when kernels change.</p>
+<pre><code># Debian/Ubuntu: unattended security upgrades
+sudo apt install unattended-upgrades
+sudo dpkg-reconfigure -plow unattended-upgrades
+# check status / pending reboot
+cat /var/run/reboot-required
+sudo needrestart</code></pre>
+<p>For containers, patching means <strong>rebuilding images</strong> regularly on updated base images (a weekly scheduled CI build) and redeploying. Live-patching a container is an anti-pattern.</p>
+
+<h2>2. SSH hardening</h2>
+<p>Put these in <code>/etc/ssh/sshd_config.d/99-hardening.conf</code>:</p>
+<pre><code>PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers deploy alice
+MaxAuthTries 3
+LoginGraceTime 20
+X11Forwarding no</code></pre>
+<pre><code>sudo sshd -t                 # validate config BEFORE reloading
+sudo systemctl reload ssh    # keep your current session open and test a second one</code></pre>
+<div class="callout warn"><strong>Do not lock yourself out</strong><p>Always keep an existing session open while testing a new SSH config in a second terminal. Know your provider's recovery console before you need it.</p></div>
+<p>Use ed25519 keys (<code>ssh-keygen -t ed25519</code>) with a passphrase or hardware key. Optionally move SSH off port 22 (reduces log noise, not real security) or, better, reach servers only through a VPN/bastion or a tool like Tailscale or AWS SSM Session Manager so port 22 is not public at all.</p>
+
+<h2>3. Firewall</h2>
+<p>Default deny inbound, open only what you serve.</p>
+<pre><code>sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 22/tcp      # or restrict: ufw allow from 203.0.113.7 to any port 22
+sudo ufw allow 80,443/tcp
+sudo ufw enable
+sudo ufw status verbose</code></pre>
+<div class="callout warn"><strong>Docker bypasses ufw</strong><p>Published container ports (<code>-p 5432:5432</code>) are added to iptables ahead of ufw rules and are exposed to the world. Bind to localhost (<code>127.0.0.1:5432:5432</code>) or do not publish at all and use internal networks. Also use your cloud security group as the primary firewall.</p></div>
+
+<h2>4. fail2ban</h2>
+<p>Bans IPs that repeatedly fail authentication by parsing logs and adding firewall rules.</p>
+<pre><code>sudo apt install fail2ban
+# /etc/fail2ban/jail.local
+[sshd]
+enabled  = true
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+
+sudo systemctl enable --now fail2ban
+sudo fail2ban-client status sshd</code></pre>
+<p>With key-only SSH it mostly reduces noise, but it is also useful on nginx login endpoints (<code>nginx-limit-req</code> jail).</p>
+
+<h2>5. Least privilege</h2>
+<ul>
+<li>Run apps as a dedicated unprivileged user, never root. In containers add <code>USER node</code> (or a numeric UID) and prefer <code>--read-only</code> filesystems.</li>
+<li>Give the DB user used by the app only <code>SELECT/INSERT/UPDATE/DELETE</code> on its schema, with a separate migration user for DDL.</li>
+<li>Use <code>sudo</code> with specific commands rather than full access; log it.</li>
+<li>systemd sandboxing makes a cheap extra layer:</li>
+</ul>
+<pre><code>[Service]
+User=app
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/app
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX</code></pre>
+<p>Check how you are doing with <code>systemd-analyze security app.service</code>.</p>
+
+<h2>6. Reduce attack surface</h2>
+<ul>
+<li>Remove unused packages and services (<code>ss -tlnp</code> shows what is listening).</li>
+<li>Databases and caches listen on private interfaces only. A public Redis with no password is mining malware's favourite target.</li>
+<li>Use minimal images (<code>distroless</code>, <code>alpine</code>, <code>-slim</code>).</li>
+<li>Enable audit logs and send them off the box so an intruder cannot erase them.</li>
+</ul>
+
+<h2>7. OWASP Top 10: the application basics</h2>
+<p>The OWASP Top 10 lists the most common web risks. A practical translation:</p>
+<table>
+<tr><th>Risk</th><th>What goes wrong</th><th>Defence</th></tr>
+<tr><td>Broken access control</td><td>User A fetches <code>/orders/123</code> belonging to B (IDOR)</td><td>Check ownership server-side on every request</td></tr>
+<tr><td>Cryptographic failures</td><td>Plain HTTP, weak hashing, secrets in URLs</td><td>TLS everywhere, argon2/bcrypt for passwords</td></tr>
+<tr><td>Injection</td><td>SQL/command/template injection</td><td>Parameterised queries, never string-concat input</td></tr>
+<tr><td>Insecure design</td><td>No rate limits, no abuse thinking</td><td>Threat model early</td></tr>
+<tr><td>Security misconfiguration</td><td>Debug on, default creds, open buckets</td><td>IaC + config scanning</td></tr>
+<tr><td>Vulnerable components</td><td>Old libraries with CVEs</td><td>Dependency scanning (next lesson)</td></tr>
+<tr><td>Authentication failures</td><td>Credential stuffing, weak sessions</td><td>MFA, lockout/rate limits, secure cookies</td></tr>
+<tr><td>Integrity failures</td><td>Unsigned updates, tampered pipelines</td><td>Signing, pinned dependencies</td></tr>
+<tr><td>Logging and monitoring failures</td><td>Breach unnoticed for months</td><td>Log auth events, alert on anomalies</td></tr>
+<tr><td>SSRF</td><td>Server tricked into fetching internal URLs (cloud metadata!)</td><td>Allow-list outbound targets, IMDSv2</td></tr>
+</table>
+<pre><code>// SQL injection: wrong vs right
+db.query("SELECT * FROM users WHERE email = '" + email + "'");   // WRONG
+db.query("SELECT * FROM users WHERE email = $1", [email]);       // right</code></pre>
+
+<h2>8. Security headers (set at nginx or in the app)</h2>
+<pre><code>add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-Frame-Options "DENY" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'" always;
+add_header Permissions-Policy "geolocation=(), camera=()" always;
+server_tokens off;</code></pre>
+<p>Test with <code>curl -I https://example.com</code> or securityheaders.com. Roll out CSP in <code>Content-Security-Policy-Report-Only</code> mode first so you do not break the site. Set cookies with <code>Secure; HttpOnly; SameSite=Lax</code>.</p>
+
+<h2>9. Rate limiting and abuse control</h2>
+<pre><code>http {
+  limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+  limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+  server {
+    location /login { limit_req zone=login burst=5 nodelay; proxy_pass http://app; }
+    location /api/  { limit_req zone=api burst=20;          proxy_pass http://app; }
+  }
+}</code></pre>
+<p>Limit at the edge (CDN/WAF), at nginx and, for per-user logic, in the app (token bucket in Redis). Return <code>429</code> with <code>Retry-After</code>. Behind a proxy make sure you key on the real client IP (<code>X-Forwarded-For</code> from a trusted proxy only), otherwise everyone shares one bucket or attackers spoof it.</p>
+
+<h2>10. Verify, continuously</h2>
+<ul>
+<li><code>lynis audit system</code> gives a hardening report for Linux hosts; CIS Benchmarks are the detailed standard.</li>
+<li><code>nmap -sV yourserver</code> from outside: does the list of open ports match your intent?</li>
+<li>Run OWASP ZAP baseline scan against staging in CI.</li>
+<li>Enable cloud-native detection (GuardDuty, Security Hub) if on AWS.</li>
+</ul>
+
+<h2>Trade-offs</h2>
+<p>Every control costs convenience. Strict CSP breaks inline scripts; read-only filesystems break apps that write temp files; aggressive rate limits block users behind shared NAT. Roll out in report-only or monitor mode, measure, then enforce.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>On a throwaway VPS apply the SSH config, ufw rules and fail2ban above. From another machine confirm password login is refused.</li>
+<li>Run <code>sudo lynis audit system</code> and fix the top three suggestions.</li>
+<li>Add the headers to nginx and grade the site; then add a login rate limit and prove it with a loop of <code>curl</code> requests that start returning 429.</li>
+</ol></div>

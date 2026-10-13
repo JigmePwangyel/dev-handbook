@@ -1,0 +1,122 @@
+<h1>DevSecOps and Supply Chain Security</h1>
+<p class="lead">Your application is perhaps 10% code you wrote and 90% code you imported, plus a base image, a build system and a pipeline. Attackers know it: compromising one popular package or one CI token reaches thousands of victims. DevSecOps means building security checks into the pipeline so they run on every change, not once a year.</p>
+
+<h2>Why "shift left"</h2>
+<p>A vulnerability found in a pull request costs minutes to fix. The same flaw found in production costs an incident. Automated checks in CI give fast feedback to the developer who just wrote the code, while it is still in their head.</p>
+<pre class="diagram">
+ commit ─▶ secret scan ─▶ SAST ─▶ dependency scan ─▶ build ─▶ image scan ─▶ sign + SBOM ─▶ deploy
+   │            │           │            │                       │               │            │
+ pre-commit   gitleaks   Semgrep/    Dependabot/             Trivy/Grype      cosign       admission
+                         CodeQL      npm audit/OSV                                         policy verifies
+</pre>
+
+<h2>The scanning toolbox</h2>
+<table>
+<tr><th>Type</th><th>Finds</th><th>Tools</th></tr>
+<tr><td>Secret scanning</td><td>Keys in code/history</td><td>gitleaks, trufflehog, GitHub push protection</td></tr>
+<tr><td>SAST (static analysis)</td><td>Insecure code patterns</td><td>Semgrep, CodeQL, SonarQube</td></tr>
+<tr><td>SCA (dependency scanning)</td><td>Known CVEs in libraries</td><td>Dependabot, Renovate, OSV-Scanner, <code>npm audit</code>, Snyk</td></tr>
+<tr><td>Container scanning</td><td>CVEs in OS packages and libs</td><td>Trivy, Grype, Docker Scout</td></tr>
+<tr><td>IaC scanning</td><td>Open buckets, wide security groups</td><td>Trivy config, Checkov, tfsec</td></tr>
+<tr><td>DAST</td><td>Runtime web flaws</td><td>OWASP ZAP, Nuclei</td></tr>
+</table>
+
+<h2>Dependency scanning in practice</h2>
+<p>Enable Dependabot or Renovate so you receive automated update PRs. A minimal <code>.github/dependabot.yml</code>:</p>
+<pre><code>version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: docker
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }</code></pre>
+<p>And a CI gate that fails on serious findings:</p>
+<pre><code>- name: Scan image
+  uses: aquasecurity/trivy-action@0.28.0
+  with:
+    image-ref: ghcr.io/acme/api:${{ github.sha }}
+    severity: CRITICAL,HIGH
+    ignore-unfixed: true
+    exit-code: 1</code></pre>
+<div class="callout tip"><strong>Triage, do not drown</strong><p>Scanners produce noise. Prioritise: is it reachable by your code, is a fix available, is it exploitable in your context? Use <code>ignore-unfixed</code>, VEX statements or documented ignore files with expiry dates. A gate nobody trusts gets disabled.</p></div>
+
+<h2>Pinning: make builds reproducible and tamper-evident</h2>
+<ul>
+<li><strong>Lockfiles</strong>: commit them, install with <code>npm ci</code>/<code>pip --require-hashes</code>/<code>go.sum</code> verification.</li>
+<li><strong>Base images by digest</strong>: tags are mutable, digests are not.</li>
+<li><strong>GitHub Actions by commit SHA</strong>: a tag like <code>@v4</code> can be moved by a compromised maintainer (this happened in the 2025 tj-actions/changed-files incident, which leaked secrets from thousands of repos).</li>
+</ul>
+<pre><code>FROM node:22-alpine@sha256:3a4c...e91f      # digest pin; Renovate can bump it
+
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.2.2</code></pre>
+<p>Trade-off: pinning stops silent changes but also stops silent <em>security fixes</em>, so pair it with automated update PRs.</p>
+
+<h2>SBOM: a bill of materials</h2>
+<p>A Software Bill of Materials lists every component in an artifact. When the next Log4Shell lands, you query SBOMs instead of grepping repos. Common formats: SPDX and CycloneDX.</p>
+<pre><code>syft ghcr.io/acme/api:1.4.0 -o spdx-json > sbom.spdx.json
+grype sbom:sbom.spdx.json --fail-on high
+# Attach it to the image in the registry
+cosign attest --yes --predicate sbom.spdx.json --type spdxjson ghcr.io/acme/api@sha256:...</code></pre>
+<p>Regulation is pushing this: US executive order 14028 and the EU Cyber Resilience Act both expect SBOMs for many products.</p>
+
+<h2>Signing images with cosign (Sigstore)</h2>
+<p>Scanning tells you what is inside. Signing tells you <em>who built it and that it was not altered</em>. Sigstore's <strong>keyless</strong> signing ties a signature to an OIDC identity (for example "the GitHub workflow in repo acme/api on main") and records it in a public transparency log, so you manage no long-lived signing keys.</p>
+<pre><code># in CI (needs permissions: id-token: write, packages: write)
+cosign sign --yes ghcr.io/acme/api@${DIGEST}
+
+# verify anywhere
+cosign verify ghcr.io/acme/api@${DIGEST} \
+  --certificate-identity-regexp '^https://github.com/acme/api/.github/workflows/release.yml@refs/heads/main$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com</code></pre>
+<p>Enforce verification at deploy time with a Kubernetes admission controller (Kyverno <code>verifyImages</code>, Sigstore policy-controller, or Ratify). Sign the <strong>digest</strong>, never the tag.</p>
+
+<h2>SLSA: a maturity framework for build integrity</h2>
+<p>SLSA ("salsa", Supply-chain Levels for Software Artifacts) defines increasing guarantees about how an artifact was built.</p>
+<table>
+<tr><th>Build level</th><th>Meaning</th><th>How to get it</th></tr>
+<tr><td>L1</td><td>Build is scripted and provenance exists</td><td>Any CI that emits provenance</td></tr>
+<tr><td>L2</td><td>Hosted build platform signs provenance</td><td>GitHub Actions + <code>actions/attest-build-provenance</code></td></tr>
+<tr><td>L3</td><td>Hardened, isolated builds; provenance cannot be forged by the build's own steps</td><td>slsa-github-generator reusable workflows</td></tr>
+</table>
+<p>Provenance is a signed statement: "this digest was built from commit X of repo Y by workflow Z". A consumer can verify it with <code>gh attestation verify</code> or <code>slsa-verifier</code>.</p>
+
+<h2>Hardening the pipeline itself</h2>
+<ul>
+<li>Set the workflow <code>permissions:</code> to read-only by default; grant write per job.</li>
+<li>Protect <code>main</code>: required reviews, required status checks, no force pushes, signed commits if you need them.</li>
+<li>Never use <code>pull_request_target</code> with checkout of untrusted PR code; never interpolate untrusted input (<code>${{ github.event.pull_request.title }}</code>) into shell commands.</li>
+<li>Use ephemeral runners for untrusted builds; self-hosted runners that persist between jobs can be poisoned.</li>
+<li>Use OIDC to cloud instead of stored keys; require approvals on the <code>production</code> environment.</li>
+</ul>
+
+<h2>Dependency hygiene</h2>
+<ul>
+<li>Beware typosquatting and dependency confusion (an attacker publishes a public package with your internal package's name). Use scoped names and registry config that pins internal scopes.</li>
+<li>Be wary of install scripts: <code>npm ci --ignore-scripts</code> where feasible.</li>
+<li>Prefer fewer, well-maintained dependencies. Every one is trust you extend.</li>
+<li>Delay adopting brand new releases a few days (Renovate <code>minimumReleaseAge</code>); most malicious versions are yanked quickly.</li>
+</ul>
+
+<h2>A sensible starting pipeline</h2>
+<ol>
+<li>Day 1: Dependabot + secret scanning + push protection (free on GitHub).</li>
+<li>Week 1: Trivy on image and IaC in CI, failing on critical.</li>
+<li>Month 1: SBOM and provenance generated on release.</li>
+<li>Quarter 1: cosign signing and cluster-side verification; SHA-pinned actions.</li>
+</ol>
+
+<div class="callout key"><strong>Security is a process, not a gate</strong><p>The goal is not zero findings; it is a pipeline that makes the secure path the easy path, keeps fix time short, and lets you answer "are we affected?" within an hour of a new CVE.</p></div>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run <code>trivy image node:22</code> and compare with <code>trivy image node:22-alpine</code> and a distroless image. Note the difference in findings.</li>
+<li>Generate an SBOM with <code>syft</code> for one of your images and query it for a package: <code>grype sbom:./sbom.json</code>.</li>
+<li>Sign a test image in GHCR using keyless cosign from a GitHub Action, then verify it from your laptop.</li>
+</ol></div>

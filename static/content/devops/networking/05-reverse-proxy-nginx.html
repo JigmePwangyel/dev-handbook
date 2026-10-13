@@ -1,0 +1,246 @@
+<h1>Reverse Proxies and nginx</h1>
+<p class="lead">A reverse proxy sits in front of your application and handles the messy edge of the internet: TLS, compression, static files, slow clients, rate limits. It is the first piece of infrastructure almost every production app gets, and nginx is the most common choice.</p>
+
+<h2>Forward vs reverse proxy</h2>
+<p>A <em>forward</em> proxy acts for clients (a corporate proxy hiding employees). A <em>reverse</em> proxy acts for servers: clients talk to it believing it is the site, and it forwards requests to one or more backends.</p>
+<pre class="diagram">
+ Internet            ┌──────────── your server ─────────────────────────┐
+                     │                                                  │
+ Browser ──443──▶  nginx ──▶ 127.0.0.1:3000  Node app (API)
+ (HTTPS)             │  ├──▶ 127.0.0.1:3001  Another service
+                     │  └──▶ /var/www/site   static files (served directly)
+                     └──────────────────────────────────────────────────┘
+</pre>
+
+<h2>Why not just expose Node/Python/Java directly?</h2>
+<ul>
+<li><strong>Privileged ports</strong>: nginx binds 80/443 while your app runs as an unprivileged user on 3000.</li>
+<li><strong>TLS termination</strong>: certificates, ciphers, HTTP/2 and HTTP/3 handled by battle-tested code.</li>
+<li><strong>Slow clients</strong>: nginx buffers a slow mobile client's upload/download so your app worker is not tied up ("slowloris" resistance).</li>
+<li><strong>Static files</strong>: nginx serves them via the kernel's <code>sendfile</code> orders of magnitude cheaper than your framework.</li>
+<li><strong>Compression, caching, rate limiting, access logs</strong> in one place.</li>
+<li><strong>Multiple apps on one IP</strong>: route by hostname or path.</li>
+<li><strong>Zero-downtime reloads and upstream failover</strong>.</li>
+<li><strong>Security boundary</strong>: malformed requests are rejected before reaching your code; the app is not directly reachable.</li>
+</ul>
+
+<h2>nginx basics</h2>
+<p>On Ubuntu: <code>sudo apt install nginx</code>. Layout:</p>
+<table>
+<tr><th>Path</th><th>Purpose</th></tr>
+<tr><td><code>/etc/nginx/nginx.conf</code></td><td>Main config; includes the files below</td></tr>
+<tr><td><code>/etc/nginx/sites-available/</code></td><td>One file per site (Debian/Ubuntu convention)</td></tr>
+<tr><td><code>/etc/nginx/sites-enabled/</code></td><td>Symlinks to the enabled sites</td></tr>
+<tr><td><code>/etc/nginx/conf.d/*.conf</code></td><td>Extra config snippets, also included</td></tr>
+<tr><td><code>/var/log/nginx/access.log, error.log</code></td><td>Logs. <code>error.log</code> is where 502s are explained.</td></tr>
+</table>
+<p>Config is hierarchical: <code>http { server { location { } } }</code>. A request picks a <code>server</code> by port and <code>server_name</code> (matching the Host header), then a <code>location</code> by the best path match (exact <code>=</code>, longest prefix, then regex).</p>
+<pre><code>sudo nginx -t                     # ALWAYS test config before reloading
+sudo systemctl reload nginx       # graceful: new workers start, old ones finish requests
+sudo systemctl restart nginx      # drops connections; rarely needed
+sudo tail -f /var/log/nginx/error.log</code></pre>
+
+<h2>Example 1: the minimal reverse proxy</h2>
+<pre><code># /etc/nginx/sites-available/myapp
+server {
+    listen 80;
+    server_name example.com www.example.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}</code></pre>
+<pre><code>sudo ln -s /etc/nginx/sites-available/myapp /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t &amp;&amp; sudo systemctl reload nginx</code></pre>
+<p>Without the <code>proxy_set_header</code> lines your app sees <code>Host: 127.0.0.1:3000</code> and every client as <code>127.0.0.1</code>. Remember <code>app.set('trust proxy', 1)</code> in Express.</p>
+<div class="callout warn"><strong>The trailing slash in proxy_pass</strong><p><code>proxy_pass http://127.0.0.1:3000;</code> forwards the original path unchanged. <code>proxy_pass http://127.0.0.1:3000/;</code> (with a URI part) <em>replaces</em> the matched location prefix. With <code>location /api/ { proxy_pass http://127.0.0.1:3000/; }</code> a request for <code>/api/users</code> arrives at the app as <code>/users</code>. This is the most common source of unexpected 404s behind nginx.</p></div>
+
+<h2>Example 2: a production-grade config</h2>
+<p>Full server with HTTPS, static files, compression, upstream keep-alive, caching of assets, security headers and timeouts:</p>
+<pre><code># /etc/nginx/conf.d/rate-limit.conf  (http context; shared zones live here)
+limit_req_zone  $binary_remote_addr zone=api:10m  rate=10r/s;
+limit_req_zone  $binary_remote_addr zone=login:10m rate=5r/m;
+limit_conn_zone $binary_remote_addr zone=perip:10m;
+
+# WebSocket support: choose Connection header based on the Upgrade header
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}</code></pre>
+<pre><code># /etc/nginx/sites-available/myapp
+upstream app_backend {
+    server 127.0.0.1:3000;
+    # server 127.0.0.1:3001;      # add more for load balancing
+    keepalive 32;                 # reuse connections to the app
+}
+
+server {
+    listen 80;
+    server_name example.com www.example.com;
+    # Let's Encrypt HTTP-01 and everything else redirects
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://example.com$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options    "nosniff" always;
+    add_header X-Frame-Options           "DENY" always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+
+    client_max_body_size 10m;               # default 1m: uploads above get 413
+    limit_conn perip 50;
+
+    # --- Compression --------------------------------------------------
+    gzip on;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_types text/plain text/css text/javascript application/javascript
+               application/json application/xml image/svg+xml;
+    # Images/video are already compressed: do not list them.
+
+    # --- Static files served directly by nginx ------------------------
+    root /var/www/myapp/current/public;
+
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+        access_log off;
+    }
+
+    # --- API with rate limiting --------------------------------------
+    location /api/ {
+        limit_req zone=api burst=20 nodelay;
+        limit_req_status 429;
+        proxy_pass http://app_backend;
+        include /etc/nginx/snippets/proxy.conf;
+    }
+
+    location = /api/login {
+        limit_req zone=login burst=3 nodelay;
+        limit_req_status 429;
+        proxy_pass http://app_backend;
+        include /etc/nginx/snippets/proxy.conf;
+    }
+
+    # --- WebSockets ---------------------------------------------------
+    location /socket.io/ {
+        proxy_pass http://app_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host       $host;
+        proxy_read_timeout 3600s;           # keep idle sockets open for an hour
+        proxy_send_timeout 3600s;
+    }
+
+    # --- Everything else goes to the app -------------------------------
+    location / {
+        proxy_pass http://app_backend;
+        include /etc/nginx/snippets/proxy.conf;
+    }
+
+    # Health endpoint not exposed publicly beyond the LB
+    location = /nginx-health { access_log off; return 200 "ok\n"; }
+}</code></pre>
+<pre><code># /etc/nginx/snippets/proxy.conf
+proxy_http_version 1.1;
+proxy_set_header Connection "";               # required for upstream keepalive
+proxy_set_header Host              $host;
+proxy_set_header X-Real-IP         $remote_addr;
+proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_connect_timeout 5s;
+proxy_read_timeout    60s;
+proxy_send_timeout    60s;</code></pre>
+
+<h3>What each part does</h3>
+<table>
+<tr><th>Directive</th><th>Why</th></tr>
+<tr><td><code>upstream ... keepalive 32</code></td><td>Avoids a TCP handshake per request to the app. Needs <code>proxy_http_version 1.1</code> and an empty <code>Connection</code> header.</td></tr>
+<tr><td><code>gzip_types</code></td><td>Text compresses 70 to 90 percent; <code>text/html</code> is always on. Brotli needs a module; often done at the CDN.</td></tr>
+<tr><td><code>expires 1y</code> + <code>immutable</code></td><td>For fingerprinted build assets. Never for HTML.</td></tr>
+<tr><td><code>limit_req zone=api burst=20 nodelay</code></td><td>Average 10 req/s per IP, tolerate bursts of 20 immediately, reject the rest with 429.</td></tr>
+<tr><td><code>Upgrade</code>/<code>Connection</code> headers</td><td>Required for the HTTP Upgrade handshake that creates a WebSocket. Without it you get 400 or silent fallback to polling.</td></tr>
+<tr><td><code>proxy_read_timeout 3600s</code> for sockets</td><td>Default 60 s would kill idle WebSockets. (Or send app-level pings.)</td></tr>
+<tr><td><code>always</code> on <code>add_header</code></td><td>Otherwise headers are omitted on error responses.</td></tr>
+</table>
+
+<h2>Example 3: serving a single-page app and an API</h2>
+<pre><code>server {
+    listen 443 ssl;
+    http2 on;
+    server_name app.example.com;
+    # ssl_* omitted
+
+    root /var/www/spa/dist;
+    index index.html;
+
+    location /api/ { proxy_pass http://127.0.0.1:3000; include snippets/proxy.conf; }
+
+    location /assets/ { expires 1y; add_header Cache-Control "public, immutable"; }
+
+    # index.html must not be cached long, so deploys take effect
+    location = /index.html { add_header Cache-Control "no-cache"; }
+
+    # Client-side routing: unknown paths return index.html
+    location / { try_files $uri $uri/ /index.html; }
+}</code></pre>
+
+<h2>Example 4: several apps behind one nginx</h2>
+<pre><code>server { listen 443 ssl; server_name api.example.com;    location / { proxy_pass http://127.0.0.1:3000; } }
+server { listen 443 ssl; server_name admin.example.com;  location / { proxy_pass http://127.0.0.1:4000; } }
+server { listen 443 ssl default_server; server_name _; ssl_reject_handshake on; }  # unknown hosts</code></pre>
+
+<h2>Debugging nginx</h2>
+<table>
+<tr><th>Symptom</th><th>Likely cause (check <code>error.log</code>)</th></tr>
+<tr><td>502 Bad Gateway, "connect() failed (111: Connection refused)"</td><td>App is down or on a different port/address</td></tr>
+<tr><td>502, "upstream prematurely closed connection"</td><td>App crashed mid-request or keep-alive mismatch</td></tr>
+<tr><td>504, "upstream timed out"</td><td>App too slow; raise <code>proxy_read_timeout</code> only if truly needed</td></tr>
+<tr><td>413 Request Entity Too Large</td><td><code>client_max_body_size</code></td></tr>
+<tr><td>Wrong site served</td><td>No matching <code>server_name</code>; falls to the default server</td></tr>
+<tr><td>403 on static files</td><td>nginx user (<code>www-data</code>) cannot read the path (directory execute bits!)</td></tr>
+<tr><td>Change not visible</td><td>Forgot reload, or the browser/CDN cached the old response</td></tr>
+<tr><td>Real IPs not logged</td><td>Behind a CDN/LB: use the <code>realip</code> module (<code>set_real_ip_from</code>, <code>real_ip_header</code>)</td></tr>
+</table>
+<p>Useful: <code>sudo nginx -T</code> dumps the entire effective config; <code>curl -I -H 'Host: example.com' http://127.0.0.1/</code> tests a vhost locally; custom <code>log_format</code> with <code>$request_time</code> and <code>$upstream_response_time</code> shows where latency is.</p>
+
+<h2>Alternatives and trade-offs</h2>
+<table>
+<tr><th>Tool</th><th>Strength</th><th>Consider when</th></tr>
+<tr><td>nginx</td><td>Fast, ubiquitous, great docs</td><td>Default choice</td></tr>
+<tr><td>Caddy</td><td>Automatic HTTPS, tiny config</td><td>You want the simplest possible setup</td></tr>
+<tr><td>Traefik</td><td>Dynamic config from Docker/K8s labels</td><td>Containerised environments</td></tr>
+<tr><td>HAProxy / Envoy</td><td>Advanced load balancing, observability</td><td>Heavy traffic, service meshes</td></tr>
+<tr><td>Apache httpd</td><td>.htaccess, legacy PHP</td><td>Legacy stacks</td></tr>
+</table>
+<p>Caddy equivalent of Examples 1 plus HTTPS in full: <code>example.com { reverse_proxy 127.0.0.1:3000 }</code>. That is the whole file, and certificates are obtained and renewed automatically.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run a tiny backend: <code>python3 -m http.server 3000 --bind 127.0.0.1</code>. Install nginx and write Example 1 so <code>http://your-server/</code> reaches it.</li>
+<li>Stop the backend and request the site. Find the matching line in <code>error.log</code> and the 502 in <code>access.log</code>.</li>
+<li>Add the <code>/assets/</code> block and verify headers with <code>curl -I</code>.</li>
+<li>Add rate limiting <code>rate=1r/s burst=2</code> and fire <code>for i in $(seq 1 10); do curl -s -o /dev/null -w '%{http_code}\n' localhost/api/; done</code>. See the 429s.</li>
+<li>Test the trailing-slash behaviour by logging the incoming path in a tiny app, with and without the slash on <code>proxy_pass</code>.</li>
+<li>Break the config on purpose and see <code>nginx -t</code> catch it before reload.</li>
+</ol></div>

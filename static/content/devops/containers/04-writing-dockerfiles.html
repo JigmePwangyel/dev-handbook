@@ -1,0 +1,195 @@
+<h1>Writing Dockerfiles</h1>
+<p class="lead">A Dockerfile is a text recipe: start from a base image, then run a series of instructions, each producing a layer. Writing a good one is mostly about knowing what each instruction really does, ordering them for the build cache, and keeping the result small, secure and well-behaved at shutdown.</p>
+
+<h2>Anatomy of a Dockerfile</h2>
+<pre><code># syntax=docker/dockerfile:1
+# base image (required, first)
+FROM node:22-slim
+# set and create working directory
+WORKDIR /app
+# copy files from build context
+COPY package*.json ./
+# execute a command at BUILD time
+RUN npm ci --omit=dev
+COPY . .
+# environment variable (build + runtime)
+ENV NODE_ENV=production
+# documentation only
+EXPOSE 3000
+# drop root
+USER node
+# default command at RUN time
+CMD ["node", "server.js"]</code></pre>
+<p>Build and run it:</p>
+<pre><code>docker build -t myapp:1.0 .          # "." is the build context
+docker run -d -p 3000:3000 myapp:1.0</code></pre>
+
+<h2>Every instruction explained</h2>
+<table>
+<tr><th>Instruction</th><th>What it does</th><th>Notes</th></tr>
+<tr><td><code>FROM</code></td><td>Sets the base image. <code>FROM scratch</code> is empty. Multiple <code>FROM</code>s create stages.</td><td>Pin the version. <code>FROM node:22-slim AS build</code> names a stage.</td></tr>
+<tr><td><code>WORKDIR</code></td><td>Sets the working directory for later instructions and the runtime.</td><td>Creates it if missing. Prefer over <code>RUN cd</code>, which does not persist.</td></tr>
+<tr><td><code>COPY</code></td><td>Copies files from the build context (or another stage) into the image.</td><td><code>COPY --chown=node:node . .</code>, <code>COPY --from=build /out /app</code>.</td></tr>
+<tr><td><code>ADD</code></td><td>Like COPY, plus auto-extracts local tarballs and can fetch URLs.</td><td>Prefer <code>COPY</code>; use ADD only for tar auto-extraction.</td></tr>
+<tr><td><code>RUN</code></td><td>Executes a command during build and commits the result as a layer.</td><td>Shell form runs via <code>/bin/sh -c</code>; exec form <code>RUN ["a","b"]</code> does not.</td></tr>
+<tr><td><code>ENV</code></td><td>Sets environment variables, persisted into the image and visible to running containers.</td><td>Never put secrets here; they show in <code>docker inspect</code>.</td></tr>
+<tr><td><code>ARG</code></td><td>Build-time variable passed with <code>--build-arg</code>. Not present at runtime.</td><td>Also visible in <code>docker history</code>; not for secrets.</td></tr>
+<tr><td><code>EXPOSE</code></td><td>Documents which port the app listens on.</td><td>Does NOT publish the port. You still need <code>-p</code>.</td></tr>
+<tr><td><code>USER</code></td><td>Sets the user for following instructions and the runtime process.</td><td>Create a non-root user; see security lesson.</td></tr>
+<tr><td><code>VOLUME</code></td><td>Declares a mount point that gets an anonymous volume.</td><td>Mostly avoid; define volumes at run time/Compose.</td></tr>
+<tr><td><code>ENTRYPOINT</code></td><td>The executable that always runs.</td><td>See next section.</td></tr>
+<tr><td><code>CMD</code></td><td>Default arguments (or default command) overridable at <code>docker run</code>.</td><td>One effective CMD; last wins.</td></tr>
+<tr><td><code>HEALTHCHECK</code></td><td>Command Docker runs periodically to judge health.</td><td><code>HEALTHCHECK CMD curl -fs http://localhost:3000/health || exit 1</code></td></tr>
+<tr><td><code>LABEL</code></td><td>Key/value metadata.</td><td>OCI keys such as <code>org.opencontainers.image.source</code>.</td></tr>
+<tr><td><code>SHELL</code></td><td>Changes the default shell for shell-form commands.</td><td>E.g. <code>SHELL ["/bin/bash","-o","pipefail","-c"]</code>.</td></tr>
+<tr><td><code>STOPSIGNAL</code></td><td>Signal sent by <code>docker stop</code>.</td><td>Default SIGTERM.</td></tr>
+</table>
+
+<h2>ENTRYPOINT vs. CMD</h2>
+<p>Both define what runs when the container starts. The distinction is who can override what.</p>
+<ul>
+<li><code>ENTRYPOINT</code>: the program. Overridden only with <code>--entrypoint</code>.</li>
+<li><code>CMD</code>: default arguments to the entrypoint (or the whole command if there is no entrypoint). Replaced by anything you put after the image name in <code>docker run</code>.</li>
+</ul>
+<table>
+<tr><th>Dockerfile</th><th><code>docker run img</code></th><th><code>docker run img --foo</code></th></tr>
+<tr><td><code>CMD ["node","server.js"]</code></td><td>node server.js</td><td>runs <code>--foo</code> as the command (error!)</td></tr>
+<tr><td><code>ENTRYPOINT ["node"]</code></td><td>node</td><td>node --foo</td></tr>
+<tr><td><code>ENTRYPOINT ["node"]<br>CMD ["server.js"]</code></td><td>node server.js</td><td>node --foo</td></tr>
+</table>
+<p>A common pattern is an entrypoint script that prepares the environment, then hands over to the real process:</p>
+<pre><code>#!/bin/sh
+# docker-entrypoint.sh
+set -e
+echo "Running migrations..."
+node migrate.js
+exec "$@"      # replace the shell with the CMD so signals reach the app</code></pre>
+<pre><code>COPY docker-entrypoint.sh /usr/local/bin/
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["node", "server.js"]</code></pre>
+
+<h3>Exec form vs. shell form</h3>
+<pre><code>CMD ["node", "server.js"]     # exec form (JSON array): node IS PID 1
+CMD node server.js            # shell form: /bin/sh -c "node server.js", sh is PID 1</code></pre>
+<div class="callout warn"><strong>Always use exec form for CMD and ENTRYPOINT</strong><p>In shell form, <code>sh</code> is PID 1 and does not forward SIGTERM to your app. <code>docker stop</code> then waits 10 seconds and kills it forcibly, losing graceful shutdown (open requests dropped, DB connections not closed). Exec form makes your app PID 1 so it receives signals. Also note PID 1 has special signal semantics: handle SIGTERM explicitly in your code, or run with <code>docker run --init</code> (adds a tiny init, tini) to reap zombies and forward signals.</p></div>
+
+<h2>Build context and .dockerignore</h2>
+<p>The <code>.</code> in <code>docker build .</code> is the <strong>build context</strong>: the directory whose contents are sent to the builder. <code>COPY</code> can only see files inside it. Sending a context that includes <code>node_modules</code>, <code>.git</code> and build output is slow and pollutes the cache (any change in those files invalidates <code>COPY . .</code>). It can also leak secrets such as <code>.env</code> into the image.</p>
+<pre><code># .dockerignore
+.git
+node_modules
+npm-debug.log
+dist
+coverage
+.env
+.env.*
+*.md
+Dockerfile
+docker-compose*.yaml
+.DS_Store
+__pycache__
+*.pyc
+.venv</code></pre>
+
+<h2>Layer-friendly RUN</h2>
+<pre><code># Bad: three layers, cache goes stale, apt lists left behind
+RUN apt-get update
+RUN apt-get install -y curl
+RUN rm -rf /var/lib/apt/lists/*
+
+# Good: one layer, no leftovers, no recommended extras
+RUN apt-get update \
+ &amp;&amp; apt-get install -y --no-install-recommends curl ca-certificates \
+ &amp;&amp; rm -rf /var/lib/apt/lists/*</code></pre>
+
+<h2>Full example: Node.js</h2>
+<pre><code># syntax=docker/dockerfile:1
+FROM node:22-slim
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# 1. dependency manifests first -> cached until they change
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+# 2. application code
+COPY --chown=node:node . .
+
+# built-in unprivileged user in node images
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
+  CMD node -e "fetch('http://localhost:3000/health').then(r=&gt;process.exit(r.ok?0:1)).catch(()=&gt;process.exit(1))"
+CMD ["node", "server.js"]</code></pre>
+<p><code>npm ci</code> installs exactly what the lockfile says (reproducible, faster than <code>npm install</code>). The healthcheck uses Node itself because slim images have no curl.</p>
+
+<h2>Full example: Python (FastAPI)</h2>
+<pre><code># syntax=docker/dockerfile:1
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Create unprivileged user
+RUN useradd --create-home --uid 10001 appuser
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY --chown=appuser:appuser . .
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]</code></pre>
+<p><code>PYTHONUNBUFFERED=1</code> makes logs appear immediately in <code>docker logs</code> instead of being buffered. Binding to <code>0.0.0.0</code> is essential: <code>127.0.0.1</code> inside a container is reachable only from inside that container, so published ports would not work.</p>
+
+<h2>Full example: Go (static binary)</h2>
+<pre><code># syntax=docker/dockerfile:1
+FROM golang:1.24 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/server /server
+EXPOSE 8080
+ENTRYPOINT ["/server"]</code></pre>
+<p>Go compiles to a single static binary, so the final image can be ~10 MB with no shell or package manager. The multi-stage pattern is explained in the next lesson.</p>
+
+<h2>Configuration: ENV vs. ARG vs. runtime</h2>
+<pre><code># build-time only
+ARG APP_VERSION=dev
+# promote to runtime if needed
+ENV APP_VERSION=$APP_VERSION
+# docker build --build-arg APP_VERSION=1.4.2 -t myapp:1.4.2 .</code></pre>
+<p>Environment-specific values (database URLs, API keys) belong at run time (<code>-e</code>, <code>--env-file</code>, Compose, orchestrator secrets), not in the image. The image should be identical in every environment; only configuration varies. This is the build-once, deploy-anywhere principle.</p>
+
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Running as root</strong> because nobody added <code>USER</code>.</li>
+<li><strong><code>COPY . .</code> before installing dependencies</strong>, destroying the cache.</li>
+<li><strong>Secrets via ARG/ENV/COPY</strong>. They persist in layers and metadata. Use BuildKit secret mounts (next lesson).</li>
+<li><strong>Using <code>latest</code> base images</strong>, so builds change without you touching anything.</li>
+<li><strong>Multiple processes in one container</strong> (app + cron + ssh). Split them.</li>
+<li><strong>Forgetting <code>.dockerignore</code></strong>.</li>
+<li><strong>Apps that log to files</strong> instead of stdout/stderr, so <code>docker logs</code> shows nothing.</li>
+<li><strong><code>apt-get upgrade</code> in Dockerfiles</strong>: non-reproducible. Bump the base image instead.</li>
+</ul>
+
+<h2>Linting</h2>
+<p>Run <code>hadolint Dockerfile</code> locally or in CI. It flags unpinned versions, missing <code>--no-install-recommends</code>, shell-form CMD and dozens of other issues. Recent Docker also has <code>docker build --check</code> for built-in lint rules.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a minimal Express or FastAPI "hello" app and write the Dockerfile above. Build and run it, then hit it with curl.</li>
+<li>Change one line of source and rebuild. Which steps say <code>CACHED</code>? Now change <code>package.json</code> and rebuild; what is different?</li>
+<li>Switch <code>CMD</code> to shell form and time <code>docker stop</code>. Switch back and compare.</li>
+<li>Add <code>.dockerignore</code> and compare the "transferring context" size in the build output before and after.</li>
+<li>Override the command: <code>docker run --rm myapp:1.0 node -v</code>. Then use <code>--entrypoint sh</code> to get a shell.</li>
+</ol></div>

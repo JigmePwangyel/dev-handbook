@@ -1,0 +1,129 @@
+<h1>Package Management and Runtimes</h1>
+<p class="lead">Installing software on a server should be repeatable, verifiable and updatable. Package managers give you that; downloading random tarballs and running "make install" gives you a snowflake.</p>
+
+<h2>Why package managers</h2>
+<p>A package manager knows what files belong to which package, what other packages are required (dependencies), which versions are available, and how to verify authenticity (cryptographic signatures). It lets you install, upgrade, list and cleanly remove software, and apply security patches with a single command. Without it you track versions in your head and leave orphaned files everywhere.</p>
+
+<h2>apt (Debian, Ubuntu)</h2>
+<pre><code>sudo apt update                    # refresh the package INDEX (does not install anything)
+sudo apt upgrade -y                # install available updates
+sudo apt full-upgrade              # also allow removals/new deps (kernel upgrades)
+sudo apt install -y nginx curl git # install
+apt search redis                   # search
+apt show nginx                     # details, version, dependencies
+apt policy nginx                   # installed vs candidate versions and sources
+sudo apt remove nginx              # remove program, keep config
+sudo apt purge nginx               # remove program AND config
+sudo apt autoremove                # remove no-longer-needed dependencies
+dpkg -l | grep nginx               # installed packages
+dpkg -L nginx                      # files a package installed
+dpkg -S /usr/sbin/nginx            # which package owns this file?
+sudo apt install ./package.deb     # local .deb with dependency resolution</code></pre>
+
+<h2>dnf (RHEL, Rocky, Alma, Fedora)</h2>
+<pre><code>sudo dnf check-update
+sudo dnf upgrade -y
+sudo dnf install -y nginx
+dnf search redis; dnf info nginx
+sudo dnf remove nginx
+rpm -qa | grep nginx               # installed
+rpm -ql nginx                      # files in package
+rpm -qf /usr/sbin/nginx            # owner of a file
+dnf provides '*/bin/dig'           # which package supplies this command?
+sudo dnf install epel-release      # extra packages repo for RHEL family</code></pre>
+<table>
+<tr><th>Task</th><th>apt</th><th>dnf</th><th>apk (Alpine)</th></tr>
+<tr><td>Refresh index</td><td><code>apt update</code></td><td>(automatic)</td><td><code>apk update</code></td></tr>
+<tr><td>Install</td><td><code>apt install x</code></td><td><code>dnf install x</code></td><td><code>apk add x</code></td></tr>
+<tr><td>Remove</td><td><code>apt remove x</code></td><td><code>dnf remove x</code></td><td><code>apk del x</code></td></tr>
+<tr><td>Upgrade all</td><td><code>apt upgrade</code></td><td><code>dnf upgrade</code></td><td><code>apk upgrade</code></td></tr>
+<tr><td>Search</td><td><code>apt search x</code></td><td><code>dnf search x</code></td><td><code>apk search x</code></td></tr>
+</table>
+<div class="callout tip"><strong>In scripts and Dockerfiles</strong><p>Use <code>apt-get</code> (stable CLI for scripting) and non-interactive mode: <code>DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl</code>. In Docker, combine <code>update</code>, <code>install</code> and <code>rm -rf /var/lib/apt/lists/*</code> in one layer.</p></div>
+
+<h2>Repositories and trust</h2>
+<p>Packages come from <em>repositories</em> listed in <code>/etc/apt/sources.list.d/</code> or <code>/etc/yum.repos.d/</code>. Distro repos are conservative: stable but often older versions (e.g. an old Node or Postgres). Vendors publish their own repos for newer versions. Adding one means trusting that vendor with root on your machine, so do it deliberately and use signed keyrings:</p>
+<pre><code># Example: PostgreSQL's official apt repository (current, documented method)
+sudo apt install -y postgresql-common
+sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+
+# Generic modern pattern (keyring per repo, not the deprecated apt-key):
+curl -fsSL https://example.com/repo.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/example.gpg
+echo "deb [signed-by=/etc/apt/keyrings/example.gpg] https://example.com/apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/example.list
+sudo apt update</code></pre>
+
+<h2>Automatic security updates</h2>
+<p>Unpatched servers are the easiest targets. On Ubuntu/Debian:</p>
+<pre><code>sudo apt install -y unattended-upgrades
+sudo dpkg-reconfigure -plow unattended-upgrades
+cat /etc/apt/apt.conf.d/20auto-upgrades
+# APT::Periodic::Update-Package-Lists "1";
+# APT::Periodic::Unattended-Upgrade "1";
+[ -f /var/run/reboot-required ] &amp;&amp; echo "reboot needed (kernel update)"</code></pre>
+<p>On RHEL family use <code>dnf-automatic</code>. Kernel updates need a reboot (or live patching) to take effect. In a fleet, patch via rebuilding images rather than patching in place.</p>
+
+<h2>Language runtimes: the version problem</h2>
+<p>Your app needs Node 22, another needs Node 20; the distro ships Node 18. Installing a language runtime globally with the system package manager couples every app to one version. Use a version manager or isolate per app.</p>
+<table>
+<tr><th>Language</th><th>Tools</th><th>Isolation of dependencies</th></tr>
+<tr><td>Node.js</td><td><code>nvm</code>, <code>fnm</code>, <code>volta</code>, NodeSource apt repo, <code>mise</code></td><td><code>node_modules</code> per project, lockfile (<code>package-lock.json</code>)</td></tr>
+<tr><td>Python</td><td><code>pyenv</code>, <code>uv</code>, distro python3</td><td>Virtualenv (<code>python3 -m venv .venv</code>), <code>requirements.txt</code>/<code>uv.lock</code></td></tr>
+<tr><td>Java</td><td><code>SDKMAN!</code>, <code>apt install openjdk-21-jre-headless</code></td><td>Maven/Gradle</td></tr>
+<tr><td>Go</td><td>Download tarball from go.dev; produces single static binaries</td><td>Go modules</td></tr>
+<tr><td>Ruby</td><td><code>rbenv</code>, <code>rvm</code></td><td>Bundler</td></tr>
+<tr><td>Any</td><td><code>mise</code> / <code>asdf</code> (multi-language)</td><td>.tool-versions file</td></tr>
+</table>
+
+<h3>Node with nvm</h3>
+<pre><code>curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash   # check latest version first
+source ~/.bashrc
+nvm install --lts
+nvm use --lts
+node -v; npm -v
+echo "22" &gt; .nvmrc      # pin per project; then "nvm use"</code></pre>
+<div class="callout warn"><strong>nvm and systemd do not mix automatically</strong><p>nvm modifies your interactive shell's PATH, which a systemd service never sees. In the unit file use the absolute path: <code>ExecStart=/home/deploy/.nvm/versions/node/v22.11.0/bin/node server.js</code>, or install Node system-wide (NodeSource repo, or unpack the official tarball in <code>/opt/node</code>). Better yet, build a container image with the runtime baked in.</p></div>
+
+<h3>Python</h3>
+<pre><code>sudo apt install -y python3-venv python3-pip
+cd /opt/myapp
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+# systemd: ExecStart=/opt/myapp/.venv/bin/gunicorn app:app -b 127.0.0.1:8000
+# Do not "sudo pip install" system-wide: modern distros block it (PEP 668)</code></pre>
+
+<h2>Installing binaries directly</h2>
+<p>Many tools ship as a single static binary on GitHub releases. Safe pattern: download, verify checksum, install into <code>/usr/local/bin</code>.</p>
+<pre><code>curl -fsSLO https://example.com/tool_1.2.3_linux_amd64.tar.gz
+curl -fsSLO https://example.com/checksums.txt
+sha256sum -c checksums.txt --ignore-missing
+tar xzf tool_1.2.3_linux_amd64.tar.gz
+sudo install -m 0755 tool /usr/local/bin/tool</code></pre>
+<p>Others: <strong>snap</strong> (Ubuntu's sandboxed packages, auto-updating), <strong>Flatpak</strong> (desktop), <strong>Homebrew on Linux</strong>, and of course <strong>containers</strong>, which bundle runtime and dependencies and avoid most problems here.</p>
+
+<h2>Best practices</h2>
+<ul>
+<li>Pin versions of important software; upgrade deliberately and test in staging first (<code>apt-mark hold pkg</code> to freeze).</li>
+<li>Keep a list of what you installed (script or Ansible later). A server built from a script can be rebuilt in minutes.</li>
+<li>Minimise installed software: every package is attack surface and something to patch.</li>
+<li>Never pipe unknown scripts to a root shell. Read it, pin a version, verify checksums.</li>
+<li>Commit lockfiles so every environment installs the same dependency tree.</li>
+</ul>
+
+<h2>Troubleshooting</h2>
+<table>
+<tr><th>Error</th><th>Fix</th></tr>
+<tr><td><code>Could not get lock /var/lib/dpkg/lock</code></td><td>Another apt is running (often unattended-upgrades). Wait; do not delete lock files.</td></tr>
+<tr><td><code>Unable to locate package</code></td><td>Run <code>apt update</code>; wrong release/repo.</td></tr>
+<tr><td>Broken dependencies</td><td><code>sudo apt --fix-broken install</code></td></tr>
+<tr><td><code>NO_PUBKEY</code> / signature errors</td><td>Repo key missing or expired; re-add via signed-by keyring.</td></tr>
+<tr><td><code>command not found</code> after install</td><td>New shell/<code>hash -r</code>; check <code>which</code> and <code>$PATH</code>.</td></tr>
+</table>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Install <code>nginx</code> with apt. Use <code>dpkg -L nginx</code> to see where its files went, and <code>apt policy nginx</code> for the version.</li>
+<li>Enable unattended-upgrades and run <code>sudo unattended-upgrade --dry-run -d</code>.</li>
+<li>Install Node via nvm, create a tiny app, and note why the systemd unit needs the absolute node path.</li>
+<li>Create a Python venv, install <code>flask</code> in it, and confirm <code>pip list</code> differs from the system pip.</li>
+</ol></div>

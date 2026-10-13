@@ -1,0 +1,203 @@
+<h1>Jenkins and Other CI/CD Tools</h1>
+<p class="lead">GitHub Actions and GitLab CI are not the only options. Jenkins is the veteran you will meet in many companies; CircleCI, Argo and Tekton cover other niches. This lesson shows what each is, how its pipeline looks, and how to choose.</p>
+
+<h2>Why there are so many tools</h2>
+<p>All of them do the same core job (run your build, test and deploy steps on a trigger), but they differ along four axes: <strong>where they run</strong> (SaaS vs self-hosted), <strong>how tied they are to a Git host</strong>, <strong>how they model pipelines</strong> (YAML, Groovy, Kubernetes resources), and <strong>what they optimise for</strong> (flexibility, convenience, Kubernetes-native delivery, GitOps). Knowing the axes lets you pick without chasing hype.</p>
+
+<h2>Jenkins</h2>
+<p>Jenkins (originally Hudson, 2004-2011) is an open-source automation server written in Java. It is self-hosted, extremely flexible, and has around 2,000 plugins. Its age is both strength and weakness: it can integrate with nearly anything, but it needs care and feeding.</p>
+<pre class="diagram">
+              ┌─────────────────────────┐
+ webhook ────▶│  Jenkins controller      │  holds config, schedules, UI, credentials
+ (Git push)   │  (formerly "master")     │
+              └───────┬─────────┬────────┘
+                      │ agents connect (SSH / inbound JNLP / k8s pods)
+              ┌───────▼───┐ ┌───▼────────┐ ┌─────────────┐
+              │ agent:    │ │ agent:     │ │ k8s pod     │
+              │ linux     │ │ windows    │ │ (ephemeral) │
+              └───────────┘ └────────────┘ └─────────────┘
+</pre>
+<h3>Declarative Jenkinsfile</h3>
+<p>Pipelines live in a <code>Jenkinsfile</code> in the repo, written in Groovy-based DSL. The <em>declarative</em> syntax is structured and preferred over the older free-form <em>scripted</em> syntax.</p>
+<pre><code>pipeline {
+  agent none                                  // each stage picks its own agent
+
+  options {
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  environment {
+    IMAGE = "registry.example.com/shop:${env.GIT_COMMIT}"
+  }
+
+  stages {
+    stage('Lint &amp; Test') {
+      agent { docker { image 'node:22-alpine' } }
+      steps {
+        sh 'npm ci'
+        sh 'npm run lint'
+        sh 'npm test'
+      }
+      post {
+        always { junit 'junit.xml' }          // publish test results
+      }
+    }
+
+    stage('Build image') {
+      when { branch 'main' }                  // only on main
+      agent { label 'docker' }
+      steps {
+        withCredentials([usernamePassword(
+            credentialsId: 'registry-creds',
+            usernameVariable: 'REG_USER', passwordVariable: 'REG_PASS')]) {
+          sh '''
+            echo "$REG_PASS" | docker login registry.example.com -u "$REG_USER" --password-stdin
+            docker build -t "$IMAGE" .
+            docker push "$IMAGE"
+          '''
+        }
+      }
+    }
+
+    stage('Approve production') {
+      when { branch 'main' }
+      steps {
+        timeout(time: 1, unit: 'HOURS') {
+          input message: 'Deploy to production?', ok: 'Deploy'
+        }
+      }
+    }
+
+    stage('Deploy') {
+      when { branch 'main' }
+      agent { label 'deployer' }
+      steps {
+        sshagent(credentials: ['deploy-ssh-key']) {
+          sh 'ssh deploy@prod.example.com "IMAGE=$IMAGE /opt/shop/deploy.sh"'
+        }
+      }
+    }
+  }
+
+  post {
+    failure { slackSend channel: '#ci', message: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}" }
+  }
+}
+</code></pre>
+<p>Key ideas: <code>agent</code> says where to run (a label, or a Docker image); <code>when</code> conditions stages; <code>post</code> runs cleanup/notifications; <code>withCredentials</code> injects secrets from Jenkins' credential store and masks them in logs; <code>input</code> implements a manual approval; <strong>Multibranch Pipeline</strong> jobs auto-discover branches and PRs that contain a Jenkinsfile. <strong>Shared libraries</strong> (Groovy code in a separate repo) hold common steps for many pipelines.</p>
+
+<h3>Jenkins in practice</h3>
+<ul>
+<li><strong>Pros:</strong> total control; runs anywhere (air-gapped, on-prem); works with any SCM; massive plugin ecosystem; free.</li>
+<li><strong>Cons:</strong> you operate it (upgrades, backups, scaling agents, security patches); plugin sprawl and compatibility; Groovy sandbox quirks; UI shows its age; the controller is a high-value target.</li>
+<li><strong>Best practice:</strong> keep config as code (Jenkins Configuration as Code plugin), run builds only on ephemeral agents (never on the controller), use Kubernetes plugin pods, keep plugins few and updated, back up <code>JENKINS_HOME</code>, put it behind SSO and HTTPS.</li>
+</ul>
+
+<h2>CircleCI</h2>
+<p>A hosted CI/CD SaaS (self-hosted runners available) known for speed, good caching/parallelism and Docker-first design. Config is <code>.circleci/config.yml</code> and uses <strong>orbs</strong> (shareable config packages).</p>
+<pre><code>version: 2.1
+orbs:
+  node: circleci/node@6
+
+jobs:
+  test:
+    docker:
+      - image: cimg/node:22.9
+    steps:
+      - checkout
+      - node/install-packages            # includes caching
+      - run: npm test
+workflows:
+  main:
+    jobs:
+      - test
+      - deploy:
+          requires: [test]
+          filters: {branches: {only: main}}</code></pre>
+<p><strong>Choose it</strong> for: very fast hosted CI independent of your Git host, strong test splitting and insights. <strong>Watch for:</strong> credit-based pricing, and the 2023 security incident that reminded everyone to rotate secrets held in any CI vendor.</p>
+
+<h2>Other hosted and platform-native options</h2>
+<ul>
+<li><strong>Bitbucket Pipelines:</strong> built into Bitbucket; simple YAML; natural for Atlassian shops.</li>
+<li><strong>Azure Pipelines (Azure DevOps):</strong> YAML multi-stage pipelines, strong Windows/.NET and enterprise governance.</li>
+<li><strong>AWS CodePipeline/CodeBuild, Google Cloud Build:</strong> cloud-native, great IAM integration, less portable.</li>
+<li><strong>Buildkite:</strong> hosted control plane, <em>you</em> run the agents; popular for large, performance-sensitive monorepos.</li>
+<li><strong>Drone / Woodpecker CI, Concourse:</strong> container-native, lightweight, self-hosted; Concourse is resource-and-pipeline oriented.</li>
+<li><strong>Dagger:</strong> pipelines written in real code (Go, Python, TypeScript) that run identically locally and in any CI, with built-in caching. Reduces CI lock-in.</li>
+</ul>
+
+<h2>Kubernetes-native: Tekton</h2>
+<p>Tekton defines CI/CD as Kubernetes custom resources: <code>Task</code> (a series of container steps), <code>Pipeline</code> (tasks wired together), <code>PipelineRun</code> (one execution). Everything runs as pods.</p>
+<pre><code>apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata: {name: build-and-test}
+spec:
+  tasks:
+    - name: test
+      taskRef: {name: npm-test}
+    - name: build-image
+      runAfter: [test]
+      taskRef: {name: buildah}</code></pre>
+<p><strong>Pros:</strong> cloud-native, scalable, vendor-neutral, a foundation for platforms (it underlies several products). <strong>Cons:</strong> verbose YAML, steep learning curve, you must build the UX and triggers (Tekton Triggers) yourself.</p>
+
+<h2>Argo: Workflows, Events and (most importantly) Argo CD</h2>
+<p>The Argo project is several tools, and naming confuses people:</p>
+<table>
+<tr><th>Tool</th><th>Role</th></tr>
+<tr><td><strong>Argo CD</strong></td><td><strong>Continuous delivery</strong> via GitOps: watches a Git repo of Kubernetes manifests (or Helm/Kustomize) and continuously reconciles the cluster to match. It does <em>not</em> build or test code.</td></tr>
+<tr><td><strong>Argo Workflows</strong></td><td>Container-native workflow engine for Kubernetes (CI-like jobs, data/ML pipelines as DAGs).</td></tr>
+<tr><td><strong>Argo Rollouts</strong></td><td>Progressive delivery: canary, blue-green, automated analysis and rollback.</td></tr>
+<tr><td><strong>Argo Events</strong></td><td>Event-driven triggering of workflows.</td></tr>
+</table>
+<p>The common modern pattern splits CI from CD:</p>
+<pre class="diagram">
+ CI (GitHub Actions / GitLab / Jenkins)           CD (GitOps: Argo CD or Flux)
+ ┌──────────────────────────────┐                ┌───────────────────────────────┐
+ │ test, build, scan, push image │──▶ update ───▶│ config repo: image: shop:3f9a1 │
+ │ registry/shop:3f9a1c2         │   image tag    │        ▲ watches (pull)        │
+ └──────────────────────────────┘   in config    │  Argo CD ─▶ applies to cluster │
+                                    repo         └───────────────────────────────┘
+</pre>
+<p>Benefits: the cluster pulls its desired state, so CI needs no cluster credentials; Git is the audit log and rollback is <code>git revert</code>; drift is detected and corrected. The Infrastructure as Code section covers GitOps in depth. Flux is the main alternative to Argo CD.</p>
+
+<h2>Comparison</h2>
+<table>
+<tr><th>Tool</th><th>Hosting</th><th>Config</th><th>Strength</th><th>Weakness</th></tr>
+<tr><td>GitHub Actions</td><td>SaaS (+ self-hosted runners)</td><td>YAML</td><td>Ecosystem, GitHub integration</td><td>GitHub lock-in; third-party action risk</td></tr>
+<tr><td>GitLab CI</td><td>SaaS or self-managed</td><td>YAML</td><td>All-in-one platform</td><td>Best when you use the whole GitLab</td></tr>
+<tr><td>Jenkins</td><td>Self-hosted</td><td>Groovy Jenkinsfile</td><td>Flexibility, on-prem, plugins</td><td>Operational burden</td></tr>
+<tr><td>CircleCI</td><td>SaaS (+ runners)</td><td>YAML + orbs</td><td>Speed, parallelism</td><td>Cost model; another vendor</td></tr>
+<tr><td>Buildkite</td><td>Hybrid</td><td>YAML / dynamic</td><td>Scale, you control agents</td><td>You run agents</td></tr>
+<tr><td>Tekton</td><td>In your k8s cluster</td><td>K8s CRDs</td><td>Cloud-native building block</td><td>Complexity, DIY UX</td></tr>
+<tr><td>Argo CD</td><td>In your k8s cluster</td><td>K8s manifests in Git</td><td>GitOps CD, drift correction</td><td>Not a CI tool; k8s only</td></tr>
+<tr><td>Cloud-native (CodeBuild, Cloud Build, Azure Pipelines)</td><td>Cloud SaaS</td><td>YAML/console</td><td>IAM integration, no infra</td><td>Cloud lock-in</td></tr>
+</table>
+
+<h2>How to choose</h2>
+<ol>
+<li><strong>Start where your code lives.</strong> GitHub repo: Actions. GitLab: GitLab CI. Bitbucket: Pipelines. Integration beats feature checklists.</li>
+<li><strong>Do you need self-hosting or air-gapped?</strong> Jenkins, GitLab self-managed, Buildkite agents, Tekton.</li>
+<li><strong>Do you deploy to Kubernetes?</strong> Consider a CI tool for build/test plus Argo CD/Flux for delivery.</li>
+<li><strong>Scale and speed?</strong> Large monorepos or heavy test suites may justify Buildkite, CircleCI, or remote build caches (Bazel, Nx).</li>
+<li><strong>Team capacity.</strong> Self-hosting means someone owns uptime and security. Small teams should prefer SaaS.</li>
+<li><strong>Minimise lock-in</strong> by keeping logic in scripts, Makefiles or Dagger modules, with the CI file only orchestrating. Then migrating tools is a rewrite of a thin YAML file.</li>
+</ol>
+<div class="callout key"><strong>The tool matters less than you think</strong><p>The practices (small changes, fast tests, build once, safe rollout) are tool-independent. A well-designed pipeline on Jenkins beats a sloppy one on the shiniest platform. Do not migrate tools to fix a process problem.</p></div>
+
+<h2>Pitfalls</h2>
+<ul>
+<li>Running two CI systems "temporarily" for years.</li>
+<li>Click-configured Jenkins jobs with no Jenkinsfile: undocumented, unreviewable.</li>
+<li>Running builds on the Jenkins controller itself (security and stability risk).</li>
+<li>Treating Argo CD as a CI tool, or expecting GitOps tools to build images.</li>
+<li>Putting complex logic in plugin-specific syntax that cannot be run locally.</li>
+</ul>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Run Jenkins locally: <code>docker run -p 8080:8080 -v jenkins_home:/var/jenkins_home jenkins/jenkins:lts-jdk17</code>, finish the setup wizard, and create a Pipeline job from a Jenkinsfile in a repo.</li>
+<li>Port your GitHub Actions workflow (or the example above) to GitLab CI or CircleCI. Note what concepts map one-to-one and what does not.</li>
+<li>Move the commands out of the YAML into a <code>Makefile</code> (<code>make test</code>, <code>make build</code>), and have the CI file call only those targets.</li>
+</ol></div>

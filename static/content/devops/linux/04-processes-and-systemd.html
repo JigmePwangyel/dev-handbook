@@ -1,0 +1,139 @@
+<h1>Processes and systemd</h1>
+<p class="lead">Your app on a server is a process. Production means that process starts at boot, restarts on crash, runs as the right user, has its logs captured and can be stopped cleanly. On modern Linux, systemd does all of that.</p>
+
+<h2>Why you need a process manager</h2>
+<p>If you start your app with <code>node server.js</code> over SSH it dies when you log out, does not restart when it crashes, does not start after a reboot, and its output vanishes. You could run it with <code>nohup</code> or <code>tmux</code>, but that is a hack. A <strong>service manager</strong> supervises it properly. On virtually every mainstream distro that is <strong>systemd</strong> (PID 1, the first process; it starts everything else).</p>
+
+<h2>Processes 101</h2>
+<p>A process is a running program with a PID, an owner, memory, open files and a parent (PPID). Programs start other programs, forming a tree rooted at PID 1.</p>
+<pre><code>ps aux                     # every process (BSD style)
+ps -ef --forest            # tree view with parent relationships
+ps -o pid,ppid,user,%cpu,%mem,etime,cmd -p 1234
+pgrep -a nginx             # find PIDs by name
+pstree -p                  # tree
+top                        # live view (q quits); htop is friendlier
+lsof -p 1234               # files and sockets a process has open
+lsof -i :3000              # who is using port 3000?
+ss -tlnp                   # listening TCP ports with owning process (needs sudo for others)</code></pre>
+<p>Process states in <code>ps</code>: <code>R</code> running, <code>S</code> sleeping, <code>D</code> uninterruptible I/O wait (often a stuck disk/NFS), <code>Z</code> zombie (finished, parent has not collected it), <code>T</code> stopped.</p>
+
+<h2>Signals: talking to processes</h2>
+<table>
+<tr><th>Signal</th><th>Number</th><th>Meaning</th><th>Catchable?</th></tr>
+<tr><td><code>SIGTERM</code></td><td>15</td><td>"Please shut down gracefully" (default of <code>kill</code>)</td><td>Yes</td></tr>
+<tr><td><code>SIGINT</code></td><td>2</td><td>Ctrl+C</td><td>Yes</td></tr>
+<tr><td><code>SIGHUP</code></td><td>1</td><td>Terminal closed; by convention "reload config"</td><td>Yes</td></tr>
+<tr><td><code>SIGKILL</code></td><td>9</td><td>Kill immediately, no cleanup</td><td><strong>No</strong></td></tr>
+<tr><td><code>SIGUSR1/2</code></td><td>10/12</td><td>App-defined</td><td>Yes</td></tr>
+</table>
+<pre><code>kill 1234            # SIGTERM: let it finish requests, flush, close DB
+kill -HUP 1234       # reload (nginx, many daemons)
+kill -9 1234         # last resort
+pkill -f "node server.js"
+killall nginx</code></pre>
+<div class="callout key"><strong>Handle SIGTERM in your app</strong><p>Deploys, systemd and Kubernetes all stop apps by sending SIGTERM, then SIGKILL after a timeout. If your app ignores SIGTERM, in-flight requests are cut off on every deploy. Listen for it, stop accepting new connections, finish current work, then exit. Containers have a twist: if your app is PID 1 it must handle signals itself (or use <code>tini</code>/<code>--init</code>).</p></div>
+<pre><code>// Node.js graceful shutdown
+process.on("SIGTERM", () =&gt; {
+  server.close(() =&gt; { db.end().then(() =&gt; process.exit(0)); });
+  setTimeout(() =&gt; process.exit(1), 10000).unref();   // hard stop after 10s
+});</code></pre>
+
+<h2>systemd basics</h2>
+<p>systemd manages <strong>units</strong>; the most common is a <code>.service</code>. Others: <code>.timer</code> (scheduling), <code>.socket</code>, <code>.mount</code>, <code>.target</code> (groups of units, like "multi-user").</p>
+<pre><code>systemctl status nginx          # state, recent logs, PID, memory
+sudo systemctl start nginx
+sudo systemctl stop nginx
+sudo systemctl restart nginx    # stop then start (brief downtime)
+sudo systemctl reload nginx     # re-read config without dropping connections, if supported
+sudo systemctl enable nginx     # start at boot
+sudo systemctl enable --now nginx   # enable and start together
+sudo systemctl disable nginx
+systemctl is-active nginx; systemctl is-enabled nginx
+systemctl list-units --type=service --state=running
+systemctl --failed              # what is broken?</code></pre>
+<p><em>enable</em> and <em>start</em> are independent: enabled means "at boot", started means "now".</p>
+
+<h2>Writing a unit file for your app</h2>
+<p>Suppose a Node app lives in <code>/opt/myapp</code>, runs <code>node server.js</code> on port 3000, and reads config from <code>/etc/myapp/env</code>. Create <code>/etc/systemd/system/myapp.service</code> (your own units go in <code>/etc/systemd/system</code>; packages use <code>/usr/lib/systemd/system</code>).</p>
+<pre><code>[Unit]
+Description=My App (Node.js)
+Documentation=https://example.com/docs
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=myapp
+Group=myapp
+WorkingDirectory=/opt/myapp/current
+EnvironmentFile=/etc/myapp/env
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+RestartSec=3
+# Stop behaviour
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening (cheap, big security win)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/myapp
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+<table>
+<tr><th>Directive</th><th>Why</th></tr>
+<tr><td><code>After=</code>/<code>Wants=</code></td><td>Ordering and soft dependency (start after the network and DB)</td></tr>
+<tr><td><code>User=</code></td><td>Never run apps as root</td></tr>
+<tr><td><code>EnvironmentFile=</code></td><td>Config and secrets outside the unit (mode 640, root:myapp)</td></tr>
+<tr><td><code>ExecStart=</code></td><td>Absolute path to the binary; systemd does not use your shell or PATH like you do</td></tr>
+<tr><td><code>Restart=on-failure</code></td><td>Auto-restart on crash; <code>always</code> also restarts after clean exit</td></tr>
+<tr><td><code>Type=</code></td><td><code>simple</code> (foreground process), <code>forking</code> (old-style daemons), <code>oneshot</code> (run and exit)</td></tr>
+<tr><td><code>WantedBy=multi-user.target</code></td><td>What <code>enable</code> hooks into</td></tr>
+</table>
+<p>Activate it:</p>
+<pre><code>sudo systemctl daemon-reload          # REQUIRED after creating/editing unit files
+sudo systemctl enable --now myapp
+systemctl status myapp
+systemd-analyze verify /etc/systemd/system/myapp.service   # lint
+sudo systemctl edit myapp             # drop-in override without editing the original
+systemd-analyze security myapp        # hardening score</code></pre>
+<div class="callout warn"><strong>Common unit mistakes</strong><ul><li>Forgetting <code>daemon-reload</code> after edits.</li><li>Relative paths in <code>ExecStart</code>, or shell syntax (<code>&amp;&amp;</code>, <code>$VAR</code> expansion, pipes). Wrap in <code>/bin/sh -c '...'</code> if you truly need it.</li><li>Quotes in <code>EnvironmentFile</code> are handled differently than in a shell; use plain <code>KEY=value</code>.</li><li><code>ProtectSystem=strict</code> makes the filesystem read-only, so list writable paths in <code>ReadWritePaths</code>.</li></ul></div>
+
+<h2>Reading logs with journalctl</h2>
+<p>systemd captures stdout and stderr of services into the <strong>journal</strong>. Your app need only log to stdout (a 12-factor best practice).</p>
+<pre><code>journalctl -u myapp                    # all logs for the unit
+journalctl -u myapp -f                 # follow live
+journalctl -u myapp -n 100 --no-pager  # last 100 lines
+journalctl -u myapp --since "1 hour ago"
+journalctl -u myapp --since "2026-10-05 09:00" --until "09:30"
+journalctl -u myapp -p err             # only errors and worse
+journalctl -b                          # this boot; -b -1 = previous boot
+journalctl -u myapp -o json-pretty | head
+journalctl --disk-usage; sudo journalctl --vacuum-time=14d</code></pre>
+
+<h2>Alternatives and context</h2>
+<table>
+<tr><th>Tool</th><th>When</th></tr>
+<tr><td>systemd</td><td>Default for long-running processes on a VM. Zero extra install.</td></tr>
+<tr><td>PM2 / supervisord</td><td>Older/Node-centric supervisors; if you use PM2, still run it under systemd (<code>pm2 startup</code>)</td></tr>
+<tr><td>Docker <code>--restart unless-stopped</code> / Compose</td><td>Containerised apps</td></tr>
+<tr><td>Kubernetes</td><td>Many containers across many nodes; replaces what systemd does for apps</td></tr>
+</table>
+<p>The concepts carry over: a declared command, a user, env vars, restart policy, health, graceful stop, captured logs.</p>
+
+<h2>Zero-downtime-ish restarts</h2>
+<p>A plain restart drops requests for a moment. Options: reload where supported (nginx), run two instances behind a proxy and restart one at a time, or socket activation. The Deploy section builds proper strategies on this.</p>
+
+<div class="exercise"><h3>Try it</h3>
+<ol>
+<li>Create a trivial server: <code>python3 -m http.server 8000 --directory /srv/demo</code>. Write a unit for it (user <code>nobody</code> is fine for the exercise), enable and start it.</li>
+<li>Find its PID with <code>systemctl status</code>, then <code>kill -9</code> it. Watch systemd restart it (<code>Restart=always</code>). Look at the restart in <code>journalctl -u</code>.</li>
+<li>Reboot the VM and confirm it came back by itself.</li>
+<li>Run <code>systemd-analyze security</code> on your unit, add two hardening options, and re-score.</li>
+</ol></div>
